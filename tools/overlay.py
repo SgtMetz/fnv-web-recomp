@@ -34,28 +34,47 @@ OUT = ROOT / 'out/src'
 SSE_BLOCK = ROOT / 'port/compat/fnv_sse_block.h'
 MSVC_XMM = ROOT / 'port/compat/fnv_msvc_xmm.h'
 OWN_M128 = re.compile(r'\b(union|struct)\s*(__declspec\((?:[^()]|\([^()]*\))*\)\s*|_CRT_ALIGN\(\d+\)\s*)*__m128\b')
-DIAG = re.compile(r'^(?P<file>.*?)\((?P<line>\d+),(?P<col>\d+)\) ?: (?P<kind>error|note): (?P<msg>.*)$')
+DIAG = re.compile(r'^(?P<file>.*?)\((?P<line>\d+),(?P<col>\d+)\) ?:(?P<ranges>(?:\{\d+:\d+-\d+:\d+\})*):? ?'
+                  r'(?P<kind>error|note): (?P<msg>.*)$')
+RANGE = re.compile(r'\{(\d+):(\d+)-(\d+):(\d+)\}')
+HELPERS = None   # set below (port/compat/fnv_overlay_helpers.h)
 DUP_MSGS = ("conflicting types for '", "redeclaration of '", "declaration of '",
             "redefinition of '")
 SSE_DEF = re.compile(r'union\s+(__declspec\([^)]*\)\s*|_CRT_ALIGN\(\d+\)\s*)*__m128\b|\bm128_(f32|u32|i32|u64)\b'
                      r'|\b_mm_\w+\s*\(')
 
 
-def compile_unit(unit, src, sse, obj='NUL'):
+FIXIT = re.compile(r'^fix-it:"(?P<file>.*?)":\{(?P<l1>\d+):(?P<c1>\d+)-(?P<l2>\d+):(?P<c2>\d+)\}:"(?P<text>.*)"$')
+MODERN = ['-fms-compatibility-version=19.44', '/std:c++17']
+HELPERS = ROOT / 'port/compat/fnv_overlay_helpers.h'
+
+
+def compile_unit(unit, src, sse, obj='NUL', modern=False):
     cmd = cc.command(unit, str(DECOMP), obj)
     cmd[-1] = str(src)
-    extra = ['/I' + str((DECOMP / unit['source']).parent), '/I' + str(SSE_BLOCK.parent)]
+    extra = ['/I' + str((DECOMP / unit['source']).parent), '/I' + str(SSE_BLOCK.parent),
+             '/clang:-fdiagnostics-parseable-fixits', '/clang:-fdiagnostics-print-source-range-info',
+             '/FI' + str(HELPERS)]
     if sse:
         extra.append('/FI' + str(SSE_BLOCK))
     if sse == 'types':
         extra.append('/FI' + str(MSVC_XMM))
+    if modern:          # units that pull in the modern STL headers need the language mode those headers expect
+        cmd = [c for c in cmd if not c.startswith('-fms-compatibility-version=')]
+        extra += MODERN
     cmd[1:1] = extra
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
     diags = []
     for l in r.stderr.splitlines():
         m = DIAG.match(l)
         if m:
-            diags.append(dict(m.groupdict(), line=int(m['line']), col=int(m['col'])))
+            diags.append(dict(m.groupdict(), line=int(m['line']), col=int(m['col']), fixits=[],
+                              ranges=[tuple(map(int, r)) for r in RANGE.findall(m['ranges'] or '')]))
+            continue
+        f = FIXIT.match(l)
+        if f and diags:
+            diags[-1]['fixits'].append(dict(file=f['file'].replace('\\\\', '\\'), l1=int(f['l1']), c1=int(f['c1']),
+                                             l2=int(f['l2']), c2=int(f['c2']), text=f['text']))
     return r.returncode == 0, diags
 
 
@@ -170,8 +189,310 @@ def unify_simd_types(text):
     return ''.join(out), n, all_ok
 
 
-def fix_round(lines, diags, src, record):
+FIXIT_OK = ("is a pointer; did you mean to use '->'", "template specialization requires 'template<>'")
+STL_HEADERS = re.compile(r'[\\/](xtr1common|type_traits|xutility|xmemory|xstring|utility|limits|xtree|vector|string|'
+                         r'memory|cstdint|cstddef|yvals|yvals_core|vcruntime\w*|xkeycheck\.h|new|exception)$', re.I)
+
+
+def apply_fixits(lines, diags, src, record):
+    """Clang's own fix-its for whitelisted diagnostics (same-line edits only, applied right to left)."""
+    edits = {}
+    for d in diags:
+        if d['kind'] == 'error' and any(k in d['msg'] for k in FIXIT_OK):
+            for f in d['fixits']:
+                if f['l1'] == f['l2'] and same_file(f['file'], src):
+                    edits.setdefault(f['l1'], []).append((f['c1'], f['c2'], f['text']))
+    for ln, es in edits.items():
+        line = lines[ln - 1]
+        for c1, c2, text in sorted(set(es), reverse=True):
+            line = line[:c1 - 1] + text + line[c2 - 1:]
+        lines[ln - 1] = line
+        record.append(dict(rule='fixit', line=ln, edits=len(es)))
+    return bool(edits)
+
+
+def drop_extern_c(lines, diags, src, record):
+    """extern "C" functions declared in several namespaces with different types are one entity in C++ (VC2008
+    accepted them). Dropping extern "C" from the ones inside a namespace makes each an ordinary namespaced function;
+    the relink binds FUN_<addr>/DAT_<addr> names to their address whatever the namespace."""
+    depth = namespace_depths(lines)
+    hits = set()
+    for d in diags:
+        if not same_file(d['file'], src) or d['line'] > len(lines):
+            continue          # a conflict reported inside an SDK header still has its note (handled below) here
+        if d['kind'] == 'error' and not re.match(r"(conflicting types for|declaration of|redeclaration of|"
+                                                 r"functions that differ only in their return type)", d['msg']):
+            continue
+        if d['kind'] == 'note' and 'previous declaration' not in d['msg']:
+            continue
+        i = d['line'] - 1
+        if depth[i] and 'extern "C"' in lines[i]:
+            hits.add(i)
+    for i in sorted(hits):
+        lines[i] = lines[i].replace('extern "C"', 'extern /* [overlay dropc] */', 1)
+        record.append(dict(rule='dropc', line=i + 1))
+    return bool(hits)
+
+
+CONST_INIT = re.compile(r"cannot initialize (?:return object|a variable) of type '([^']+)' with an (?:rvalue|lvalue) "
+                        r"of type 'const [^']+'")
+
+
+def const_casts(lines, diags, src, record):
+    """VC2008 let a const pointer (e.g. `cond ? p : ""`) initialise a non-const one; clang does not. Cast the
+    expression to the target type named by the diagnostic, for `return EXPR;` and `T name = EXPR;` lines only."""
     changed = False
+    for d in diags:
+        a = ASSIGN_LITERAL.match(d['msg'])
+        if a and d['kind'] == 'error' and same_file(d['file'], src):
+            i = d['line'] - 1
+            new = re.sub(r'^(\s*[^=;]+?=\s*)("(?:[^"\\]|\\.)*")(\s*;.*)$',
+                         lambda r: '%s(%s)%s%s' % (r.group(1), a.group(1), r.group(2), r.group(3)), lines[i])
+            if new != lines[i]:
+                lines[i] = new
+                record.append(dict(rule='constcast', line=d['line']))
+                changed = True
+            continue
+        m = CONST_INIT.match(d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src):
+            continue
+        i, target = d['line'] - 1, m.group(1)
+        line = lines[i]
+        new = re.sub(r'^(\s*return\s+)(.+);(\s*(//.*)?)$', lambda r: '%s(%s)(%s);%s' % (r.group(1), target, r.group(2),
+                                                                                  r.group(3)), line)
+        if new == line:
+            new = re.sub(r'^(\s*[\w:<>\s\*&]+?\b\w+\s*=\s*)(.+);(\s*(//.*)?)$',
+                         lambda r: '%s(%s)(%s);%s' % (r.group(1), target, r.group(2), r.group(3)), line)
+        if new != line:
+            lines[i] = new
+            record.append(dict(rule='constcast', line=d['line']))
+            changed = True
+    return changed
+
+
+ASSIGN_LITERAL = re.compile(r"assigning to '([^']+)' from incompatible type 'const char\[\d+\]'")
+
+
+def lvalue_wraps(lines, diags, src, record):
+    """VC2008 bound temporaries to non-const references and allowed `(T&)rvalue`. Wrap the temporary in
+    fnv_lvalue(...) (port/compat/fnv_overlay_helpers.h), using clang's source ranges: the argument for a binding
+    error, the operand (last range) for a C-style cast. Single-line ranges only, applied right to left."""
+    edits = {}
+    for d in diags:
+        if d['kind'] != 'error' or not same_file(d['file'], src) or not d['ranges']:
+            continue
+        if 'cannot bind to a temporary of type' in d['msg']:
+            r = d['ranges'][0]
+        elif 'C-style cast from rvalue to reference type' in d['msg']:
+            r = d['ranges'][-1]
+        else:
+            continue
+        l1, c1, l2, c2 = r
+        if l1 == l2:
+            edits.setdefault(l1, set()).add((c1, c2))
+    for ln, spans in edits.items():
+        line = lines[ln - 1]
+        for c1, c2 in sorted(spans, reverse=True):
+            line = line[:c1 - 1] + 'fnv_lvalue(' + line[c1 - 1:c2 - 1] + ')' + line[c2 - 1:]
+        lines[ln - 1] = line
+        record.append(dict(rule='lvalue', line=ln, edits=len(spans)))
+    return bool(edits)
+
+
+def incomplete_if_not_exists(lines, diags, src, record):
+    """`__if_not_exists(X::~X)` on a class that is only forward-declared means "not defined yet" (VC2008: true);
+    clang rejects the incomplete type. Test a name that is never declared, so the block is kept."""
+    changed = False
+    for d in diags:
+        m = re.match(r"incomplete type '(\w+)' named in nested name specifier", d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src):
+            continue
+        i, x = d['line'] - 1, m.group(1)
+        new = re.sub(r'__if_not_exists\s*\(\s*%s::~%s\s*\)' % (x, x), '__if_not_exists(__fnv_never_declared_%s)' % x,
+                     lines[i])
+        if new != lines[i]:
+            lines[i] = new
+            record.append(dict(rule='ifexists-incomplete', line=d['line']))
+            changed = True
+    return changed
+
+
+def rename_namespaced_specializations(lines, diags, src, record):
+    """`template <> class T<ARGS> {...}` inside a namespace specialises a global template (VC2008 allowed it; C++
+    requires global scope, and the body uses names of the enclosing namespace). Turn it into a plain class
+    T__fnvspecK: the declaration, its constructors/destructor inside the body, and every `T<ARGS>` from the
+    declaration to the end of the enclosing namespace. Functions whose mangling changes bind through the @fnv map."""
+    changed = False
+    depth = namespace_depths(lines)
+    for d in diags:
+        m = re.match(r"class template specialization of '(\w+)' must occur at global scope", d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src):
+            continue
+        i, t = d['line'] - 1, m.group(1)
+        decl = re.match(r'^(\s*)template\s*<\s*>\s*(class|struct)\s+%s\s*<(.*)>(.*)$' % t, lines[i])
+        if not decl or not depth[i]:
+            continue
+        args = decl.group(3)
+        k = sum(1 for c in record if c['rule'] == 'nsspec') + 1
+        new = '%s__fnvspec%d' % (t, k)
+        lines[i] = '%s%s %s%s' % (decl.group(1), decl.group(2), new, decl.group(4))
+        # body extent
+        level, j, opened = 0, i, False
+        while j < len(lines):
+            code = re.sub(r'//.*', '', lines[j])
+            level += code.count('{') - code.count('}')
+            opened |= '{' in code
+            if opened and level <= 0:
+                break
+            j += 1
+        for b in range(i + 1, min(j + 1, len(lines))):
+            lines[b] = re.sub(r'(~?)\b%s\s*\(' % t, lambda r: r.group(1) + new + '(', lines[b])
+        # uses across the whole enclosing namespace (VC2008 used the specialisation even where it came after a
+        # use); a forward declaration on the namespace's opening line keeps earlier by-value parameters valid
+        end = scope_end(lines, i + 1)
+        start = i
+        while start > 0 and not (depth[start - 1] == depth[i] - 1 and re.search(r'\bnamespace\b', lines[start - 1])):
+            start -= 1
+        use = re.compile(r'\b%s\s*<\s*%s\s*>' % (t, r'\s*'.join(re.escape(x) for x in re.split(r'\s+', args.strip()))))
+        for b in range(start, end):
+            lines[b] = use.sub(new, lines[b])
+        if start > 0:
+            lines[start - 1] += ' %s %s;' % (decl.group(2), new)
+        record.append(dict(rule='nsspec', name=t, args=args.strip(), line=d['line'], new=new))
+        changed = True
+    return changed
+
+
+def drop_sdk_redeclarations(lines, diags, src, record):
+    """The unit redeclares a Windows SDK function with its own types; clang reports the clash inside the SDK header,
+    with a note pointing at the unit's declaration. Comment out that one-line declaration so the SDK's is used."""
+    changed = False
+    for k, d in enumerate(diags):
+        if d['kind'] != 'error' or same_file(d['file'], src) or not d['msg'].startswith('conflicting types for'):
+            continue
+        for n in diags[k + 1:k + 4]:
+            if n['kind'] == 'note' and 'previous declaration' in n['msg'] and same_file(n['file'], src):
+                i = n['line'] - 1
+                if lines[i].rstrip().endswith(';') and '{' not in lines[i] and not lines[i].lstrip().startswith('//'):
+                    lines[i] = '// [overlay sdkdup] ' + lines[i]
+                    record.append(dict(rule='sdkdup', line=n['line']))
+                    changed = True
+                break
+    return changed
+
+
+def spec_conversions(lines, diags, src, record):
+    """A renamed namespaced specialisation (T__fnvspecK) meets code declared outside the namespace that still uses
+    the global T<ARGS>. Both are the same object layout (the original was one type): reinterpret the operand."""
+    edits = {}
+    for d in diags:
+        m = re.match(r"no viable conversion from '([^']+)' to '([^']+)'", d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src) or not d['ranges']:
+            continue
+        if '__fnvspec' not in m.group(1) and '__fnvspec' not in m.group(2):
+            continue
+        target = re.sub(r"\s*\(aka.*$", '', m.group(2))
+        l1, c1, l2, c2 = d['ranges'][0]
+        if l1 == l2:
+            edits.setdefault(l1, set()).add((c1, c2, target))
+    for ln, spans in edits.items():
+        line = lines[ln - 1]
+        for c1, c2, target in sorted(spans, reverse=True):
+            line = line[:c1 - 1] + '(*(%s*)&(' % target + line[c1 - 1:c2 - 1] + '))' + line[c2 - 1:]
+        lines[ln - 1] = line
+        record.append(dict(rule='specconv', line=ln))
+    return bool(edits)
+
+
+def incomplete_dynamic_casts(lines, diags, src, record):
+    """dynamic_cast<T*>(e) where T is only forward-declared here: cast by decorated name instead
+    (fnv_dyncast, port/compat/fnv_rtti.cpp). Global-namespace class names only."""
+    changed = False
+    for d in diags:
+        m = re.match(r"'(\w+)' is an incomplete type", d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src):
+            continue
+        i, t = d['line'] - 1, m.group(1)
+        new = re.sub(r'\bdynamic_cast\s*<\s*%s\s*\*\s*>\s*\(' % t, 'fnv_dyncast<%s>(".?AV%s@@", ' % (t, t), lines[i])
+        if new != lines[i]:
+            lines[i] = new
+            record.append(dict(rule='dyncast-name', line=d['line'], type=t))
+            changed = True
+    return changed
+
+
+def small_msvc_leniencies(lines, diags, src, record):
+    """One-line VC2008 leniencies:
+       * `T* x = fnv_dyncast<D>(...)` where D is incomplete (so not known to derive from T): cast through void*;
+       * `class ::X;` (a qualified forward declaration): dropped, the global X is declared elsewhere;
+       * a string literal passed to a `void *` parameter: cast the literals on that line."""
+    changed = False
+    for k, d in enumerate(diags):
+        if d['kind'] != 'error' or not same_file(d['file'], src):
+            continue
+        i = d['line'] - 1
+        line = lines[i]
+        m = re.match(r"cannot initialize a variable of type '([^']+)' with an rvalue of type '[^']+'", d['msg'])
+        if m and 'fnv_dyncast<' in line:
+            new = line.replace('= fnv_dyncast<', '= (%s)(void*)fnv_dyncast<' % m.group(1), 1)
+        elif 'forward declaration of class cannot have a nested name specifier' in d['msg'] and \
+                re.match(r'^\s*(class|struct)\s+::\w+\s*;\s*$', line):
+            new = '// [overlay fwd] ' + line
+        elif d['msg'].startswith('no matching function for call to') and any(
+                n['kind'] == 'note' and re.search(r"no known conversion from 'const char\[\d+\]' to 'void \*'", n['msg'])
+                for n in diags[k + 1:k + 6]):
+            new = re.sub(r'(?<![\w)])("(?:[^"\\]|\\.)*")', r'(void*)\1', line)
+        else:
+            continue
+        if new != line:
+            lines[i] = new
+            record.append(dict(rule='leniency', line=d['line']))
+            changed = True
+    return changed
+
+
+def sdk_conflict_renames(lines, diags, src, record):
+    """The unit declares a Windows API function itself (simplified types) at file scope and includes <windows.h>
+    only later; clang reports the clash inside the SDK header, with a note at the unit's declaration. Rename the
+    function from that declaration up to the next system #include to NAME__fnvdupK: uses before the include keep
+    the unit's types, later ones the SDK's, and the relink strips the marker (__imp__NAME@N binds the IAT slot)."""
+    changed = False
+    for k, d in enumerate(diags):
+        m = re.match(r"conflicting types for '(\w+)'", d['msg'])
+        if d['kind'] != 'error' or not m or same_file(d['file'], src):
+            continue
+        note = next((n for n in diags[k + 1:k + 4] if n['kind'] == 'note' and 'previous declaration' in n['msg']
+                     and same_file(n['file'], src)), None)
+        if note is None:
+            continue
+        name, start = m.group(1), note['line']
+        # an SDK include nested in a namespace (seen in the decomp) declares into that namespace, so it does not
+        # end the region; only one at file scope does
+        depth = namespace_depths(lines)
+        end = next((j for j in range(start, len(lines)) if re.match(r'\s*#\s*include\s*<', lines[j]) and not depth[j]),
+                   len(lines))
+        kth = sum(1 for c in record if c['rule'] == 'sdkrename') + 1
+        pat = re.compile(r'(?<![\w$])%s(?![\w$])' % re.escape(name))
+        for j in range(start - 1, end):
+            if not lines[j].lstrip().startswith('#'):
+                lines[j] = pat.sub('%s__fnvdup%d' % (name, 90 + kth), lines[j])
+        record.append(dict(rule='sdkrename', name=name, lines=[start, end]))
+        changed = True
+    return changed
+
+
+def fix_round(lines, diags, src, record):
+    if drop_extern_c(lines, diags, src, record):
+        return True                        # re-diagnose before any rename rule touches these names
+    changed = apply_fixits(lines, diags, src, record)
+    changed |= const_casts(lines, diags, src, record)
+    changed |= lvalue_wraps(lines, diags, src, record)
+    changed |= incomplete_if_not_exists(lines, diags, src, record)
+    changed |= rename_namespaced_specializations(lines, diags, src, record)
+    changed |= spec_conversions(lines, diags, src, record)
+    changed |= incomplete_dynamic_casts(lines, diags, src, record)
+    changed |= small_msvc_leniencies(lines, diags, src, record)
+    changed |= sdk_conflict_renames(lines, diags, src, record)
     ours = [d for d in diags if same_file(d['file'], src)]
     # qualify: N::X where N doesn't declare X but the global scope does (VC2008 resolved these)
     for d in ours:
@@ -235,21 +556,33 @@ def process(index, unit, rounds):
         sse = 'own' if global_own else 'types'
     out = overlay_path(index, unit)
     out.parent.mkdir(parents=True, exist_ok=True)
-    lines = text.splitlines()
     record = [dict(rule='sse', mode=sse, unified=unified)] if sse else []
+    # __if_not_exists(T::T) ("class T is not declared yet") errors in clang when T is undeclared; test T itself
+    text, n = re.subn(r'__if_not_exists\s*\(\s*(::)?(\w+)::\2\s*\)', r'__if_not_exists(\1\2)', text)
+    if n:
+        record.append(dict(rule='ifexists', count=n))
+    lines = text.splitlines()
+    modern = False
     first_errors = None
     for r in range(rounds):
         out.write_text('\n'.join(lines) + '\n')
-        ok, diags = compile_unit(unit, out, sse, obj_path(index, unit))
+        ok, diags = compile_unit(unit, out, sse, obj_path(index, unit), modern)
         errs = [d for d in diags if d['kind'] == 'error']
         if first_errors is None:
             first_errors = len(errs)
         if ok:
             break
-        if not fix_round(lines, diags, out, record):
+        changed = False
+        if not modern and any(STL_HEADERS.search(Path(d['file']).name and d['file']) or 'char16_t' in d['msg']
+                              for d in errs):
+            modern = True
+            record.append(dict(rule='modern'))
+            changed = True
+        if not fix_round(lines, diags, out, record) and not changed:
             break
     (out.parent / (out.name + '.overlay.json')).write_text(json.dumps(dict(source=unit['source'], ok=ok,
-                                                                          rounds=r + 1, changes=record), indent=1))
+                                                                          rounds=r + 1, modern=modern,
+                                                                          changes=record), indent=1))
     remaining = Counter(re.sub(r"'[^']*'", "'X'", d['msg'])[:100] for d in diags if d['kind'] == 'error')
     return unit['source'], ok, record, remaining
 

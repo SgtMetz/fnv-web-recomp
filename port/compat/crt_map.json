@@ -1,0 +1,266 @@
+{
+ "_note": "Out-of-scope C runtime functions of FalloutNV.exe 1.4.0.525, bound to the modern CRT by symbol. Source 'name': the decomp names this address after a CRT function in some unit (rule 4: names can be wrong; checked by signature). Source 'disasm': identified or confirmed by reading the original code.",
+ "map": {
+  "0x00ec32e3": {
+   "symbol": "??0_Lockit@std@@QAE@H@Z",
+   "source": "name"
+  },
+  "0x00ec43fb": {
+   "symbol": "___RTDynamicCast",
+   "source": "name"
+  },
+  "0x00ec44d0": {
+   "symbol": "_memmove",
+   "source": "name"
+  },
+  "0x00ec4835": {
+   "symbol": "_memcmp",
+   "source": "name"
+  },
+  "0x00ec5fce": {
+   "symbol": "??_M@YGXPAXIHP6EX0@Z@Z",
+   "source": "name"
+  },
+  "0x00ec6054": {
+   "symbol": "_sqrt",
+   "source": "disasm",
+   "evidence": "x87 fsqrt with domain-error path"
+  },
+  "0x00ec6130": {
+   "symbol": "_strlen",
+   "source": "name"
+  },
+  "0x00ec61c0": {
+   "symbol": "_memset",
+   "source": "name"
+  },
+  "0x00ec62c0": {
+   "symbol": "__ftol2_sse",
+   "source": "name"
+  },
+  "0x00ec6370": {
+   "symbol": "_strcpy",
+   "source": "name"
+  },
+  "0x00ec6380": {
+   "symbol": "_strcat",
+   "source": "name"
+  },
+  "0x00ec658f": {
+   "symbol": "_atexit",
+   "source": "name"
+  },
+  "0x00ec65a6": {
+   "symbol": "_strcpy_s",
+   "source": "name"
+  },
+  "0x00ec67aa": {
+   "symbol": "_tolower",
+   "source": "disasm",
+   "evidence": "'A'..'Z' range check"
+  },
+  "0x00ec68e4": {
+   "symbol": "__stricmp",
+   "source": "name"
+  },
+  "0x00ec6bd2": {
+   "symbol": "_strcat_s",
+   "source": "name"
+  },
+  "0x00ec6cde": {
+   "symbol": "_fabs",
+   "source": "disasm",
+   "evidence": "x87 fabs"
+  },
+  "0x00ec6da0": {
+   "symbol": "_strcmp",
+   "source": "name"
+  },
+  "0x00ec6e30": {
+   "symbol": "_strrchr",
+   "source": "name"
+  },
+  "0x00ec6f20": {
+   "symbol": "_qsort",
+   "source": "name"
+  },
+  "0x00ec716d": {
+   "symbol": "_bsearch",
+   "source": "name"
+  },
+  "0x00ec7595": {
+   "symbol": "__finite",
+   "source": "name"
+  },
+  "0x00ec75b1": {
+   "symbol": "__isnan",
+   "source": "name"
+  },
+  "0x00ec7690": {
+   "symbol": "_strchr",
+   "source": "name"
+  },
+  "0x00ec7750": {
+   "symbol": "_strstr",
+   "source": "name"
+  },
+  "0x00ec782f": {
+   "symbol": "??_L@YGXPAXIHP6EX0@Z1@Z",
+   "source": "name"
+  },
+  "0x00ec7c56": {
+   "symbol": "__invalid_parameter_noinfo",
+   "source": "name"
+  },
+  "0x00ec7ce3": {
+   "symbol": "_memmove_s",
+   "source": "name"
+  },
+  "0x00ec7d40": {
+   "symbol": "_abs",
+   "source": "disasm",
+   "evidence": "neg if negative"
+  },
+  "0x00ec7ec0": {
+   "symbol": "__strnicmp",
+   "source": "name"
+  },
+  "0x00ec7f1e": {
+   "symbol": "__splitpath_s",
+   "source": "name"
+  },
+  "0x00ec825b": {
+   "symbol": "__makepath_s",
+   "source": "name"
+  },
+  "0x00ec86e1": {
+   "symbol": "_isalpha",
+   "source": "name"
+  },
+  "0x00ec89e9": {
+   "symbol": "_isalnum",
+   "source": "name"
+  },
+  "0x00ec8a19": {
+   "symbol": "_strncmp",
+   "source": "name"
+  },
+  "0x00ec8d08": {
+   "symbol": "_strtol",
+   "source": "name"
+  },
+  "0x00ec8d5f": {
+   "symbol": "_strncpy_s",
+   "source": "name"
+  },
+  "0x00ec9010": {
+   "symbol": "_atan",
+   "source": "name"
+  },
+  "0x00ec9130": {
+   "symbol": "_fmod",
+   "source": "name"
+  },
+  "0x00ec9907": {
+   "symbol": "_fclose",
+   "source": "name"
+  },
+  "0x00ec9a47": {
+   "symbol": "_fopen",
+   "source": "name"
+  },
+  "0x00ec9a5e": {
+   "symbol": "_fopen_s",
+   "source": "name"
+  },
+  "0x00ec9ac0": {
+   "symbol": "_pow",
+   "source": "name"
+  },
+  "0x00ec9e10": {
+   "symbol": "_ceil",
+   "source": "name"
+  },
+  "0x00ec9f30": {
+   "symbol": "_cos",
+   "source": "name"
+  },
+  "0x00eca060": {
+   "symbol": "_sin",
+   "source": "name"
+  },
+  "0x00eca573": {
+   "symbol": "_atof",
+   "source": "name"
+  },
+  "0x00eca590": {
+   "symbol": "_tan",
+   "source": "name"
+  },
+  "0x00eca6d3": {
+   "symbol": "_atoi",
+   "source": "name"
+  },
+  "0x00eca7f4": {
+   "symbol": "_toupper",
+   "source": "name"
+  },
+  "0x00ecada6": {
+   "symbol": "_srand",
+   "source": "name"
+  },
+  "0x00ecadb8": {
+   "symbol": "_rand",
+   "source": "disasm",
+   "evidence": "MSVC LCG (x*0x343FD+0x269EC3)>>16 & 0x7FFF"
+  },
+  "0x00ecadda": {
+   "symbol": "__time64",
+   "source": "name"
+  },
+  "0x00ecae30": {
+   "symbol": "_exp",
+   "source": "name"
+  },
+  "0x00ecb086": {
+   "symbol": "_fwrite",
+   "source": "name"
+  },
+  "0x00ecb562": {
+   "symbol": "_ftell",
+   "source": "name"
+  },
+  "0x00ecb65a": {
+   "symbol": "_fseek",
+   "source": "name"
+  },
+  "0x00ecbf05": {
+   "symbol": "__access",
+   "source": "name"
+  },
+  "0x00ecbf20": {
+   "symbol": "_strpbrk",
+   "source": "name"
+  },
+  "0x00ecc104": {
+   "symbol": "_fgets",
+   "source": "name"
+  },
+  "0x00ecc7b0": {
+   "symbol": "_strncpy",
+   "source": "name"
+  },
+  "0x00eccf5d": {
+   "symbol": "_realloc",
+   "source": "name"
+  },
+  "0x00ecdb00": {
+   "symbol": "_wcslen",
+   "source": "name"
+  },
+  "0x00ecdd16": {
+   "symbol": "__gcvt",
+   "source": "name"
+  }
+ }
+}

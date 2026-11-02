@@ -96,11 +96,102 @@ void* relinked(DWORD original)
     return (it != g_table.end() && it->original == original) ? it->relinked : nullptr;
 }
 
+const DWORD kTrapException = 0xE0F17E01u;   // raised by fnv_trap (DLL) and loader_unbound (address, name)
+
 extern "C" void __cdecl loader_unbound(DWORD original)
 {
     fprintf(g_log, "[loader] call into unbound original code at 0x%08lx\n", original);
     fflush(g_log);
-    ExitProcess(0xF17D0000u | (original & 0xffff));
+    ULONG_PTR args[2] = {original, 0};
+    RaiseException(kTrapException, EXCEPTION_NONCONTINUABLE, 2, args);
+}
+
+struct InitResult
+{
+    DWORD code;          // 0 = ran; kTrapException = hit unbound code; else the exception code
+    DWORD detail;        // trap: original address; access violation: faulting data address
+    void* where;         // exception address
+    DWORD frames[6];     // return addresses from the EBP chain at the fault
+};
+
+// Guarded call without compiler SEH (clang-cl crashed on __try here): call_guarded saves the callee-saved
+// registers, ESP and the fs:[0] SEH chain head; while a guarded call is active, a vectored handler turns a trap or
+// hardware fault into a jump to guard_resume, which restores ESP and fs:[0] (dropping any SEH frames the abandoned
+// code registered) and returns 1. C++ exceptions (0xE06D7363) are left to their normal handlers.
+InitResult g_guard;
+volatile LONG g_guardActive = 0;
+DWORD g_guardEsp = 0, g_guardSeh = 0;
+
+extern "C" __declspec(naked) int __cdecl call_guarded(void(__cdecl* f)(void))
+{
+    __asm {
+        push ebx
+        push esi
+        push edi
+        push ebp
+        mov eax, fs:[0]
+        mov g_guardSeh, eax
+        mov g_guardEsp, esp
+        mov eax, [esp + 20]
+        call eax
+        xor eax, eax
+        pop ebp
+        pop edi
+        pop esi
+        pop ebx
+        ret
+    }
+}
+
+extern "C" __declspec(naked) void guard_resume()
+{
+    __asm {
+        mov esp, g_guardEsp
+        mov eax, g_guardSeh
+        mov fs:[0], eax
+        mov eax, 1
+        pop ebp
+        pop edi
+        pop esi
+        pop ebx
+        ret
+    }
+}
+
+LONG CALLBACK guard_handler(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    bool fault = code == kTrapException || code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
+                 code == EXCEPTION_PRIV_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
+                 code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
+    if (!g_guardActive || !fault)
+        return EXCEPTION_CONTINUE_SEARCH;
+    g_guard.code = code;
+    g_guard.where = ep->ExceptionRecord->ExceptionAddress;
+    g_guard.detail = ep->ExceptionRecord->NumberParameters >= 2
+                         ? (DWORD)ep->ExceptionRecord->ExceptionInformation[code == kTrapException ? 0 : 1] : 0;
+    DWORD* fp = (DWORD*)ep->ContextRecord->Ebp;
+    for (int i = 0; i < 6; ++i)
+    {
+        g_guard.frames[i] = 0;
+        if (!fp || IsBadReadPtr(fp, 8))
+            break;
+        g_guard.frames[i] = fp[1];
+        fp = (DWORD*)fp[0];
+    }
+    g_guardActive = 0;
+    ep->ContextRecord->Eip = (DWORD)&guard_resume;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+// One original initializer, guarded, so a single run reports every blocker.
+InitResult run_initializer(void(__cdecl* f)(void))
+{
+    g_guard = InitResult{0, 0, nullptr, {0}};
+    g_guardActive = 1;
+    call_guarded(f);
+    g_guardActive = 0;
+    return g_guard;
 }
 
 // push imm32 ; call rel32 loader_unbound  (never returns)
@@ -195,7 +286,7 @@ int main(int argc, char** argv)
     // 2. game DLL: change to the install folder so the game finds Data\ and its own DLLs
     char gameDir[MAX_PATH], dllPath[MAX_PATH];
     GetFullPathNameA(dll, MAX_PATH, dllPath, nullptr);
-    strcpy_s(gameDir, exe);
+    GetFullPathNameA(exe, MAX_PATH, gameDir, nullptr);       // also normalises '/' to '\'
     if (char* slash = strrchr(gameDir, '\\'))
         *slash = 0;
     SetCurrentDirectoryA(gameDir);
@@ -318,8 +409,12 @@ int main(int argc, char** argv)
     }
     fprintf(g_log, "[loader] imports: %zu resolved, %zu missing\n", imported, missing);
 
-    // 5. original C++ initializers, in their original order
-    size_t ran = 0, skipped = 0;
+    // 5. original C++ initializers, in their original order. Each runs under SEH: one that reaches unbound code or
+    //    faults is logged with the original address it was blocked on, and startup continues, so one run lists
+    //    every blocker. FNV_STRICT_INIT=1 stops at the first one instead.
+    bool strict = getenv("FNV_STRICT_INIT") && *getenv("FNV_STRICT_INIT") == '1';
+    PVOID veh = AddVectoredExceptionHandler(1, guard_handler);
+    size_t ran = 0, skipped = 0, blocked = 0;
     for (DWORD p = kXcA; p < kXcZ; p += 4)
     {
         auto f = *(void(__cdecl**)(void))p;
@@ -330,10 +425,36 @@ int main(int argc, char** argv)
             ++skipped;                                        // initializer outside the decomp's scope
             continue;
         }
-        f();
+        InitResult r = strict ? InitResult{0, 0, nullptr, {0}} : run_initializer(f);
+        if (strict)
+            f();
+        if (r.code)
+        {
+            ++blocked;
+            auto it = std::lower_bound(g_byPtr.begin(), g_byPtr.end(), (void*)f,
+                                       [](const AddrEntry& e, void* q) { return e.relinked < q; });
+            DWORD orig = (it != g_byPtr.end() && it->relinked == (void*)f) ? it->original : 0;
+            if (r.code == kTrapException)
+                fprintf(g_log, "[init-blocked] initializer 0x%08lx (slot 0x%08lx): unbound 0x%08lx\n", orig, p,
+                        r.detail);
+            else
+            {
+                fprintf(g_log, "[init-blocked] initializer 0x%08lx (slot 0x%08lx): exception 0x%08lx at %p "
+                               "(data 0x%08lx)\n", orig, p, r.code, r.where, r.detail);
+                describe(r.where);
+                for (int i = 0; i < 6 && r.frames[i]; ++i)
+                {
+                    fprintf(g_log, "[loader]   from %08lx", r.frames[i]);
+                    describe((void*)r.frames[i]);
+                }
+            }
+            continue;
+        }
         ++ran;
     }
-    fprintf(g_log, "[loader] initializers: %zu ran, %zu skipped (not relinked)\n", ran, skipped);
+    RemoveVectoredExceptionHandler(veh);
+    fprintf(g_log, "[loader] initializers: %zu ran, %zu blocked, %zu skipped (not relinked)\n", ran, blocked,
+            skipped);
     fflush(g_log);
 
     // 6. WinMain

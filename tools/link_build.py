@@ -27,6 +27,7 @@ from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, r'E:\Games\fnv_decomp-main\tools')
 import relink_plan as rp  # noqa: E402
 from relink import Image  # noqa: E402
 
@@ -35,6 +36,23 @@ DECOMP = rp.DECOMP
 LINK = ROOT / 'out/link'
 LLVM = Path(r'C:\Program Files\LLVM\bin')
 DUP = re.compile(r'__fnvdup\d+')
+# Port runtime and compat sources linked into the game DLL (source, object name).
+COMPAT_SOURCES = [
+    ('port/runtime/fnv_trap.cpp', 'fnv_trap.obj'),
+    ('port/compat/fnv_msvc_xmm.cpp', 'fnv_msvc_xmm.obj'),
+    ('port/compat/fnv_vc2008_shims.cpp', 'fnv_vc2008_shims.obj'),
+    ('port/compat/fnv_rtti.cpp', 'fnv_rtti.obj'),
+    ('port/runtime/fnv_lift_runtime.cpp', 'fnv_lift_runtime.obj'),
+]
+XC_TABLE = (0x00FDF4A4, 0x010113C0)     # __xc_a..__xc_z of FalloutNV.exe 1.4.0.525 (see port/loader/loader.cpp)
+# Units left out of the link (their functions become logging traps) until fixed, with the reason.
+EXCLUDE = {
+    'src/fallout_shared/tesscript.cpp':
+        'declares the original __tls_index slot (DAT_0126fd98) as a __declspec(thread) variable; no correct binding '
+        'exists in a clang-built DLL (SECREL to a non-TLS address)',
+}
+# a mangled function or variable whose own name is FUN_/DAT_<8 hex digits>, in any scope, or the plain C name
+ADDR_NAME = re.compile(r'^(?:\?|_)(FUN|DAT)_([0-9a-fA-F]{8})(?:@|$)')
 LNK_REMOVE = 0x800
 SYM_ABSOLUTE = -1
 EXTERNAL, STATIC, WEAK_EXTERNAL = 2, 3, 105
@@ -90,9 +108,53 @@ class CoffPatch:
         if storage is not None:
             struct.pack_into('<B', self.data, o + 16, storage)
 
+    def drop_includes(self, names):
+        """Blank (same length) /INCLUDE:name directives in .drectve for symbols this patch renamed: the linker would
+        otherwise demand the old name. Returns how many were dropped."""
+        n = 0
+        for sec in range(1, self.nsec + 1):
+            if self.section_name(sec) != '.drectve':
+                continue
+            h = 20 + (sec - 1) * 40
+            size, raw = struct.unpack_from('<II', self.data, h + 16)
+            text = bytes(self.data[raw:raw + size]).decode('latin1')
+            for m in re.finditer(r'/INCLUDE:("?)([^" ]+)\1', text, re.I):
+                if m.group(2) in names:
+                    self.data[raw + m.start():raw + m.end()] = b' ' * (m.end() - m.start())
+                    n += 1
+        return n
+
+    def add_symbol(self, name, storage=EXTERNAL):
+        """Append an undefined symbol (after every existing one, so no index moves); returns its index."""
+        off = len(self.strings) + len(self.extra)
+        self.extra += name.encode('latin1') + b'\0'
+        self.added = getattr(self, 'added', bytearray())
+        index = self.nsym + len(self.added) // 18
+        self.added += struct.pack('<IIIhHBB', 0, off, 0, 0, 0, storage, 0)
+        return index
+
+    def retarget(self, old, new):
+        """Point every relocation that names symbol `old` at symbol `new`."""
+        n = 0
+        for sec in range(1, self.nsec + 1):
+            h = 20 + (sec - 1) * 40
+            relptr, = struct.unpack_from('<I', self.data, h + 24)
+            count, = struct.unpack_from('<H', self.data, h + 32)
+            if self.section_flags(sec) & 0x01000000:            # IMAGE_SCN_LNK_NRELOC_OVFL
+                count, = struct.unpack_from('<I', self.data, relptr)
+            for k in range(count):
+                o = relptr + k * 10
+                if struct.unpack_from('<I', self.data, o + 4)[0] == old:
+                    struct.pack_into('<I', self.data, o + 4, new)
+                    n += 1
+        return n
+
     def bytes(self):
         strings = self.strings + bytes(self.extra)
-        return bytes(self.data[:self.strptr]) + struct.pack('<I', len(strings)) + strings[4:]
+        added = bytes(getattr(self, 'added', b''))
+        head = bytearray(self.data[:self.strptr])
+        struct.pack_into('<I', head, 12, self.nsym + len(added) // 18)
+        return bytes(head) + added + struct.pack('<I', len(strings)) + strings[4:]
 
 
 CTX = {}
@@ -100,6 +162,40 @@ CTX = {}
 
 def init(ctx):
     CTX.update(ctx)
+
+
+CRT_REGION = (0x00EC3000, 0x00EDE000)     # the statically linked VC2008 CRT in FalloutNV.exe
+
+
+def crt_alias(name, addr, libsyms):
+    """Modern CRT symbol for a decomp name of a VC2008 CRT function, by name only, inside the CRT region:
+    `__malloc` (extern "C" _malloc) -> `_malloc`, `?_strlen@@YAIPBD@Z` -> `_strlen`. FUN_ names never match."""
+    if not CRT_REGION[0] <= addr < CRT_REGION[1] or 'FUN_' in name:
+        return None
+    m = re.match(r'^\?(_*\w+?)@@', name)
+    base = m.group(1) if m else re.sub(r'@\d+$', '', name)
+    for cand in (base, base[1:] if base.startswith('_') else None, '_' + base):
+        if cand and cand in libsyms:
+            return cand
+    return None
+
+
+def own_functions(index, defined=()):
+    """{mangled name: address} of the recipe functions a unit defines: the recipe's own names plus the @fnv source
+    map (tools/fnv_map.py), which binds definitions whose mangling changed (overlay renames, SSE unification, clang
+    vs VC2008 mangling differences)."""
+    own = {f['symbol']: int(f['address'], 16) for f in CTX['units'][index]['functions']}
+    mapped = CTX['fnv_map'].get(str(index), {})
+    # a unit can carry two definitions marked with one address (a readable copy and the matched shell), and a few
+    # @fnv comments sit above the wrong definition: the recipe's name wins whenever the object defines it;
+    # otherwise the first mapped name per address
+    taken = {own[n] for n in own if n in mapped or n in defined}
+    for name, addr in sorted(mapped.items()):
+        a = int(addr, 16)
+        if name not in own and a not in taken:
+            own[name] = a
+            taken.add(a)
+    return own
 
 
 def bound_vftable_sections(entries, index):
@@ -116,14 +212,15 @@ def patch_object(job):
     index, src, dst = job
     c = CTX
     unit = c['units'][index]
-    own = {f['symbol']: int(f['address'], 16) for f in unit['functions']}
     syms = unit.get('symbols', {})
     p = CoffPatch(Path(src).read_bytes())
     entries = list(p.symbols())
+    own = own_functions(index, {s['name'] for _, s in entries if s['section'] > 0})
     vsec = bound_vftable_sections(entries, index)
     for sec in vsec:
         p.flag_section(sec, LNK_REMOVE)
     stats, traps = Counter(), {}
+    renamed = set()        # names whose definition this patch renamed (their /INCLUDE directives go too)
     # clang's per-unit initializer lists: the loader runs the original __xc table instead, in its original order
     for sec in range(1, p.nsec + 1):
         if p.section_name(sec) == '.CRT$XCU':
@@ -139,6 +236,23 @@ def patch_object(job):
         if base == '__tls_index':
             return base, 'crt'          # the loader writes the DLL's own TLS index into the CRT's variable
         addr = int(syms[base], 0) if base in syms else c['global_names'].get(base)
+        if addr is None:
+            addr = c['inferred'].get(base)          # bound by call-site correspondence (infer_job)
+        if addr is None and base.startswith('__imp_?'):
+            # an import the overlay turned into a namespaced C++ declaration (dropc): bind to Name's IAT slot
+            ident = re.match(r'__imp_\?(\w+)@', base)
+            if ident:
+                addr = c['iat_by_name'].get(ident.group(1))
+        if addr is None:
+            # FUN_<addr> / DAT_<addr> name the address they live at, whatever namespace the overlay left them in
+            m = ADDR_NAME.match(base)
+            if m:
+                a = int(m.group(2), 16)
+                if (m.group(1) == 'FUN' and (a in c['starts'] or a in c['crt_map'])) or \
+                        (m.group(1) == 'DAT' and not (c['text'][0] <= a < c['text'][1])):
+                    addr = a
+        if addr is not None and addr in c['crt_map']:
+            return c['crt_map'][addr], 'crt-mapped'      # port/compat/crt_map.json
         if addr is not None and c['tls'][0] <= addr < c['tls'][1]:
             return 'fnv_t_%08x' % addr, 'tls'
         if addr is not None:
@@ -150,6 +264,9 @@ def patch_object(job):
             if c['text'][0] <= addr < c['text'][1]:
                 if base in c['libsyms']:
                     return base, 'crt'
+                alias = crt_alias(base, addr, c['libsyms'])
+                if alias:
+                    return alias, 'crt-alias'
                 traps['fnv_c_%08x' % addr] = (addr, base)
                 return 'fnv_c_%08x' % addr, 'code-other'
             return 'fnv_d_%08x' % addr, 'data'
@@ -173,9 +290,13 @@ def patch_object(job):
                 and not name.startswith('.') and bound_data(name):
             # a global the unit defines but the original keeps at a fixed address (e.g. the objects the generated
             # initializers construct): bind every use to the data image instead of the DLL's own copy
+            # The definition itself stays (COMDAT and associative sections remain consistent) as an unreferenced
+            # local; every relocation is retargeted to a new undefined symbol bound to the original address.
             new, kind = bind(name)
-            p.rename(i, new)
-            p.set(i, section=0, value=0, storage=EXTERNAL)
+            p.retarget(i, p.add_symbol(new))
+            renamed.add(name)
+            p.rename(i, '%s__fnvdead%d' % (name, index))
+            p.set(i, storage=STATIC)
             stats['data-definition-bound-' + kind] += 1
         elif s['storage'] == WEAK_EXTERNAL and name.startswith('??_E'):
             # clang's vector-deleting-dtor alias: only its (discarded) vftables use it
@@ -185,6 +306,7 @@ def patch_object(job):
             # another object owns this name (or it binds by address): keep this copy object-local
             p.rename(i, '%s__fnvlocal%d' % (name, index))
             p.set(i, storage=STATIC)
+            renamed.add(name)
             stats['dup-made-local'] += 1
         elif sec in vsec and s['storage'] == EXTERNAL:
             new, kind = bind(name)
@@ -199,16 +321,72 @@ def patch_object(job):
             if new != name:
                 p.rename(i, new)
             stats[kind] += 1
+    stats['drectve-include-dropped'] += p.drop_includes(renamed)
     Path(dst).write_bytes(p.bytes())
     return index, stats, traps
+
+
+def lookup(name, unit):
+    """Address a name binds to, without side effects (None when unbound or bound by name only)."""
+    c = CTX
+    base = DUP.sub('', name)
+    syms = unit.get('symbols', {})
+    addr = int(syms[base], 0) if base in syms else c['global_names'].get(base)
+    if addr is None:
+        addr = c['inferred'].get(base)
+    if addr is None:
+        m = ADDR_NAME.match(base)
+        if m and m.group(1) == 'FUN' and int(m.group(2), 16) in c['starts']:
+            addr = int(m.group(2), 16)
+    return addr
+
+
+def infer_job(job):
+    """Call-site correspondence for one object. For each relinked function F (original address A): the names its
+    call relocations (REL32) use that do not bind yet, against A's original call targets that no bound call of F
+    explains. One unbound name against one unexplained recipe target is a vote that the name is that function."""
+    from compare import Coff
+    index, src, _ = job
+    c = CTX
+    unit = c['units'][index]
+    coff = Coff(src)
+    defined = {s['name'] for s in coff.symbols.values() if s['section'] > 0}
+    own = own_functions(index, defined)
+    sec_fn = {}
+    for s in coff.symbols.values():
+        if s['section'] > 0 and s['name'] in own:
+            sec_fn.setdefault(s['section'], own[s['name']])
+    votes = []
+    for sec, a in sec_fn.items():
+        names, bound = set(), set()
+        for _, si, kind in coff.sections[sec]['relocs']:
+            if kind != 0x14:
+                continue
+            n = coff.symbols[si]['name']
+            if coff.symbols[si]['section'] > 0:
+                if n in own:
+                    bound.add(own[n])
+                continue
+            base = DUP.sub('', n)
+            addr = lookup(base, unit)
+            if addr is not None:
+                bound.add(addr)
+            elif not (base in c['libsyms'] or base in c['compat'] or base in c['by_name']):
+                names.add(base)
+        if len(names) != 1:
+            continue
+        cand = c['orig_calls'].get(a, set()) - bound - {a}
+        if len(cand) == 1:
+            votes.append((next(iter(names)), next(iter(cand))))
+    return votes
 
 
 def external_defs(job):
     """Externally defined names of an object, minus its own recipe functions and clang's vftable/RTTI sections."""
     index, src, _ = job
-    own = {f['symbol'] for f in CTX['units'][index]['functions']}
     p = CoffPatch(Path(src).read_bytes())
     entries = list(p.symbols())
+    own = set(own_functions(index, {s['name'] for _, s in entries if s['section'] > 0}))
     vsec = bound_vftable_sections(entries, index)
     # COMDAT selection per section, from the section symbol's aux record (byte 14); only NODUPLICATES (1) collides
     selection = {}
@@ -320,7 +498,8 @@ def cl(src, obj):
     vs = sorted(rp.VS.iterdir())[-1]
     sdk = sorted(Path(r'C:\Program Files (x86)\Windows Kits\10\Include').iterdir())[-1]
     cmd = [str(LLVM / 'clang-cl.exe'), '--target=i686-pc-windows-msvc', '/nologo', '/c', '/O2', '/MT', '/EHsc',
-           '-w', '/I' + str(ROOT / 'port/compat'), '/imsvc' + str(vs / 'include')]
+           '-w', '/I' + str(ROOT / 'port/compat'), '/I' + str(ROOT / 'port/runtime'),
+           '/imsvc' + str(vs / 'include')]
     cmd += ['/imsvc' + str(sdk / p) for p in ('ucrt', 'shared', 'um')]
     r = subprocess.run(cmd + ['/Fo' + str(obj), str(src)], capture_output=True, text=True)
     if r.returncode:
@@ -339,6 +518,61 @@ def build_loader(vs, sdk):
     return dict(exit=r.returncode, log=(r.stdout + r.stderr)[-2000:])
 
 
+def original_calls(img, units):
+    """{recipe function address: set of direct call/jump targets in the original}, EH tails included."""
+    text = next(s for s in img.sections if s['name'] == '.text')
+    code = img.data[text['raw']:text['raw'] + text['rsize']]
+    base = text['start']
+    spans = defaultdict(list)
+    for u in units:
+        for f in u['functions']:
+            spans[int(f['address'], 16)].append((int(f['address'], 16), f['size']))
+        for e in u.get('eh_tails', []):
+            spans[int(e['parent'], 16)].append((int(e['address'], 16), e['size']))
+    out = {}
+    for fn, ranges in spans.items():
+        targets = set()
+        for start, size in ranges:
+            o = start - base
+            for k in range(o, o + size - 4):
+                if code[k] in (0xE8, 0xE9):
+                    targets.add((base + k + 5 + struct.unpack_from('<i', code, k + 1)[0]) & 0xffffffff)
+        out[fn] = targets
+    return out
+
+
+def lift_initializers(exe, img, units, ctx):
+    """Translate the __xc entries that are not decomp functions (and what they register with atexit) into
+    out/link/lifted.cpp with tools/lift_stubs.py. Returns counts for the report."""
+    import lift_stubs
+    names = defaultdict(set)
+    for u in units:
+        for k, v in u.get('symbols', {}).items():
+            names[int(v, 0)].add(k)
+
+    def resolve(addr):
+        if addr in ctx['starts']:
+            return ('sym', 'fnv_f_%08x' % addr)
+        if addr in ctx['crt_map']:
+            return ('sym', ctx['crt_map'][addr])
+        for n in names.get(addr, ()):
+            alias = crt_alias(n, addr, ctx['libsyms'])
+            if alias:
+                return ('sym', alias)
+        return None
+
+    table = [img.u32(p) for p in range(XC_TABLE[0], XC_TABLE[1], 4)]
+    entries = sorted({v for v in table if v and v not in ctx['starts']})
+    text = next(s for s in img.sections if s['name'] == '.text')
+    lifter = lift_stubs.Lifter(exe, resolve, (text['start'], text['end']))
+    lifter.run(entries)
+    (LINK / 'lifted.cpp').write_text(lifter.source())
+    return dict(initializers=len(entries), lifted=len(lifter.lifted), unsupported=len(lifter.unsupported),
+                unsupported_top=sorted(Counter(re.sub(r'0x[0-9a-f]+', 'N', v) for v in lifter.unsupported.values())
+                                       .items(), key=lambda x: -x[1])[:15],
+                unbound_code_pointers=len(lifter.traps))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--exe', required=True)
@@ -353,12 +587,19 @@ def main():
             seen[k].add(int(v, 0))
         for f in u['functions']:
             seen[f['symbol']].add(int(f['address'], 16))
-    objs = {int(p.name[:4]): p for p in (ROOT / 'out/obj').glob('*.obj')}
+    objs = {int(p.name[:4]): p for p in (ROOT / 'out/obj').glob('*.obj')
+            if units[int(p.name[:4])]['source'] not in EXCLUDE}
     with ProcessPoolExecutor(a.jobs) as ex:
         tables = dict(zip(objs, ex.map(rp.nm, objs.values(), chunksize=32)))
     by_name = set().union(*(d for d, _ in tables.values()))
     compat = {'_' + n for n in re.findall(r'\b(_mm_\w+)\s*\(', (ROOT / 'port/compat/fnv_msvc_xmm.h').read_text())}
-    ctx = dict(units=units, starts={int(f['address'], 16): i for i, u in enumerate(units) for f in u['functions']},
+    fnv_map = json.loads((ROOT / 'out/fnv_map.json').read_text()) if (ROOT / 'out/fnv_map.json').exists() else {}
+    crt_map = {int(k, 16): v['symbol'] for k, v in
+               json.loads((ROOT / 'port/compat/crt_map.json').read_text())['map'].items()}
+    iat_by_name = {}
+    for va, full in img.imports().items():
+        iat_by_name.setdefault(full.split('!', 1)[1], va)
+    ctx = dict(units=units, fnv_map=fnv_map, crt_map=crt_map, iat_by_name=iat_by_name, starts={int(f['address'], 16): i for i, u in enumerate(units) for f in u['functions']},
                compiled=set(objs), text=(text['start'], text['end']), libsyms=rp.library_symbols(),
                global_names={k: next(iter(v)) for k, v in seen.items() if len(v) == 1},
                by_name=by_name, compat=compat,
@@ -385,6 +626,22 @@ def main():
             for f in u['functions']:
                 owner.setdefault(int(f['address'], 16), i)
     ctx['addr_owner'] = owner
+    # call-site correspondence against the original code (rule 4: the machine code is the authority)
+    ctx['orig_calls'] = original_calls(img, units)
+    ctx['inferred'] = {}
+    infer_rounds = []
+    for _ in range(4):
+        votes = defaultdict(Counter)
+        with ProcessPoolExecutor(a.jobs, initializer=init, initargs=(ctx,)) as ex:
+            for vs in ex.map(infer_job, jobs, chunksize=16):
+                for n, addr in vs:
+                    votes[n][addr] += 1
+        new = {n: next(iter(v)) for n, v in votes.items() if len(v) == 1 and n not in ctx['inferred']}
+        conflicting = sum(1 for v in votes.values() if len(v) > 1)
+        infer_rounds.append(dict(new=len(new), conflicting=conflicting))
+        if not new:
+            break
+        ctx['inferred'].update(new)
     stats, traps = Counter(), {}
     with ProcessPoolExecutor(a.jobs, initializer=init, initargs=(ctx,)) as ex:
         for _, s, t in ex.map(patch_object, jobs, chunksize=16):
@@ -401,24 +658,32 @@ def main():
     write_abs_obj(LINK / 'abs.obj', sorted(data_names))
     tls_names = {n for n in referenced if n.startswith('fnv_t_')}
     write_tls_obj(LINK / 'tls.obj', sorted(tls_names), ctx['tls'])
-    for n in referenced - defined - data_names - tls_names - ctx['libsyms'] - ctx['compat'] - set(traps):
+    # out-of-scope compiler-generated initializers (and the atexit thunks they register), lifted to C++
+    lift_report = lift_initializers(a.exe, img, units, ctx)
+    # port runtime/compat code: built first, so nothing it defines gets a trap stub
+    compat_defined = set()
+    for src, obj in COMPAT_SOURCES + [('out/link/lifted.cpp', 'lifted.obj')]:
+        cl(ROOT / src, LINK / obj)
+        ext, und = external_symbols(LINK / obj)
+        compat_defined |= ext
+        referenced |= und             # lifted code can name recipe functions no unit object defines
+    for n in referenced - defined - data_names - tls_names - ctx['libsyms'] - ctx['compat'] - compat_defined - set(traps):
         m = re.match(r'fnv_[fc]_([0-9a-f]{8})$', n)
         traps[n] = (int(m.group(1), 16) if m else 0, n)
         stats['trap-never-defined'] += 1
-    traps.pop('?terminate@@YAXXZ', None)
+    for n in compat_defined:
+        traps.pop(n, None)
     write_traps(LINK / 'traps.cpp', traps)
-    functions = {n for n in defined if re.match(r'fnv_f_[0-9a-f]{8}$', n)} |                 {n for n in traps if re.match(r'fnv_f_[0-9a-f]{8}$', n)}
+    functions = {n for n in defined | compat_defined if re.match(r'fnv_f_[0-9a-f]{8}$', n)} | \
+                {n for n in traps if re.match(r'fnv_f_[0-9a-f]{8}$', n)}
     write_addr_table(LINK / 'addr_table.obj', functions)
     cl(LINK / 'traps.cpp', LINK / 'traps.obj')
-    cl(ROOT / 'port/runtime/fnv_trap.cpp', LINK / 'fnv_trap.obj')
-    cl(ROOT / 'port/compat/fnv_msvc_xmm.cpp', LINK / 'fnv_msvc_xmm.obj')
-    cl(ROOT / 'port/compat/fnv_vc2008_shims.cpp', LINK / 'fnv_vc2008_shims.obj')
 
     vs = sorted(rp.VS.iterdir())[-1] / 'lib/x86'
     sdk = sorted(rp.KITS.iterdir())[-1]
     rsp = LINK / 'link.rsp'
-    inputs = [j[2] for j in jobs] + [str(LINK / n) for n in ('abs.obj', 'tls.obj', 'addr_table.obj', 'traps.obj', 'fnv_trap.obj',
-                                                            'fnv_msvc_xmm.obj', 'fnv_vc2008_shims.obj')]
+    inputs = [j[2] for j in jobs] + [str(LINK / n) for n in ('abs.obj', 'tls.obj', 'addr_table.obj', 'traps.obj')] + \
+             [str(LINK / obj) for _, obj in COMPAT_SOURCES] + [str(LINK / 'lifted.obj')]
     rsp.write_text('\n'.join('"%s"' % x for x in inputs) + '\n')
     cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/dll', '/machine:x86', '/base:0x20000000',
            '/dynamicbase:no', '/fixed', '/safeseh:no', '/errorlimit:0', '/export:fnv_addr_table,DATA', '/out:' + str(LINK / 'fnv_game.dll'),
@@ -436,7 +701,8 @@ def main():
             (undefined if m.group(1).startswith('undef') else duplicate)[m.group(2).strip()] += 1
         elif 'error:' in line:
             errs[re.sub(r"'[^']*'|\S+\.obj|0x[0-9a-f]+", 'X', line.split('error:', 1)[1].strip())[:110]] += 1
-    report = dict(patch=dict(stats), traps=len(traps), abs_symbols=len(data_names), addr_table=len(functions),
+    report = dict(patch=dict(stats), inferred=dict(names=len(ctx['inferred']), rounds=infer_rounds), lift=lift_report, traps=len(traps), abs_symbols=len(data_names),
+                  addr_table=len(functions),
                   link_exit=r.returncode,
                   undefined=len(undefined), duplicate=len(duplicate), other_errors=errs.most_common(20),
                   undefined_top=undefined.most_common(25), duplicate_top=duplicate.most_common(25))
