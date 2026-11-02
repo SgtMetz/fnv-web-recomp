@@ -1,0 +1,15 @@
+# Anything derived from FalloutNV.exe or game data stays local (rule 1)
+out/
+local/
+*.bin
+*.obj
+*.exe
+*.dll
+*.sdp
+*.dxbc
+*.spv
+*.wgsl.gen
+*.bsa
+*.esm
+*.dds
+__pycache__/
