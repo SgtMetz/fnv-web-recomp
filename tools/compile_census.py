@@ -35,8 +35,10 @@ def command(unit, decomp, obj):
     flags = [f for f in unit['flags'] if f not in ('/MT',)]
     # FNV_MSVER / FNV_STD override the language mode (measured: 19.44 + C++17 changes almost nothing)
     cmd = [CLANG_CL, '--target=i686-pc-windows-msvc', '/c', '/nologo', '/MT',
-           os.environ.get('FNV_MSVER', '-fms-compatibility-version=15.00'), os.environ.get('FNV_STD', '/std:c++14'),
+           os.environ.get('FNV_MSVER', '-fms-compatibility-version=15.00'),
            '-w', '-Wno-everything', '-ferror-limit=0', '/Zc:dllexportInlines-'] + flags
+    if os.environ.get('FNV_STD'):       # clang-cl's default for 15.00 compiles more units than an explicit /std:c++14
+        cmd.append(os.environ['FNV_STD'])
     for inc in includes():
         cmd.append('/imsvc' + str(inc))
     cmd.append('/I' + str(Path(decomp) / 'include'))

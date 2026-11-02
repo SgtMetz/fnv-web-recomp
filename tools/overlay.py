@@ -41,8 +41,8 @@ SSE_DEF = re.compile(r'union\s+(__declspec\([^)]*\)\s*|_CRT_ALIGN\(\d+\)\s*)*__m
                      r'|\b_mm_\w+\s*\(')
 
 
-def compile_unit(unit, src, sse):
-    cmd = cc.command(unit, str(DECOMP), 'NUL')
+def compile_unit(unit, src, sse, obj='NUL'):
+    cmd = cc.command(unit, str(DECOMP), obj)
     cmd[-1] = str(src)
     extra = ['/I' + str((DECOMP / unit['source']).parent), '/I' + str(SSE_BLOCK.parent)]
     if sse:
@@ -210,6 +210,11 @@ def fix_round(lines, diags, src, record):
     return changed
 
 
+def obj_path(index, unit):
+    """Same naming as compile_census.py, so out/obj holds one object per unit whichever tool built it."""
+    return str(ROOT / 'out/obj' / ('%04d_%s.obj' % (index, Path(unit['source']).stem)))
+
+
 def overlay_path(index, unit):
     """One folder per unit: a few sources are built by more than one unit (with different flags)."""
     return OUT / ('%04d' % index) / Path(unit['source']).name
@@ -235,7 +240,7 @@ def process(index, unit, rounds):
     first_errors = None
     for r in range(rounds):
         out.write_text('\n'.join(lines) + '\n')
-        ok, diags = compile_unit(unit, out, sse)
+        ok, diags = compile_unit(unit, out, sse, obj_path(index, unit))
         errs = [d for d in diags if d['kind'] == 'error']
         if first_errors is None:
             first_errors = len(errs)
