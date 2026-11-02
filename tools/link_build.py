@@ -124,6 +124,15 @@ def patch_object(job):
     for sec in vsec:
         p.flag_section(sec, LNK_REMOVE)
     stats, traps = Counter(), {}
+    # clang's per-unit initializer lists: the loader runs the original __xc table instead, in its original order
+    for sec in range(1, p.nsec + 1):
+        if p.section_name(sec) == '.CRT$XCU':
+            p.flag_section(sec, LNK_REMOVE)
+            stats['crt-xcu-stripped'] += 1
+
+    def bound_data(name):
+        addr = int(syms[name], 0) if name in syms else c['global_names'].get(name)
+        return addr is not None and addr not in c['starts'] and not (c['text'][0] <= addr < c['text'][1])
 
     def bind(name):
         base = DUP.sub('', name)
@@ -160,6 +169,14 @@ def patch_object(job):
                 p.rename(i, 'fnv_f_%08x__fnvlocal%d' % (own[name], index))
                 p.set(i, storage=STATIC)
                 stats['defined-recipe-second-copy'] += 1
+        elif sec > 0 and s['storage'] in (EXTERNAL, STATIC) and s['type'] != 0x20 and sec not in vsec \
+                and not name.startswith('.') and bound_data(name):
+            # a global the unit defines but the original keeps at a fixed address (e.g. the objects the generated
+            # initializers construct): bind every use to the data image instead of the DLL's own copy
+            new, kind = bind(name)
+            p.rename(i, new)
+            p.set(i, section=0, value=0, storage=EXTERNAL)
+            stats['data-definition-bound-' + kind] += 1
         elif s['storage'] == WEAK_EXTERNAL and name.startswith('??_E'):
             # clang's vector-deleting-dtor alias: only its (discarded) vftables use it
             p.rename(i, '%s__fnvlocal%d' % (name, index))
@@ -310,6 +327,18 @@ def cl(src, obj):
         raise SystemExit('compile failed: %s\n%s' % (src, r.stdout[-2000:] + r.stderr[-2000:]))
 
 
+def build_loader(vs, sdk):
+    """FalloutNV_relinked.exe: fixed at the original image base 0x00400000 so its .fnvimg section reserves the
+    original data range (see port/loader/loader.cpp)."""
+    cl(ROOT / 'port/loader/loader.cpp', LINK / 'loader.obj')
+    cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/machine:x86', '/subsystem:console', '/base:0x400000', '/fixed',
+           '/dynamicbase:no', '/largeaddressaware', '/out:' + str(LINK / 'FalloutNV_relinked.exe'),
+           '/libpath:' + str(vs), '/libpath:' + str(sdk / 'ucrt/x86'), '/libpath:' + str(sdk / 'um/x86'),
+           str(LINK / 'loader.obj'), 'libcmt.lib', 'kernel32.lib']
+    r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+    return dict(exit=r.returncode, log=(r.stdout + r.stderr)[-2000:])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--exe', required=True)
@@ -391,7 +420,7 @@ def main():
     inputs = [j[2] for j in jobs] + [str(LINK / n) for n in ('abs.obj', 'tls.obj', 'addr_table.obj', 'traps.obj', 'fnv_trap.obj',
                                                             'fnv_msvc_xmm.obj', 'fnv_vc2008_shims.obj')]
     rsp.write_text('\n'.join('"%s"' % x for x in inputs) + '\n')
-    cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/dll', '/noentry', '/machine:x86', '/base:0x20000000',
+    cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/dll', '/machine:x86', '/base:0x20000000',
            '/dynamicbase:no', '/fixed', '/safeseh:no', '/errorlimit:0', '/export:fnv_addr_table,DATA', '/out:' + str(LINK / 'fnv_game.dll'),
            '/libpath:' + str(vs), '/libpath:' + str(sdk / 'ucrt/x86'), '/libpath:' + str(sdk / 'um/x86'),
            'libcmt.lib', 'libvcruntime.lib', 'libucrt.lib', 'libcpmt.lib', 'kernel32.lib', 'user32.lib',
@@ -411,6 +440,8 @@ def main():
                   link_exit=r.returncode,
                   undefined=len(undefined), duplicate=len(duplicate), other_errors=errs.most_common(20),
                   undefined_top=undefined.most_common(25), duplicate_top=duplicate.most_common(25))
+    if r.returncode == 0:
+        report['loader'] = build_loader(vs, sdk)
     (LINK / 'link_report.json').write_text(json.dumps(report, indent=1))
     print(json.dumps(report, indent=1))
 
