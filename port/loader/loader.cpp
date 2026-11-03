@@ -11,6 +11,7 @@
 //   6. calls the relinked WinMain.
 // Nothing from the exe is written to disk.
 #include <windows.h>
+#include <intrin.h>
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -379,6 +380,54 @@ struct WatchHit { LONG step; DWORD eip, from, to; };
 WatchHit g_watchHits[64];
 int g_watchCount = 0;
 
+// FNV_BP=<hex original address>[,...]: log registers and arguments at each entry of the relinked function, keep running.
+struct Bp { unsigned char* addr; unsigned char orig; DWORD original; int hits; };
+Bp g_bps[32];
+int g_bpCount = 0;
+Bp* g_bpStepping[64];   // per thread id modulo 64: the breakpoint to re-arm after the single step
+
+LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
+{
+    auto r = ep->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_BREAKPOINT)
+    {
+        for (int i = 0; i < g_bpCount; ++i)
+            if (g_bps[i].addr == r->ExceptionAddress)
+            {
+                Bp& b = g_bps[i];
+                CONTEXT* c = ep->ContextRecord;
+                if (b.hits++ < 40)
+                {
+                    DWORD* sp = (DWORD*)c->Esp;
+                    fprintf(g_log, "[bp] %08lx hit %d thread %lu eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ret=%08lx args %08lx %08lx %08lx %08lx\n", b.original, b.hits,
+                            GetCurrentThreadId(), c->Eax, c->Ecx, c->Edx, c->Esp, sp[0], sp[1], sp[2], sp[3], sp[4]);
+                    fflush(g_log);
+                }
+                DWORD old;
+                VirtualProtect(b.addr, 1, PAGE_EXECUTE_READWRITE, &old);
+                *b.addr = b.orig;
+                VirtualProtect(b.addr, 1, old, &old);
+                g_bpStepping[GetCurrentThreadId() & 63] = &b;
+                c->EFlags |= 0x100;
+                return EXCEPTION_CONTINUE_EXECUTION;
+            }
+    }
+    else if (r->ExceptionCode == EXCEPTION_SINGLE_STEP)
+    {
+        Bp*& s = g_bpStepping[GetCurrentThreadId() & 63];
+        if (s)
+        {
+            DWORD old;
+            VirtualProtect(s->addr, 1, PAGE_EXECUTE_READWRITE, &old);
+            *s->addr = 0xCC;
+            VirtualProtect(s->addr, 1, old, &old);
+            s = nullptr;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 LONG CALLBACK trace_handler(EXCEPTION_POINTERS* ep)
 {
     auto r = ep->ExceptionRecord;
@@ -478,6 +527,19 @@ void dump_trace()
         fprintf(g_log, "[trace]   %08lx eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ebp=%08lx\n", g_traceRing[i & (kTraceRing - 1)], g[0], g[1], g[2], g[3], g[4]);
     }
 }
+LPTOP_LEVEL_EXCEPTION_FILTER WINAPI ignore_set_filter(LPTOP_LEVEL_EXCEPTION_FILTER) { return nullptr; }
+void log_exit_stack(const char* what, DWORD code)
+{
+    DWORD* sp = (DWORD*)_AddressOfReturnAddress();
+    fprintf(g_log, "[loader] %s(0x%08lx) on thread %lu, caller stack:\n", what, code, GetCurrentThreadId());
+    int shown = 0;
+    for (int i = 0; i < 4000 && shown < 30 && !IsBadReadPtr(sp + i, 4); ++i)
+        if (sp[i] >= 0x20001000 && sp[i] < 0x24000000) { fprintf(g_log, "[loader]   +%x %08lx", i * 4, sp[i]); describe((void*)sp[i]); ++shown; }
+    fflush(g_log);
+}
+VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
+BOOL WINAPI wrap_TerminateProcess(HANDLE h, UINT code) { if (h == GetCurrentProcess()) log_exit_stack("TerminateProcess", code); return TerminateProcess(h, code); }
+
 DWORD g_mainThreadId = 0;
 LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
 {
@@ -676,6 +738,26 @@ int main(int argc, char** argv)
     std::sort(g_byPtr.begin(), g_byPtr.end(), [](const AddrEntry& a, const AddrEntry& b) { return a.relinked < b.relinked; });
     fprintf(g_log, "[loader] %s at %p, %zu relinked functions\n", dllPath, (void*)game, g_table.size());
     AddVectoredExceptionHandler(1, redirect_original_code);
+    if (const char* bp = getenv("FNV_BP"))
+    {
+        for (const char* q = bp; q && *q && g_bpCount < 32;)
+        {
+            DWORD orig = (DWORD)strtoul(q, nullptr, 16);
+            if (void* f = relinked(orig))
+            {
+                Bp& b = g_bps[g_bpCount++];
+                b.addr = (unsigned char*)f; b.orig = *b.addr; b.original = orig; b.hits = 0;
+                DWORD old;
+                VirtualProtect(b.addr, 1, PAGE_EXECUTE_READWRITE, &old);
+                *b.addr = 0xCC;
+                VirtualProtect(b.addr, 1, old, &old);
+                fprintf(g_log, "[loader] bp armed at original 0x%08lx (%p)\n", orig, f);
+            }
+            q = strchr(q, 0x2c);
+            if (q) ++q;
+        }
+        AddVectoredExceptionHandler(1, bp_handler);
+    }
     if (const char* at = getenv("FNV_TRACE_AT"))
     {
         DWORD orig = (DWORD)strtoul(at, nullptr, 16);
@@ -782,6 +864,11 @@ int main(int argc, char** argv)
                 f = (names[k] & IMAGE_ORDINAL_FLAG32)
                         ? GetProcAddress(m, (LPCSTR)(ULONG_PTR)(names[k] & 0xffff))
                         : GetProcAddress(m, (const char*)pe.at(names[k]) + 2);
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetUnhandledExceptionFilter") &&
+                !getenv("FNV_GAME_CRASH_FILTER"))
+                f = (FARPROC)&ignore_set_filter;     // keep the loader's crash report; the game's filter would hide it
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "ExitProcess")) f = (FARPROC)&wrap_ExitProcess;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "TerminateProcess")) f = (FARPROC)&wrap_TerminateProcess;
             if (f)
             {
                 *slot = (DWORD)f;

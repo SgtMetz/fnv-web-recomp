@@ -1147,6 +1147,9 @@ def main():
     # OpenAI model Phase 1: the source constructor dispatches through a mismatched vtable slot; the original calls 00482c80 directly.
     ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50}
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
+    for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
+        if tok_.strip():
+            ctx['lift_replace'].add(int(tok_, 16))
     # call-site correspondence against the original code (rule 4: the machine code is the authority)
     tick('symbol tables + dup scan')
     exe_key = img.data + (DECOMP / 'build/units.json').read_bytes()
