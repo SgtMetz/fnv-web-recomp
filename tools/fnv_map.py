@@ -83,11 +83,30 @@ def addresses_above(lines, line):
 
 
 def one(job):
-    import clang.cindex as ci
+    """Per unit, cached in out/cache/fnv_map/NNNN.json by the unit's object, source and arguments: unchanged units
+    are not parsed again."""
+    import hashlib
     index, unit = job
     src, args = args_for(index, unit)
     if src is None:
         return index, None, 'not-compiled'
+    obj = next((ROOT / 'out/obj').glob('%04d_*.obj' % index), None)
+    key = hashlib.sha1((obj.read_bytes() if obj else b'') + Path(src).read_bytes()
+                       + json.dumps(args).encode()).hexdigest()
+    cache = ROOT / 'out/cache/fnv_map' / ('%04d.json' % index)
+    if cache.exists():
+        c = json.loads(cache.read_text())
+        if c['key'] == key:
+            return index, c['mapping'], c['stats']
+    index, out, stats = parse_one(index, unit, src, args)
+    if out is not None:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        cache.write_text(json.dumps(dict(key=key, mapping=out, stats=stats)))
+    return index, out, stats
+
+
+def parse_one(index, unit, src, args):
+    import clang.cindex as ci
     try:
         tu = ci.Index.create().parse(str(src), args=args)
     except ci.TranslationUnitLoadError:

@@ -11,6 +11,7 @@
 //   6. calls the relinked WinMain.
 // Nothing from the exe is written to disk.
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -119,7 +120,9 @@ struct InitResult
 // hardware fault into a jump to guard_resume, which restores ESP and fs:[0] (dropping any SEH frames the abandoned
 // code registered) and returns 1. C++ exceptions (0xE06D7363) are left to their normal handlers.
 InitResult g_guard;
+char g_guardDump[1024];
 volatile LONG g_guardActive = 0;
+volatile DWORD g_guardThread = 0;
 DWORD g_guardEsp = 0, g_guardSeh = 0;
 
 extern "C" __declspec(naked) int __cdecl call_guarded(void(__cdecl* f)(void))
@@ -164,8 +167,9 @@ LONG CALLBACK guard_handler(EXCEPTION_POINTERS* ep)
     bool fault = code == kTrapException || code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_ILLEGAL_INSTRUCTION ||
                  code == EXCEPTION_PRIV_INSTRUCTION || code == EXCEPTION_INT_DIVIDE_BY_ZERO ||
                  code == EXCEPTION_STACK_OVERFLOW || code == EXCEPTION_ARRAY_BOUNDS_EXCEEDED;
-    if (!g_guardActive || !fault)
+    if (!g_guardActive || !fault || GetCurrentThreadId() != g_guardThread)
         return EXCEPTION_CONTINUE_SEARCH;
+    g_guardActive = 0;   // IsBadReadPtr below faults internally; do not re-enter
     g_guard.code = code;
     g_guard.where = ep->ExceptionRecord->ExceptionAddress;
     g_guard.detail = ep->ExceptionRecord->NumberParameters >= 2
@@ -179,6 +183,23 @@ LONG CALLBACK guard_handler(EXCEPTION_POINTERS* ep)
         g_guard.frames[i] = fp[1];
         fp = (DWORD*)fp[0];
     }
+    {
+        CONTEXT* c = ep->ContextRecord;
+        DWORD* sp = (DWORD*)c->Esp;
+        int o = sprintf(g_guardDump, "eax=%08lx ecx=%08lx edx=%08lx ebx=%08lx esi=%08lx edi=%08lx ebp=%08lx esp=%08lx stack:", c->Eax, c->Ecx, c->Edx, c->Ebx, c->Esi, c->Edi, c->Ebp, c->Esp);
+        for (int i = 0; i < 16 && !IsBadReadPtr(sp + i, 4); ++i) o += sprintf(g_guardDump + o, " %08lx", sp[i]);
+    }
+    {   // stack scan for return addresses into the game DLL (frame-pointer chains are unreliable in lifted code)
+        DWORD* sp = (DWORD*)ep->ContextRecord->Esp;
+        int n = 0;
+        for (int i = 0; i < 24 && n < 6; ++i)
+        {
+            if (IsBadReadPtr(sp + i, 4)) break;
+            DWORD w = sp[i];
+            if (w >= 0x20001000 && w < 0x22000000) g_guard.frames[n++] = w;
+        }
+        for (; n < 6; ++n) g_guard.frames[n] = 0;
+    }
     g_guardActive = 0;
     ep->ContextRecord->Eip = (DWORD)&guard_resume;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -188,6 +209,7 @@ LONG CALLBACK guard_handler(EXCEPTION_POINTERS* ep)
 InitResult run_initializer(void(__cdecl* f)(void))
 {
     g_guard = InitResult{0, 0, nullptr, {0}};
+    g_guardThread = GetCurrentThreadId();
     g_guardActive = 1;
     call_guarded(f);
     g_guardActive = 0;
@@ -210,6 +232,16 @@ void* thunk_for(DWORD original)
 
 void describe(void* ip)
 {
+    {
+        HMODULE m = nullptr;
+        char path[MAX_PATH] = {};
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)ip, &m) && m &&
+            GetModuleFileNameA(m, path, sizeof(path)))
+        {
+            const char* b = strrchr(path, 0x5c);
+            fprintf(g_log, "[loader]   module %s+0x%lx\n", b ? b + 1 : path, (DWORD)((char*)ip - (char*)m));
+        }
+    }
     auto it = std::upper_bound(g_byPtr.begin(), g_byPtr.end(), ip,
                                [](void* p, const AddrEntry& e) { return p < e.relinked; });
     if (it != g_byPtr.begin())
@@ -220,12 +252,122 @@ void describe(void* ip)
     }
 }
 
+HANDLE g_watchdogStart = nullptr;
+
+// OpenAI model: opt-in snapshot of the WinMain thread, taken without logging while it is suspended.
+DWORD WINAPI startup_watchdog(void* arg)
+{
+    HANDLE thread = (HANDLE)arg;
+    HANDLE thread0 = thread;
+    WaitForSingleObject(g_watchdogStart, INFINITE);
+    const char* ms = getenv("FNV_WATCHDOG_MS");
+    Sleep(ms ? (DWORD)atoi(ms) : 2000);
+    CONTEXT ctx = {};
+    ctx.ContextFlags = CONTEXT_FULL;
+    DWORD words[256] = {};
+    SIZE_T bytes = 0;
+    bool captured = false;
+    DWORD lo = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.front().relinked;
+    DWORD hi = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.back().relinked + 0x10000;
+    if (SuspendThread(thread) != (DWORD)-1)
+    {
+        if (GetThreadContext(thread, &ctx))
+        {
+            captured = true;
+            ReadProcessMemory(GetCurrentProcess(), (void*)ctx.Esp, words, sizeof(words), &bytes);
+        }
+        ResumeThread(thread);
+    }
+    if (!captured)
+        fprintf(g_log, "[watchdog] could not capture WinMain thread\n");
+    else
+    {
+        fprintf(g_log, "[watchdog] eip=%08lx esp=%08lx ebp=%08lx eax=%08lx ecx=%08lx edx=%08lx\n",
+                ctx.Eip, ctx.Esp, ctx.Ebp, ctx.Eax, ctx.Ecx, ctx.Edx);
+        if (ctx.Eip >= lo && ctx.Eip < hi) describe((void*)ctx.Eip);
+        for (size_t i = 0, shown = 0; i < bytes / sizeof(DWORD) && shown < 24; ++i)
+            if (words[i] >= lo && words[i] < hi)
+            {
+                fprintf(g_log, "[watchdog] stack+%03x %08lx", (unsigned)(i * 4), words[i]);
+                describe((void*)words[i]);
+                ++shown;
+            }
+    }
+    // every other thread of the process, plus module-resolved return-address candidates on the main stack
+    auto modname = [](DWORD addr, char* out, size_t n) {
+        HMODULE m = nullptr;
+        out[0] = 0;
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)addr, &m) && m)
+        {
+            char path[MAX_PATH] = {};
+            GetModuleFileNameA(m, path, sizeof(path));
+            const char* base = strrchr(path, '\\');
+            snprintf(out, n, "%s+0x%lx", base ? base + 1 : path, addr - (DWORD)m);
+        }
+    };
+    if (captured)
+    {
+        char buf[300];
+        {
+            CRITICAL_SECTION* ll = *(CRITICAL_SECTION**)((char*)__readfsdword(0x30) + 0xA0);
+            fprintf(g_log, "[watchdog] loader lock owner=%lu lockcount=%ld recursion=%ld (main tid=%lu)\n", (unsigned long)(ULONG_PTR)ll->OwningThread,
+                    ll->LockCount, ll->RecursionCount, GetThreadId(thread0));
+        }
+        modname(ctx.Eip, buf, sizeof(buf));
+        fprintf(g_log, "[watchdog] main eip in %s\n", buf);
+        for (size_t i = 0, shown = 0; i < bytes / sizeof(DWORD) && shown < 40; ++i)
+        {
+            modname(words[i], buf, sizeof(buf));
+            if (buf[0]) { fprintf(g_log, "[watchdog] main stack+%03x %08lx %s\n", (unsigned)(i * 4), words[i], buf); ++shown; }
+        }
+        HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        THREADENTRY32 te = {sizeof(te)};
+        if (snap != INVALID_HANDLE_VALUE && Thread32First(snap, &te))
+            do {
+                if (te.th32OwnerProcessID != GetCurrentProcessId() || te.th32ThreadID == GetCurrentThreadId()) continue;
+                HANDLE t = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, te.th32ThreadID);
+                if (!t) continue;
+                CONTEXT c = {};
+                c.ContextFlags = CONTEXT_FULL;
+                if (SuspendThread(t) != (DWORD)-1)
+                {
+                    bool ok = GetThreadContext(t, &c);
+                    DWORD w[256] = {};
+                    SIZE_T got = 0;
+                    if (ok) ReadProcessMemory(GetCurrentProcess(), (void*)c.Esp, w, sizeof(w), &got);
+                    ResumeThread(t);
+                    if (ok)
+                    {
+                        modname(c.Eip, buf, sizeof(buf));
+                        fprintf(g_log, "[watchdog] thread %lu eip=%08lx %s\n", te.th32ThreadID, c.Eip, buf);
+                        for (size_t i = 0, shown = 0; i < got / sizeof(DWORD) && shown < 12; ++i)
+                        {
+                            char m2[300];
+                            modname(w[i], m2, sizeof(m2));
+                            if (m2[0] && !strstr(m2, "FalloutNV_relinked"))
+                                fprintf(g_log, "[watchdog]   t%lu stack+%03x %08lx %s\n", te.th32ThreadID, (unsigned)(i * 4), w[i], m2);
+
+                            DWORD lo2 = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.front().relinked, hi2 = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.back().relinked + 0x10000;
+                            if (w[i] >= lo2 && w[i] < hi2) { fprintf(g_log, "[watchdog]   t%lu stack+%03x %08lx", te.th32ThreadID, (unsigned)(i * 4), w[i]); describe((void*)w[i]); ++shown; }
+                        }
+                    }
+                }
+                CloseHandle(t);
+            } while (Thread32Next(snap, &te));
+        if (snap != INVALID_HANDLE_VALUE) CloseHandle(snap);
+    }
+    fflush(g_log);
+    return 0;
+}
 LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
 {
     auto r = ep->ExceptionRecord;
+    CONTEXT* ctx = ep->ContextRecord;
     fprintf(g_log, "[loader] exception 0x%08lx at %p (access %s 0x%08lx)\n", r->ExceptionCode, r->ExceptionAddress,
             r->NumberParameters >= 2 ? (r->ExceptionInformation[0] ? "write" : "read") : "-",
             r->NumberParameters >= 2 ? (DWORD)r->ExceptionInformation[1] : 0);
+    fprintf(g_log, "[loader]   regs eax=%08lx ecx=%08lx edx=%08lx ebx=%08lx esi=%08lx edi=%08lx esp=%08lx ebp=%08lx\n",
+            ctx->Eax, ctx->Ecx, ctx->Edx, ctx->Ebx, ctx->Esi, ctx->Edi, ctx->Esp, ctx->Ebp);
     describe(r->ExceptionAddress);
     DWORD* ebp = (DWORD*)ep->ContextRecord->Ebp;
     for (int i = 0; i < 12 && ebp && !IsBadReadPtr(ebp, 8); ++i, ebp = (DWORD*)ebp[0])
@@ -235,7 +377,10 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
         fputc('\n', g_log);
     }
     // optimised code keeps no frame pointer: also list stack words that point into relinked code
-    DWORD* sp = (DWORD*)ep->ContextRecord->Esp;
+    DWORD* sp = (DWORD*)ctx->Esp;
+    // Keep the raw top of the faulting stack; caller arguments can themselves be bad code pointers.
+    for (int i = 0; i < 16 && !IsBadReadPtr(sp + i, 4); ++i)
+        fprintf(g_log, "[loader]   raw-stack+%03x %08lx\n", i * 4, sp[i]);
     if (!g_byPtr.empty())
     {
         DWORD lo = (DWORD)g_byPtr.front().relinked, hi = (DWORD)g_byPtr.back().relinked + 0x10000;
@@ -252,6 +397,30 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
+// Raw original code addresses in the decomp source (e.g. `reinterpret_cast<void*>(0x00aff9d0)`) carry no symbol, so
+// they are never rebound. With DEP, jumping there raises an execute fault; when the address is a relinked function,
+// continue there instead (the return address is already on the stack). Each address is logged once, to be fixed at
+// the source (the wasm build has no such safety net).
+std::vector<DWORD> g_redirected;
+
+LONG CALLBACK redirect_original_code(EXCEPTION_POINTERS* ep)
+{
+    auto r = ep->ExceptionRecord;
+    if (r->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || r->NumberParameters < 2 || r->ExceptionInformation[0] != 8)
+        return EXCEPTION_CONTINUE_SEARCH;
+    DWORD target = (DWORD)r->ExceptionAddress;
+    void* f = relinked(target);
+    if (!f)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (std::find(g_redirected.begin(), g_redirected.end(), target) == g_redirected.end())
+    {
+        g_redirected.push_back(target);
+        fprintf(g_log, "[loader] redirected a call to original code 0x%08lx -> relinked\n", target);
+    }
+    ep->ContextRecord->Eip = (DWORD)f;
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
 int fail(const char* what)
 {
     fprintf(g_log, "[loader] error: %s (GetLastError %lu)\n", what, GetLastError());
@@ -261,6 +430,19 @@ int fail(const char* what)
 
 int main(int argc, char** argv)
 {
+    if (getenv("FNV_STARTUP_WATCHDOG") && *getenv("FNV_STARTUP_WATCHDOG") == '1')
+    {
+        g_watchdogStart = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+        HANDLE thread = nullptr;
+        if (g_watchdogStart && DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &thread, 0, FALSE,
+                            DUPLICATE_SAME_ACCESS))
+        {
+            HANDLE watcher = CreateThread(nullptr, 0, startup_watchdog, thread, 0, nullptr);
+            if (watcher) CloseHandle(watcher);
+            else { CloseHandle(thread); fprintf(g_log, "[watchdog] CreateThread failed\n"); }
+        }
+        else fprintf(g_log, "[watchdog] DuplicateHandle failed\n");
+    }
     const char* exe = getenv("FNV_EXE") ? getenv("FNV_EXE") : "E:\\Games\\Fallout New Vegas\\FalloutNV.exe";
     const char* dll = "fnv_game.dll";
     for (int i = 1; i + 1 < argc; ++i)
@@ -318,6 +500,9 @@ int main(int argc, char** argv)
     RemoveVectoredExceptionHandler(loadVeh);
     if (!game)
         return fail("cannot load fnv_game.dll");
+    if (!getenv("FNV_KEEP_THREAD_ATTACH"))
+        DisableThreadLibraryCalls(game);
+    LoadLibraryA("uxtheme.dll");
     auto table = (const AddrEntry*)GetProcAddress(game, "fnv_addr_table");
     if (!table)
         return fail("fnv_addr_table export missing");
@@ -326,6 +511,7 @@ int main(int argc, char** argv)
     g_byPtr = g_table;
     std::sort(g_byPtr.begin(), g_byPtr.end(), [](const AddrEntry& a, const AddrEntry& b) { return a.relinked < b.relinked; });
     fprintf(g_log, "[loader] %s at %p, %zu relinked functions\n", dllPath, (void*)game, g_table.size());
+    AddVectoredExceptionHandler(1, redirect_original_code);
 
     // 3. code pointers in data, from the exe's own relocation table
     g_thunks = (unsigned char*)VirtualAlloc(nullptr, 1 << 22, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -449,6 +635,14 @@ int main(int argc, char** argv)
             ++skipped;                                        // initializer outside the decomp's scope
             continue;
         }
+        if (const char* skip = getenv("FNV_SKIP_INIT"))
+        {
+            auto it2 = std::lower_bound(g_byPtr.begin(), g_byPtr.end(), (void*)f,
+                                        [](const AddrEntry& e, void* q) { return e.relinked < q; });
+            char tag[16];
+            sprintf(tag, "%08lx", (it2 != g_byPtr.end() && it2->relinked == (void*)f) ? it2->original : 0ul);
+            if (strstr(skip, tag)) { ++skipped; continue; }
+        }
         InitResult r = strict ? InitResult{0, 0, nullptr, {0}} : run_initializer(f);
         if (strict)
             f();
@@ -465,6 +659,7 @@ int main(int argc, char** argv)
             {
                 fprintf(g_log, "[init-blocked] initializer 0x%08lx (slot 0x%08lx): exception 0x%08lx at %p "
                                "(data 0x%08lx)\n", orig, p, r.code, r.where, r.detail);
+                fprintf(g_log, "[loader]   %s\n", g_guardDump);
                 describe(r.where);
                 for (int i = 0; i < 6 && r.frames[i]; ++i)
                 {
@@ -504,6 +699,7 @@ int main(int argc, char** argv)
         return fail("WinMain not relinked");
     fprintf(g_log, "[loader] calling WinMain\n");
     fflush(g_log);
+    if (g_watchdogStart) SetEvent(g_watchdogStart);
     int rc = winMain(GetModuleHandleA(nullptr), nullptr, GetCommandLineA(), SW_SHOWDEFAULT);
     fprintf(g_log, "[loader] WinMain returned %d\n", rc);
     return rc;

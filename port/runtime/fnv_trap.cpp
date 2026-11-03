@@ -18,3 +18,27 @@ extern "C" __declspec(noinline) void __cdecl fnv_trap(unsigned int address, cons
     ULONG_PTR args[2] = {address, (ULONG_PTR)name};
     RaiseException(FNV_TRAP_EXCEPTION, EXCEPTION_NONCONTINUABLE, 2, args);
 }
+
+// Discovery mode (environment FNV_DISCOVERY=1): stubs whose original function has one known `ret N` call this
+// instead; it logs each address once and returns, and the stub returns 0 with the original stack cleanup, so one
+// run walks past every such gap and logs all of them. Without FNV_DISCOVERY it is fnv_trap.
+extern "C" __declspec(noinline) void __cdecl fnv_trap_soft(unsigned int address, const char* name)
+{
+    static int discovery = -1;
+    if (discovery < 0) {
+        char v[8] = {0};
+        discovery = GetEnvironmentVariableA("FNV_DISCOVERY", v, sizeof(v)) && v[0] == '1';
+    }
+    if (!discovery)
+        fnv_trap(address, name);
+    static unsigned int seen[4096];
+    static unsigned int nseen = 0;
+    for (unsigned int i = 0; i < nseen; i++)
+        if (seen[i] == address)
+            return;
+    if (nseen < 4096)
+        seen[nseen++] = address;
+    fprintf(stderr, "[fnv] discover: skipped %s 0x%08x (%s)\n", address ? "address" : "name", address,
+            name ? name : "?");
+    fflush(stderr);
+}

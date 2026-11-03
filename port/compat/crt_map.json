@@ -5,6 +5,11 @@
    "symbol": "??0_Lockit@std@@QAE@H@Z",
    "source": "name"
   },
+  "0x00ec408c": {
+   "symbol": "@fnv_check_cookie_orig@4",
+   "source": "disasm",
+   "evidence": "cmp ecx,[0x11c16bc]; jne report; ret (__security_check_cookie); port/compat/fnv_crt_orig.cpp"
+  },
   "0x00ec43fb": {
    "symbol": "___RTDynamicCast",
    "source": "name"
@@ -16,6 +21,11 @@
   "0x00ec4835": {
    "symbol": "_memcmp",
    "source": "name"
+  },
+  "0x00ec5ec0": {
+   "symbol": "__alloca_probe_16",
+   "source": "disasm",
+   "evidence": "lea ecx,[esp+8]; sub ecx,eax; and ecx,0xf; ... jmp 0xec8660 (_chkstk); the recipe also names it __alloca_probe"
   },
   "0x00ec5fce": {
    "symbol": "??_M@YGXPAXIHP6EX0@Z@Z",
@@ -66,6 +76,11 @@
   "0x00ec6bd2": {
    "symbol": "_strcat_s",
    "source": "name"
+  },
+  "0x00ec6cc4": {
+   "symbol": "_vsprintf",
+   "source": "disasm",
+   "evidence": "calls _vsprintf_l-style worker (buf, fmt, NULL, va_list)"
   },
   "0x00ec6cde": {
    "symbol": "_fabs",
@@ -133,6 +148,11 @@
    "symbol": "__makepath_s",
    "source": "name"
   },
+  "0x00ec85e3": {
+   "symbol": "__errno",
+   "source": "disasm",
+   "evidence": "() -> int*; callers store EINVAL through it"
+  },
   "0x00ec86e1": {
    "symbol": "_isalpha",
    "source": "name"
@@ -161,6 +181,26 @@
    "symbol": "_fmod",
    "source": "name"
   },
+  "0x00ec913a": {
+   "symbol": "__CIfmod",
+   "source": "disasm",
+   "evidence": "mov edx,0x11c18e0; jmp 0xed6070 (x87 intrinsic dispatcher: arguments in st0/st1); the recipe also names it _fmod"
+  },
+  "0x00ec923c": {
+   "symbol": "__stat64i32",
+   "source": "disasm",
+   "evidence": "FindFirstFileA-based _stat; callers pass a 0x30-byte struct with 64-bit times (struct _stat64i32, VC2008 default _stat)"
+  },
+  "0x00ec9610": {
+   "symbol": "_asin",
+   "source": "disasm",
+   "evidence": "x87 path: fpatan(x, sqrt((1+x)(1-x)))"
+  },
+  "0x00ec9774": {
+   "symbol": "_fprintf",
+   "source": "disasm",
+   "evidence": "(FILE*, fmt, ...); RendererInfo.txt writer uses it with fopen FILE*"
+  },
   "0x00ec9907": {
    "symbol": "_fclose",
    "source": "name"
@@ -177,6 +217,11 @@
    "symbol": "_pow",
    "source": "name"
   },
+  "0x00ec9d4a": {
+   "symbol": "_printf",
+   "source": "disasm",
+   "evidence": "(fmt, ...)"
+  },
   "0x00ec9e10": {
    "symbol": "_ceil",
    "source": "name"
@@ -188,6 +233,16 @@
   "0x00eca060": {
    "symbol": "_sin",
    "source": "name"
+  },
+  "0x00eca190": {
+   "symbol": "_acos",
+   "source": "disasm",
+   "evidence": "x87 path: fpatan with operands swapped: atan2(sqrt(1-x^2), x)"
+  },
+  "0x00eca38d": {
+   "symbol": "_sprintf_s",
+   "source": "disasm",
+   "evidence": "(char*, size_t, fmt, ...)"
   },
   "0x00eca573": {
    "symbol": "_atof",
@@ -204,6 +259,11 @@
   "0x00eca7f4": {
    "symbol": "_toupper",
    "source": "name"
+  },
+  "0x00eca920": {
+   "symbol": "_log",
+   "source": "disasm",
+   "evidence": "x87 path: fldln2; fyl2x"
   },
   "0x00ecada6": {
    "symbol": "_srand",
@@ -234,6 +294,11 @@
    "symbol": "_fseek",
    "source": "name"
   },
+  "0x00ecbc80": {
+   "symbol": "_log10",
+   "source": "disasm",
+   "evidence": "x87 path: fldlg2; fyl2x"
+  },
   "0x00ecbf05": {
    "symbol": "__access",
    "source": "name"
@@ -241,6 +306,11 @@
   "0x00ecbf20": {
    "symbol": "_strpbrk",
    "source": "name"
+  },
+  "0x00ecc071": {
+   "symbol": "__stricmp",
+   "source": "disasm",
+   "evidence": "locale-changed fast path; null arg -> errno EINVAL + invalid_parameter; callers compare two strings == 0 (_stricmp)"
   },
   "0x00ecc104": {
    "symbol": "_fgets",
@@ -262,10 +332,10 @@
    "symbol": "__gcvt",
    "source": "name"
   },
-  "0x00ec408c": {
-   "symbol": "@fnv_check_cookie_orig@4",
+  "0x00ecdf2d": {
+   "symbol": "_strtod",
    "source": "disasm",
-   "evidence": "cmp ecx,[0x11c16bc]; jne report; ret (__security_check_cookie); port/compat/fnv_crt_orig.cpp"
+   "evidence": "calls _strtod_l-style worker (str, endptr, NULL)"
   }
  }
 }

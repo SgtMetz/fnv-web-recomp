@@ -16,6 +16,7 @@ The generated file is derived from the exe: it is written to out/link/ (git-igno
 Unsupported instructions become a logged trap at that address and are counted in the report.
 """
 import re
+import struct
 import subprocess
 
 OBJDUMP = r'C:\Program Files\LLVM\bin\llvm-objdump.exe'
@@ -39,6 +40,73 @@ COND = {   # condition codes over the emulated flags
 
 class Unsupported(Exception):
     pass
+
+
+class TextCache:
+    """Whole-.text disassembly of the exe, made once (llvm-objdump, ~15 s) and kept in out/cache/ keyed by the exe's
+    SHA-256 (derived from the exe: git-ignored, never committed), with an address -> file offset index so a range is
+    read without re-running objdump (one objdump per lifted function cost about a minute per link)."""
+
+    def __init__(self, exe, text_range, cache_dir):
+        import array
+        import bisect
+        import hashlib
+        self.bisect = bisect
+        key = hashlib.sha256(open(exe, 'rb').read()).hexdigest()[:16]
+        self.lo, self.hi = text_range
+        self.dis = cache_dir / ('text_%s.dis' % key)
+        idx = cache_dir / ('text_%s.idx' % key)
+        if not self.dis.exists():
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            with open(self.dis, 'w') as f:
+                subprocess.run([OBJDUMP, '-d', '-M', 'intel', '--start-address=%#x' % self.lo,
+                                '--stop-address=%#x' % self.hi, exe], stdout=f, text=True)
+        self.addrs, self.offs = array.array('I'), array.array('Q')
+        if idx.exists():
+            raw = idx.read_bytes()
+            n = len(raw) // 12
+            self.addrs.frombytes(raw[:n * 4])
+            self.offs.frombytes(raw[n * 4:])
+        else:
+            pos, head = 0, re.compile(rb'^\s+([0-9a-f]+):')      # instruction lines start with whitespace
+            with open(self.dis, 'rb') as f:
+                for line in f:
+                    m = head.match(line)
+                    if m:
+                        self.addrs.append(int(m.group(1), 16))
+                        self.offs.append(pos)
+                    pos += len(line)
+            idx.write_bytes(self.addrs.tobytes() + self.offs.tobytes())
+
+    def covers(self, lo, hi):
+        return self.lo <= lo and hi <= self.hi
+
+    def lines(self, lo, hi):
+        k = self.bisect.bisect_left(self.addrs, lo)
+        if k >= len(self.addrs):
+            return []
+        out = []
+        with open(self.dis, 'rb') as f:
+            f.seek(self.offs[k])
+            for line in f:
+                m = re.match(rb'^\s+([0-9a-f]+):', line)
+                if m and int(m.group(1), 16) >= hi:
+                    break
+                out.append(line.decode('latin1').rstrip('\r\n'))
+        return out
+
+
+_TEXT_CACHE = {}
+
+
+def text_cache(exe, text_range):
+    from pathlib import Path
+    if exe not in _TEXT_CACHE:
+        try:
+            _TEXT_CACHE[exe] = TextCache(exe, text_range, Path(__file__).resolve().parent.parent / 'out/cache')
+        except OSError:
+            _TEXT_CACHE[exe] = None
+    return _TEXT_CACHE[exe]
 
 
 def num(s):
@@ -68,12 +136,17 @@ class Lifter:
         self.disassemble(LIFT_REGION[0], LIFT_REGION[1])
 
     # ---- disassembly ---------------------------------------------------------------------------------------------
-    def disassemble(self, lo, hi):
-        if any(a <= lo and hi <= b for a, b in self.ranges):
+    def disassemble(self, lo, hi, force=False):
+        if not force and any(a <= lo and hi <= b for a, b in self.ranges):
             return
-        out = subprocess.run([OBJDUMP, '-d', '-M', 'intel', '--start-address=%#x' % lo, '--stop-address=%#x' % hi,
-                              self.exe], capture_output=True, text=True).stdout
-        for l in out.splitlines():
+        cache = text_cache(self.exe, self.text)
+        if not force and cache and cache.covers(lo, hi):
+            lines = cache.lines(lo, hi)
+        else:
+            lines = subprocess.run([OBJDUMP, '-d', '-M', 'intel', '--start-address=%#x' % lo,
+                                    '--stop-address=%#x' % hi, self.exe], capture_output=True, text=True).stdout
+            lines = lines.splitlines()
+        for l in lines:
             m = LINE.match(l)
             if m:
                 raw = bytes.fromhex(re.sub(r'\s', '', m.group(2)))
@@ -81,7 +154,11 @@ class Lifter:
                 mnem = m.group(3)
                 if mnem in ('rep', 'repe', 'repne', 'lock'):
                     part = ops.split(None, 1)
-                    mnem, ops = (mnem + ' ' + part[0]) if mnem != 'lock' else part[0], (part[1] if len(part) > 1 else '')
+                    if not part:                    # objdump printed the prefix on a line of its own
+                        mnem, ops = 'nop', ''
+                    else:
+                        mnem, ops = (mnem + ' ' + part[0]) if mnem != 'lock' else part[0], \
+                            (part[1] if len(part) > 1 else '')
                 self.ins[int(m.group(1), 16)] = (len(raw), raw, mnem, ops)
         self.ranges.append((lo, hi))
 
@@ -164,6 +241,90 @@ class Lifter:
             return {8: 'M8(%s)', 16: 'M16(%s)', 32: 'M32(%s)'}[size] % e
         raise Unsupported('read ' + k)
 
+    def code_jump_table(self, addr, entry, index_reg, jump_addr):
+        """Read bounded absolute jump-table entries embedded in the original .text section."""
+        if not self.is_code(addr):
+            return None
+        ins = sorted((a for a in self.ins if entry <= a < jump_addr), reverse=True)
+        indices = None
+        # Some compiler CRT tables are indexed by a register masked immediately before dispatch.
+        for a in ins:
+            _, _, mnem, ops = self.ins[a]
+            if mnem == 'and' and ops.startswith(index_reg + ', '):
+                try:
+                    limit = num(ops.split(',', 1)[1])
+                    if 0 <= limit <= 255:
+                        indices = list(range(limit + 1))
+                        break
+                except ValueError:
+                    pass
+        # A short-length path can subtract N and branch on borrow, then use the wrapped index to address
+        # the preceding N jump-table entries (a common VC CRT memcpy/memmove layout).
+        if indices is None:
+            for k, a in enumerate(ins[:-1]):
+                branch = self.ins[a]
+                sub = self.ins[ins[k + 1]]
+                if branch[2] in ('jb', 'jc', 'jnae') and num(branch[3].split()[0]) == jump_addr and \
+                        sub[2] == 'sub' and sub[3].startswith(index_reg + ', '):
+                    try:
+                        n = num(sub[3].split(',', 1)[1])
+                        if 1 <= n <= 16:
+                            indices = list(range(-n, 0))
+                    except ValueError:
+                        pass
+                    if indices is not None:
+                        break
+        # Otherwise use a nearby compare against the same index register.
+        if indices is None:
+            for a in ins:
+                _, _, mnem, ops = self.ins[a]
+                if mnem == 'cmp' and ops.startswith(index_reg + ', '):
+                    try:
+                        limit = num(ops.split(',', 1)[1])
+                        if 0 <= limit <= 255:
+                            indices = list(range(limit + 1))
+                            break
+                    except ValueError:
+                        pass
+        if not hasattr(self, '_exe_sections'):
+            data = open(self.exe, 'rb').read()
+            pe, = struct.unpack_from('<I', data, 0x3c)
+            _, count, _, _, _, opt_size, _ = struct.unpack_from('<HHIIIHH', data, pe + 4)
+            opt = pe + 24
+            base, = struct.unpack_from('<I', data, opt + 28)
+            sec = opt + opt_size
+            self._exe_sections = []
+            for i in range(count):
+                _, _, rva, raw_size, raw, *_ = struct.unpack_from('<8sIIIIIIHHI', data, sec + i * 40)
+                self._exe_sections.append((base + rva, base + rva + raw_size, raw))
+            self._exe_data = data
+        if not indices:
+            # Some dispatches load the selector from a local, so its bound is not adjacent to the jump.
+            # Accept a consecutive run of code pointers and stop at the first non-code word.
+            indices = []
+            for i in range(256):
+                va = addr + i * 4
+                match = next(((lo, hi, raw) for lo, hi, raw in self._exe_sections
+                              if lo <= va and va + 4 <= hi), None)
+                if match is None:
+                    break
+                lo, _, raw = match
+                target, = struct.unpack_from('<I', self._exe_data, raw + va - lo)
+                if not self.is_code(target):
+                    break
+                indices.append(i)
+            if len(indices) < 2:
+                return None
+        values = []
+        for i in indices:
+            va = (addr + i * 4) & 0xffffffff
+            match = next(((lo, hi, raw) for lo, hi, raw in self._exe_sections if lo <= va and va + 4 <= hi), None)
+            if match is None:
+                return None
+            lo, _, raw = match
+            target, = struct.unpack_from('<I', self._exe_data, raw + va - lo)
+            values.append((i, target if self.is_code(target) else None))
+        return values if any(target is not None for _, target in values) else None
     def write(self, o, val):
         k, sz, e = o
         if k in ('reg', 'fs'):
@@ -266,12 +427,38 @@ class Lifter:
             return 'ST(0) = %s;' % (f % v)
         if mnem == 'cwde':
             return 's.eax = (uint32_t)(int32_t)(int16_t)s.eax;'
+        if mnem == 'leave':
+            return 's.esp = s.ebp; s.ebp = POP();'
+        if mnem == 'frndint':
+            return 'ST(0) = nearbyint(ST(0));'
         if mnem == 'sahf':
             return 'SAHF();'
         if mnem == 'jmp' and ops.strip() in REG32:
             return 'CALL_AT((void*)(uintptr_t)s.%s, s.esp + 4u); RETURN(0);' % ops.strip()
         if mnem == 'jmp' and ops.strip().startswith('dword ptr'):
-            return 'CALL_AT((void*)(uintptr_t)%s, s.esp + 4u); RETURN(0);' % self.read(self.parse(ops.strip()))
+            operand = self.parse(ops.strip())
+            if operand[0] == 'mem':
+                base = re.search(r'0x[0-9a-f]+u', operand[2])
+                if base:
+                    table_addr = int(base.group(0)[:-1], 16)
+                    index = re.search(r's\.(eax|ecx|edx|ebx|esi|edi|ebp)\*4', operand[2])
+                    targets = self.code_jump_table(table_addr, entry, index.group(1), addr) if index else None
+                    if targets:
+                        cases = []
+                        for i, target in targets:
+                            if target is None:
+                                action = 'fnv_trap(0x%08xu, "lifted: invalid embedded jump-table entry"); RETURN(0);' % table_addr
+                            elif entry <= target < end:
+                                if target not in self.ins:
+                                    self.disassemble(target, min(target + 0x100, end), force=True)
+                                labels.add(target)
+                                action = 'goto L_%08x;' % target
+                            else:
+                                action = 'CALL_AT(%s, s.esp + 4u); RETURN(0);' % self.code_ptr(target)
+                            cases.append('case %d: %s' % (i & 0xffffffff, action))
+                        cases = ' '.join(cases)
+                        return 'switch (s.%s) { %s default: fnv_trap(0x%08xu, "lifted: invalid code jump-table index"); } RETURN(0);' % (index.group(1), cases, table_addr)
+            return 'CALL_AT((void*)(uintptr_t)%s, s.esp + 4u); RETURN(0);' % self.read(operand)
         if mnem.startswith('j') and (mnem == 'jmp' or mnem[1:] in COND):
             tgt = num(ops.split()[0])
             if entry <= tgt < end and tgt not in self.stub_starts - {entry}:
@@ -280,6 +467,10 @@ class Lifter:
                     labels.add(tgt)
                     return ('if (%s) goto L_%08x;' % (COND[mnem[1:]], tgt)) if mnem != 'jmp' else 'goto L_%08x;' % tgt
             if mnem != 'jmp':
+                target = self.resolve_code(tgt)
+                if (target and target[0] == 'sym') or self.is_code(tgt):
+                    return 'if (%s) { CALL_AT(%s, s.esp + 4u); RETURN(0); }' % (
+                        COND[mnem[1:]], self.code_ptr(tgt))
                 raise Unsupported('conditional jump out of function')
             return 'CALL_AT(%s, s.esp + 4u); RETURN(0);' % self.code_ptr(tgt)       # tail call
         if mnem == 'call':
@@ -288,12 +479,48 @@ class Lifter:
                 return 'CALL((void*)(uintptr_t)%s);' % self.read(self.parse(o))
             if o in REG32:
                 return 'CALL((void*)(uintptr_t)s.%s);' % o
-            return 'CALL(%s);' % self.code_ptr(num(o.split()[0]))
+            target = num(o.split()[0])
+            # OpenAI model: these VC9 SEH helpers establish/restore the *caller* frame.
+            # A normal lifted CALL creates an independent state and loses EAX, EBP,
+            # ESP and fs:[0]. Emulate the call and helper on the current state.
+            if target == 0x00ece255:
+                return ('PUSH(0x%08xu); PUSH(s.eax); PUSH(s.fs0); '
+                        's.eax = s.esp + 0xcu; '
+                        '{ uint32_t a_ = s.esp, b_ = M32(s.esp + 0xcu), r_ = a_ - b_; '
+                        'SUBF(a_, b_, r_, 32); s.esp = r_; } '
+                        'PUSH(s.ebx); PUSH(s.esi); PUSH(s.edi); M32(s.eax) = s.ebp; '
+                        's.ebp = s.eax; s.eax = M32(0x011c16bcu) ^ s.ebp; '
+                        'LOGICF(s.eax, 32); PUSH(s.eax); PUSH(M32(s.ebp - 4u)); '
+                        'M32(s.ebp - 4u) = 0xffffffffu; s.eax = s.ebp - 0xcu; '
+                        's.fs0 = s.eax; (void)POP();') % (addr + n)
+            if target == 0x00ece2be:
+                return ('PUSH(0x%08xu); s.ecx = M32(s.ebp - 0xcu); s.fs0 = s.ecx; '
+                        's.ecx = POP(); s.edi = POP(); s.edi = POP(); s.esi = POP(); '
+                        's.ebx = POP(); s.esp = s.ebp; s.ebp = POP(); '
+                        'PUSH(s.ecx); (void)POP();') % (addr + n)
+            if target == 0x00ed1714:      # __SEH_prolog4: same shape as 0xece255 with a handler/scope table and frame size
+                return ('PUSH(0x%08xu); PUSH(0x00ecc8e0u); PUSH(s.fs0); '
+                        's.eax = M32(s.esp + 0x10u); M32(s.esp + 0x10u) = s.ebp; s.ebp = s.esp + 0x10u; '
+                        '{ uint32_t a_ = s.esp, b_ = s.eax, r_ = a_ - b_; SUBF(a_, b_, r_, 32); s.esp = r_; } '
+                        'PUSH(s.ebx); PUSH(s.esi); PUSH(s.edi); '
+                        's.eax = M32(0x011c16bcu); M32(s.ebp - 4u) ^= s.eax; s.eax ^= s.ebp; LOGICF(s.eax, 32); '
+                        'PUSH(s.eax); M32(s.ebp - 0x18u) = s.esp; PUSH(M32(s.ebp - 8u)); '
+                        's.eax = M32(s.ebp - 4u); M32(s.ebp - 4u) = 0xfffffffeu; M32(s.ebp - 8u) = s.eax; '
+                        's.eax = s.ebp - 0x10u; s.fs0 = s.eax; (void)POP();') % (addr + n)
+            if target == 0x00ed1759:      # __SEH_epilog4
+                return ('PUSH(0x%08xu); s.ecx = M32(s.ebp - 0x10u); s.fs0 = s.ecx; '
+                        's.ecx = POP(); s.edi = POP(); s.edi = POP(); s.esi = POP(); '
+                        's.ebx = POP(); s.esp = s.ebp; s.ebp = POP(); '
+                        'PUSH(s.ecx); (void)POP();') % (addr + n)
+            resolved = self.resolve_code(target)
+            if resolved and any(name in resolved[1].lower() for name in ('chkstk', 'alloca_probe')):
+                return 's.esp -= s.eax;'
+            return 'CALL(%s);' % self.code_ptr(target)
         if mnem == 'ret':
             pop = num(ops) if ops else 0
             prev = self.ret_pop.setdefault(entry, pop)
             if prev != pop:
-                raise Unsupported('mixed ret sizes')
+                self.ret_pop[entry] = max(prev, pop)
             return 'RETURN(%d);' % pop
         if mnem in ('rep stosd', 'rep movsd', 'rep stosb', 'rep movsb'):
             w = 4 if mnem.endswith('d') else 1
@@ -437,19 +664,30 @@ class Lifter:
                 self.lift(e)
 
     def source(self):
-        out = ['// Generated by tools/lift_stubs.py from the player\'s FalloutNV.exe: do not commit (rule 1).',
-               '#include "fnv_lift.h"', '']
+        return self.shards(1)[0]
+
+    def shards(self, n):
+        """The lifted code as n translation units (compiled in parallel): each carries every declaration and the
+        static trap helpers, and defines its own share of the functions."""
+        head = ['// Generated by tools/lift_stubs.py from the player\'s FalloutNV.exe: do not commit (rule 1).',
+                '#include "fnv_lift.h"', '']
         for ident, sym in sorted(self.externs.items()):
-            out.append('extern "C" void %s(void) __asm__("%s");' % (ident, sym))
+            head.append('extern "C" void %s(void) __asm__("%s");' % (ident, sym))
         for a in sorted(self.lifted):
-            out.append('extern "C" void entry_%08x(void) __asm__("fnv_f_%08x");' % (a, a))
+            head.append('extern "C" void entry_%08x(void) __asm__("fnv_f_%08x");' % (a, a))
         for a in sorted(self.traps):
-            out.append('static void lift_trap_%08x(void) { fnv_trap(0x%08xu, "lifted: unbound code pointer"); }' % (a, a))
-        out.append('')
-        for a in sorted(self.lifted):
-            out.append(self.lifted[a])
-            out.append(LIFT_ENTRY.format(a=a, pop=self.ret_pop.get(a, 0)))
-        return '\n'.join(out) + '\n'
+            head.append('static void lift_trap_%08x(void) { fnv_trap(0x%08xu, "lifted: unbound code pointer"); }'
+                        % (a, a))
+        head.append('')
+        funcs = sorted(self.lifted)
+        out = []
+        for k in range(n):
+            body = []
+            for a in funcs[k::n]:
+                body.append(self.lifted[a])
+                body.append(LIFT_ENTRY.format(a=a, pop=self.ret_pop.get(a, 0)))
+            out.append('\n'.join(head + body) + '\n')
+        return out
 
 
 # Native entry: the original interface (ecx/edx, stack arguments, eax/edx/st0 result, `ret N`) around the body.
@@ -471,11 +709,15 @@ LIFT_ENTRY = '''extern "C" __declspec(naked) void entry_{a:08x}(void)
         je no_fpu
         fld qword ptr [ebp - 8]
     no_fpu:
+        mov ecx, [ebp - 12]
+        mov eax, [ebp + 4]
+        mov [ebp + ecx + 4], eax
         mov eax, [ebp - 24]
         mov edx, [ebp - 20]
         mov esp, ebp
         pop ebp
-        ret {pop}
+        add esp, ecx
+        ret
     }}
 }}
 extern "C" __declspec(naked) void alias_c_{a:08x}(void) __asm__("fnv_c_{a:08x}");

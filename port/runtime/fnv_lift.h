@@ -25,11 +25,12 @@ struct FnvLiftReturn
 {
     uint32_t eax, edx;
     int32_t fpush;
-    uint32_t pad;
+    uint32_t pop;
     double st0;
 };
 
 static const int kLiftArgWords = 32;   // native argument words copied in (return address included)
+static const int kLiftStackWords = 8192; // emulated frame storage; covers large shader compiler frames
 
 struct FnvLiftState
 {
@@ -40,22 +41,22 @@ struct FnvLiftState
     double st[8];
     int depth;                       // x87 stack depth (st[depth-1] is ST(0))
     alignas(16) uint8_t xmm[8][16];
-    alignas(16) uint32_t stack[4096];
+    alignas(16) uint32_t stack[kLiftStackWords];
 
     FnvLiftState(uint32_t in_ecx, uint32_t in_edx, const uint32_t* in_args)
         : eax(0), ecx(in_ecx), edx(in_edx), ebx(0), ebp(0), esi(0), edi(0), zf(0), sf(0), cf(0), of(0), pf(0),
           fs0(0), c0(0), c2(0), c3(0), depth(0)
     {
         // [esp] = return address, [esp+4..] = the caller's arguments
-        uint32_t* top = &stack[4096 - kLiftArgWords - 8];
+        uint32_t* top = &stack[kLiftStackWords - kLiftArgWords - 8];
         memcpy(top, in_args, kLiftArgWords * 4);
         esp = (uint32_t)(uintptr_t)top;
     }
 };
 
 #define LIFT_STATE(c, d, a, o) FnvLiftState s((c), (d), (a)); FnvLiftReturn* lift_out__ = (o)
-#define RETURN(pop) do { lift_out__->eax = s.eax; lift_out__->edx = s.edx; lift_out__->fpush = s.depth > 0; \
-    lift_out__->st0 = s.depth > 0 ? ST(0) : 0.0; (void)(pop); return; } while (0)
+#define RETURN(nbytes) do { lift_out__->eax = s.eax; lift_out__->edx = s.edx; lift_out__->fpush = s.depth > 0; \
+    lift_out__->pop = (uint32_t)(nbytes); lift_out__->st0 = s.depth > 0 ? ST(0) : 0.0; return; } while (0)
 
 #define M8(a) (*(uint8_t*)(uintptr_t)(a))
 #define M16(a) (*(uint16_t*)(uintptr_t)(a))

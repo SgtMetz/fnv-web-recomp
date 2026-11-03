@@ -19,8 +19,11 @@ VENV_PY = ROOT / 'local/venv/Scripts/python.exe'
 
 
 def step(name, cmd, **kw):
+    import time
     print('== %s' % name, flush=True)
+    t0 = time.perf_counter()
     r = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, errors='replace', **kw)
+    print('   %s took %.1fs' % (name, time.perf_counter() - t0), flush=True)
     if r.returncode:
         print(r.stdout[-3000:], r.stderr[-3000:])
         raise SystemExit('%s failed' % name)
@@ -45,13 +48,15 @@ def main():
 
     print('== run', flush=True)
     log = ROOT / 'out/link/cycle_run.log'
-    try:
-        r = subprocess.run([str(ROOT / 'out/link/FalloutNV_relinked.exe'), '--exe', a.exe], cwd=ROOT / 'out/link',
-                           capture_output=True, text=True, errors='replace', timeout=a.timeout)
-        text, code = r.stdout + r.stderr, r.returncode
-    except subprocess.TimeoutExpired as e:
-        text, code = ((e.stdout or b'') + (e.stderr or b'')).decode(errors='replace'), 'timeout'
-    log.write_text(text)
+    # OpenAI model: stream startup output to disk so a waiting process can be diagnosed without stopping it.
+    with log.open('w', encoding='utf-8', errors='replace') as stream:
+        try:
+            r = subprocess.run([str(ROOT / 'out/link/FalloutNV_relinked.exe'), '--exe', a.exe], cwd=ROOT / 'out/link',
+                               stdout=stream, stderr=subprocess.STDOUT, timeout=a.timeout)
+            code = r.returncode
+        except subprocess.TimeoutExpired:
+            code = 'timeout'
+    text = log.read_text(encoding='utf-8', errors='replace')
 
     units = json.loads((Path(r'E:\Games\fnv_decomp-main') / 'build/units.json').read_text())['units']
     owner = {int(f['address'], 16): u['source'] for u in units for f in u['functions']}

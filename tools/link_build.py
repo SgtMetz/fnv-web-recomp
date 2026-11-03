@@ -18,13 +18,15 @@ usage: python tools/link_build.py --exe <FalloutNV.exe> [--jobs N]
 """
 import argparse
 import bisect
+import hashlib
 import json
+import os
 import re
 import struct
 import subprocess
 import sys
 from collections import Counter, defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -47,6 +49,8 @@ COMPAT_SOURCES = [
     ('port/compat/fnv_crt_orig.cpp', 'fnv_crt_orig.obj'),
 ]
 XC_TABLE = (0x00FDF4A4, 0x010113C0)     # __xc_a..__xc_z of FalloutNV.exe 1.4.0.525 (see port/loader/loader.cpp)
+LIFT_SHARDS = 24                         # out/link/lifted_NN.cpp, compiled in parallel
+LIFTED_OBJS = [('out/link/lifted_%02d.cpp' % k, 'lifted_%02d.obj' % k) for k in range(LIFT_SHARDS)]
 # Units left out of the link (their functions become logging traps) until fixed, with the reason.
 EXCLUDE = {
     'src/fallout_shared/tesscript.cpp':
@@ -136,22 +140,27 @@ class CoffPatch:
         return index
 
     def retarget(self, old, new):
-        """Point every relocation that names symbol `old` at symbol `new`."""
-        n = 0
+        """Point every relocation that names symbol `old` at symbol `new` (applied in one pass by bytes())."""
+        self.pending = getattr(self, 'pending', {})
+        self.pending[old] = new
+
+    def apply_retargets(self):
+        pending = getattr(self, 'pending', None)
+        if not pending:
+            return
         for sec in range(1, self.nsec + 1):
             h = 20 + (sec - 1) * 40
             relptr, = struct.unpack_from('<I', self.data, h + 24)
             count, = struct.unpack_from('<H', self.data, h + 32)
             if self.section_flags(sec) & 0x01000000:            # IMAGE_SCN_LNK_NRELOC_OVFL
                 count, = struct.unpack_from('<I', self.data, relptr)
-            for k in range(count):
-                o = relptr + k * 10
-                if struct.unpack_from('<I', self.data, o + 4)[0] == old:
-                    struct.pack_into('<I', self.data, o + 4, new)
-                    n += 1
-        return n
+            for k, (sym,) in enumerate(struct.iter_unpack('<4xI2x', self.data[relptr:relptr + count * 10])):
+                if sym in pending:
+                    struct.pack_into('<I', self.data, relptr + k * 10 + 4, pending[sym])
+        self.pending = {}
 
     def bytes(self):
+        self.apply_retargets()
         strings = self.strings + bytes(self.extra)
         added = bytes(getattr(self, 'added', b''))
         head = bytearray(self.data[:self.strptr])
@@ -164,6 +173,21 @@ CTX = {}
 
 def init(ctx):
     CTX.update(ctx)
+
+
+def init_from_file(path):
+    import pickle
+    CTX.update(pickle.loads(Path(path).read_bytes()))
+
+
+def ctx_pool(ctx, jobs):
+    """A worker pool whose workers start with `ctx`: written once to out/cache and read by each worker (sending
+    the ~40 MB context through every worker's pipe cost ~9 s per pool)."""
+    import pickle
+    path = ROOT / 'out/cache/ctx_pool.pickle'
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(pickle.dumps(ctx, protocol=pickle.HIGHEST_PROTOCOL))
+    return ProcessPoolExecutor(jobs, initializer=init_from_file, initargs=(str(path),))
 
 
 CRT_REGION = (0x00EC3000, 0x00EDE000)     # the statically linked VC2008 CRT in FalloutNV.exe
@@ -259,6 +283,9 @@ def patch_object(job):
                     addr = a
         if addr is not None and addr in c['crt_map']:
             return c['crt_map'][addr], 'crt-mapped'      # port/compat/crt_map.json
+        if addr == 0x00A9A730:
+            # OpenAI Phase 1: original 0xa9a730 is a tail JMP to 0xa5e9d0; the decomp emits CALL+INT3 and drops args.
+            return 'fnv_f_00a5e9d0', 'tail-jump-alias'
         if addr is not None and c['tls'][0] <= addr < c['tls'][1]:
             return 'fnv_t_%08x' % addr, 'tls'
         if addr is not None:
@@ -271,6 +298,10 @@ def patch_object(job):
                 if base in c['libsyms']:
                     return base, 'crt'
                 alias = crt_alias(base, addr, c['libsyms'])
+                for other in ([] if alias else sorted(c['names_at'].get(addr, ()))):
+                    alias = crt_alias(other, addr, c['libsyms'])      # another unit's name for the address
+                    if alias:
+                        break
                 if alias:
                     return alias, 'crt-alias'
                 traps['fnv_c_%08x' % addr] = (addr, base)
@@ -283,11 +314,21 @@ def patch_object(job):
 
     for i, s in entries:
         name, sec = s['name'], s['section']
-        if sec > 0 and name in own and s['storage'] in (EXTERNAL, STATIC) and sec not in vsec                 and own[name] in c['lift_replace']:
-            # the original's machine code replaces this definition (see void_mismatches): keep it unexported
+        if sec > 0 and name in own and s['storage'] in (EXTERNAL, STATIC) and sec not in vsec \
+                and own[name] == 0x00B00A80 and c['addr_owner'].get(own[name]) == index:
+            # OpenAI Phase 1: retain the source implementation behind the null-safe ABI wrapper.
+            p.rename(i, 'fnv_f_00b00a80__fnvorig')
+            p.set(i, storage=EXTERNAL)
+            stats['tasklet-null-safe-original'] += 1
+        elif sec > 0 and name in own and s['storage'] in (EXTERNAL, STATIC) and sec not in vsec \
+                and own[name] in c['lift_replace']:
+            # OpenAI model: route local relocations to the canonical lifted implementation too.
+            p.retarget(i, p.add_symbol('fnv_f_%08x' % own[name]))
+            renamed.add(name)
             p.rename(i, 'fnv_f_%08x__fnvreplaced%d' % (own[name], index))
             p.set(i, storage=STATIC)
             stats['replaced-by-lifted'] += 1
+
         elif sec > 0 and name in own and s['storage'] in (EXTERNAL, STATIC) and sec not in vsec:
             if c['addr_owner'].get(own[name]) == index:
                 p.rename(i, 'fnv_f_%08x' % own[name])
@@ -511,14 +552,12 @@ def external_defs(job):
 
 def external_symbols(path):
     """(externally defined, undefined) names of an object; static definitions cannot satisfy other objects."""
-    r = subprocess.run([rp.NM, '--no-sort', str(path)], capture_output=True, text=True, errors='replace')
     ext, und = set(), set()
-    for line in r.stdout.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[0] == 'U':
-            und.add(parts[1])
-        elif len(parts) >= 3 and parts[1] in 'TDBRCVW':
-            ext.add(parts[2])
+    for letter, name in rp.nm_lines(path):
+        if letter == 'U':
+            und.add(name)
+        elif letter in 'TDBRCVW':
+            ext.add(name)
     return ext, und
 
 
@@ -568,6 +607,7 @@ def write_addr_table(path, names):
     point the data image's vftables and callback tables at the relinked code."""
     names = sorted(names)
     n = len(names)
+    name_index = {name: i for i, name in enumerate(names)}
     body = bytearray()
     for name in names:
         body += struct.pack('<II', int(name[6:], 16), 0)
@@ -576,8 +616,9 @@ def write_addr_table(path, names):
     overflow = n + 1 > 0xffff
     if overflow:          # IMAGE_SCN_LNK_NRELOC_OVFL: the real count is in the first relocation's address field
         relocs += struct.pack('<IIH', n + 1, 0, 0)
-    for k in range(n):
-        relocs += struct.pack('<IIH', k * 8 + 4, 2 + k, 0x06)       # DIR32 to symbol 2+k
+    for k, name in enumerate(names):
+        target = 'fnv_f_00a5e9d0' if name == 'fnv_f_00a9a730' else name
+        relocs += struct.pack('<IIH', k * 8 + 4, 2 + name_index[target], 0x06)  # DIR32 to function symbol
     strings = bytearray(b'\0\0\0\0')
     syms = bytearray(struct.pack('<8sIhHBB', b'.rdata', 0, 1, 0, STATIC, 1))
     syms += struct.pack('<IHHIHBBH', len(body), min(n + overflow, 0xffff), 0, 0, 0, 0, 0, 0)
@@ -599,13 +640,41 @@ def write_addr_table(path, names):
     Path(path).write_bytes(header + section + bytes(body) + bytes(relocs) + bytes(syms) + bytes(strings))
 
 
-def write_traps(path, traps):
+def write_traps(path, traps, pops=None):
+    """Trap stubs. `pops` {symbol: N}: the original function returns with `ret N` (from its code, or from its
+    decorated name: tools/msmangle.py), so in discovery mode (port/runtime/fnv_trap.cpp) the stub can return 0
+    with the original stack cleanup instead of stopping."""
+    pops = pops or {}
     lines = ['// generated by tools/link_build.py: logging stubs for unbound code',
-             'extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);']
+             'extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);',
+             'extern "C" void __cdecl fnv_trap_soft(unsigned int address, const char* name);']
     for k, (sym, (addr, name)) in enumerate(sorted(traps.items())):
         lines.append('extern "C" void t%d(void) __asm__("%s");' % (k, sym))
-        lines.append('extern "C" void t%d(void) { fnv_trap(0x%08x, "%s"); }' % (k, addr, name.replace('\\', '\\\\')))
+        text = name.replace('\\', '\\\\')
+        if sym in pops:
+            lines.append('static void b%d(void) { fnv_trap_soft(0x%08x, "%s"); }' % (k, addr, text))
+            lines.append('extern "C" __declspec(naked) void t%d(void) { __asm { call b%d } __asm { xor eax, eax } '
+                         '__asm { ret %d } }' % (k, k, pops[sym]))
+        else:
+            lines.append('extern "C" void t%d(void) { fnv_trap(0x%08x, "%s"); }' % (k, addr, text))
     Path(path).write_text('\n'.join(lines) + '\n')
+
+
+def original_pops(exe, text, ranges):
+    """{address: N} for the functions in `ranges` ({address: end}) whose every `ret` in the original pops N bytes
+    (no ret, or mixed sizes: left out). From the cached whole-.text disassembly."""
+    import lift_stubs
+    cache = lift_stubs.text_cache(exe, (text['start'], text['end']))
+    out = {}
+    for a, end in ranges.items():
+        sizes = set()
+        for line in cache.lines(a, end):
+            m = re.search(r'\tret\s*(0x[0-9a-f]+|\d+)?\s*$', line)
+            if m:
+                sizes.add(int(m.group(1), 0) if m.group(1) else 0)
+        if len(sizes) == 1:
+            out[a] = sizes.pop()
+    return out
 
 
 def cl(src, obj):
@@ -618,6 +687,49 @@ def cl(src, obj):
     r = subprocess.run(cmd + ['/Fo' + str(obj), str(src)], capture_output=True, text=True)
     if r.returncode:
         raise SystemExit('compile failed: %s\n%s' % (src, r.stdout[-2000:] + r.stderr[-2000:]))
+
+
+def port_headers_hash():
+    """Hash of the port's own headers: a change to any of them rebuilds every cached port object."""
+    h = hashlib.sha1()
+    for p in sorted((ROOT / 'port').rglob('*.h')):
+        h.update(p.name.encode() + p.read_bytes())
+    return h.hexdigest()
+
+
+def cl_cached(job):
+    """cl() unless the object exists and was built from the same source text and port headers. Returns True when
+    it compiled."""
+    src, obj, headers = job
+    key = hashlib.sha1(Path(src).read_bytes() + headers.encode()).hexdigest()
+    stamp = Path(str(obj) + '.key')
+    if Path(obj).exists() and stamp.exists() and stamp.read_text() == key:
+        return False
+    cl(src, obj)
+    stamp.write_text(key)
+    return True
+
+
+def write_if_changed(path, text):
+    """Write text unless the file already holds it (keeps the mtime, so cached objects stay valid)."""
+    path = Path(path)
+    if not path.exists() or path.read_text() != text:
+        path.write_text(text)
+
+
+def cached(name, inputs, compute):
+    """compute() memoised in out/cache/<name>_<key>.pickle, keyed by the sha1 of `inputs` (bytes)."""
+    import pickle
+    key = hashlib.sha1(inputs).hexdigest()[:16]
+    path = ROOT / 'out/cache' / ('%s_%s.pickle' % (name, key))
+    if path.exists():
+        return pickle.loads(path.read_bytes())
+    value = compute()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    for old in path.parent.glob(name + '_*.pickle'):
+        old.unlink()
+    path.write_bytes(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+    return value
 
 
 def build_loader(vs, sdk):
@@ -708,7 +820,7 @@ def original_data_refs(img, units):
     return out
 
 
-def lift_initializers(exe, img, units, ctx, traps):
+def lift_initializers(exe, img, units, ctx, traps, defined, referenced=()):
     """Translate the __xc entries that are not decomp functions (and what they register with atexit) into
     out/link/lifted.cpp with tools/lift_stubs.py. Returns counts for the report."""
     import lift_stubs
@@ -717,21 +829,9 @@ def lift_initializers(exe, img, units, ctx, traps):
         for k, v in u.get('symbols', {}).items():
             names[int(v, 0)].add(k)
 
-    def resolve(addr):
-        if addr in ctx['starts']:
-            return ('sym', 'fnv_f_%08x' % addr)
-        if addr in ctx['crt_map']:
-            return ('sym', ctx['crt_map'][addr])
-        for n in names.get(addr, ()):
-            alias = crt_alias(n, addr, ctx['libsyms'])
-            if alias:
-                return ('sym', alias)
-        return None
-
-    table = [img.u32(p) for p in range(XC_TABLE[0], XC_TABLE[1], 4)]
-    entries = sorted({v for v in table if v and v not in ctx['starts']})
+    sizes0 = {int(f['address'], 16): f['size'] for u in units for f in u['functions']}
+    dyn_allow, dyn_bound = set(), {}
     text = next(s for s in img.sections if s['name'] == '.text')
-    # game code between recipe functions that relinked code calls (fnv_c_ traps below the CRT): lifted too
     spans = sorted((int(f['address'], 16), f['size']) for u in units for f in u['functions'])
     starts = [s for s, _ in spans]
 
@@ -743,30 +843,94 @@ def lift_initializers(exe, img, units, ctx, traps):
         k = bisect.bisect_right(starts, addr)
         return min(starts[k] if k < len(starts) else addr + 0x2000, addr + 0x2000)
 
-    gaps = sorted(a for a, _ in traps.values() if a and text['start'] <= a < CRT_REGION[0] and a not in ctx['starts']
-                  and not inside_recipe(a))
+    def resolve(addr):
+        if addr in ctx['starts']:
+            if 'fnv_f_%08x' % addr in defined or addr in ctx['lift_replace']:
+                return ('sym', 'fnv_f_%08x' % addr)
+            # a recipe function nothing defines that lifted code calls: lift it as well (transitive fallback)
+            dyn_allow.add(addr)
+            dyn_bound[addr] = addr + sizes0[addr]
+            return None
+        if addr in ctx['crt_map']:
+            return ('sym', ctx['crt_map'][addr])
+        for n in sorted(names.get(addr, ())):     # sorted: the generated code must not depend on hash order
+            alias = crt_alias(n, addr, ctx['libsyms'])
+            if alias:
+                return ('sym', alias)
+        if text['start'] <= addr < text['end'] and not inside_recipe(addr):
+            dyn_allow.add(addr)
+            dyn_bound[addr] = gap_end(addr)
+        return None
+
+    table = [img.u32(p) for p in range(XC_TABLE[0], XC_TABLE[1], 4)]
+    entries = sorted({v for v in table if v and v not in ctx['starts']})
+    # game code between recipe functions that relinked code calls (fnv_c_ traps below the CRT): lifted too
+    gaps = sorted(a for a, _ in traps.values() if a and text['start'] <= a < text['end'] and a not in ctx['starts']
+                  and a not in ctx['crt_map'] and not inside_recipe(a))
     allow = set(gaps)
     lifter = lift_stubs.Lifter(exe, resolve, (text['start'], text['end']), gap_end=gap_end,
-                               allow=lambda x: lift_stubs.LIFT_REGION[0] <= x < lift_stubs.LIFT_REGION[1] or x in allow)
+                               allow=lambda x: lift_stubs.LIFT_REGION[0] <= x < lift_stubs.LIFT_REGION[1] or x in allow
+                               or x in dyn_allow)
     sizes = {s: n for s, n in spans}
     replace = sorted(ctx['lift_replace'])
+    startup_targets_path = ROOT / 'out/startup_lift_targets.json'
+    startup_targets = {int(x, 16) for x in json.loads(startup_targets_path.read_text())} if startup_targets_path.exists() else set()
+    # OpenAI model Phase 1: runtime renderer callback reached through an original data pointer.
+    startup_targets.add(0x00E7CD50)
+    # fallback: recipe functions something references (or the initializer table names) that the relinked build does
+    # not define (units that do not compile yet, functions clang never emitted): lifted from the original code
+    missing = sorted({int(n[6:], 16) for n in set(traps) | {r for r in referenced if r not in defined}
+                      if re.match(r'fnv_f_[0-9a-f]{8}$', n) and int(n[6:], 16) in sizes} |
+                     {v for v in table if v in sizes and 'fnv_f_%08x' % v not in defined} |
+                     {v for v in startup_targets if v in sizes})
+    missing = [m for m in missing if m not in ctx['lift_replace']]
     allow.update(replace)
-    bounded = dict((a, a + sizes[a]) for a in replace)
-    lifter.gap_end = lambda x: bounded[x] if x in bounded else gap_end(x)
-    lifter.run(entries + gaps + replace)
-    (LINK / 'lifted.cpp').write_text(lifter.source())
+    allow.update(missing)
+    bounded = dict((x, x + sizes[x]) for x in replace + missing)
+    lifter.gap_end = lambda x: bounded[x] if x in bounded else dyn_bound[x] if x in dyn_bound else gap_end(x)
+    lifter.run(entries + gaps + replace + missing)
+    for k, src in enumerate(lifter.shards(LIFT_SHARDS)):
+        # OpenAI Phase 1: keep the recovered GetTaskletValue entry behind its null-safe ABI wrapper.
+        if 'static void body_00b00a80' in src:
+            src = src.replace('extern "C" __declspec(naked) void entry_00b00a80(void)',
+                              'extern "C" __declspec(naked) void entry_00b00a80_lift(void) '
+                              '__asm__("fnv_f_00b00a80__fnvlift");\n'
+                              'extern "C" __declspec(naked) void entry_00b00a80_lift(void)')
+        write_if_changed(LINK / ('lifted_%02d.cpp' % k), src)
     for g in gaps:                     # now defined by lifted.obj
         traps.pop('fnv_c_%08x' % g, None)
-    return dict(initializers=len(entries), gap_functions=len(gaps), replaced=len(replace), lifted=len(lifter.lifted), unsupported=len(lifter.unsupported),
+    for m in lifter.lifted:            # every lifted recipe address is now defined by lifted.obj
+        traps.pop('fnv_f_%08x' % m, None)
+    (LINK / 'lifted.json').write_text(json.dumps(dict(
+        lifted=sorted(lifter.lifted), unsupported={'%#010x' % k: v for k, v in sorted(lifter.unsupported.items())},
+        unbound_code_pointers=sorted(lifter.traps))))
+    return dict(initializers=len(entries), gap_functions=len(gaps), replaced=len(replace), missing=len(missing),
+                transitive=len(dyn_allow - set(missing)),
+                lifted=len(lifter.lifted), unsupported=len(lifter.unsupported),
                 unsupported_top=sorted(Counter(re.sub(r'0x[0-9a-f]+', 'N', v) for v in lifter.unsupported.values())
                                        .items(), key=lambda x: -x[1])[:15],
                 unbound_code_pointers=len(lifter.traps))
 
 
+TIMES = []
+_T0 = [None]
+
+
+def tick(stage):
+    """Record the seconds since the previous checkpoint under `stage` (printed and written to the report)."""
+    import time
+    now = time.perf_counter()
+    if _T0[0] is not None:
+        TIMES.append((stage, round(now - _T0[0], 1)))
+        print('[time] %-28s %6.1fs' % (stage, now - _T0[0]), file=sys.stderr, flush=True)
+    _T0[0] = now
+
+
 def main():
+    tick('start')
     ap = argparse.ArgumentParser()
     ap.add_argument('--exe', required=True)
-    ap.add_argument('--jobs', type=int, default=16)
+    ap.add_argument('--jobs', type=int, default=os.cpu_count())
     a = ap.parse_args()
     units = json.loads((DECOMP / 'build/units.json').read_text())['units']
     img = Image(a.exe)
@@ -801,7 +965,7 @@ def main():
     # first definer
     # A name collides when it has several definers and at least one is non-COMDAT (0) or NODUPLICATES (1).
     definers, strict = defaultdict(list), set()
-    with ProcessPoolExecutor(a.jobs, initializer=init, initargs=(ctx,)) as ex:
+    with ctx_pool(ctx, a.jobs) as ex:
         for index, names in ex.map(external_defs, jobs, chunksize=16):
             for n, sel in names:
                 definers[n].append(index)
@@ -816,15 +980,27 @@ def main():
             for f in u['functions']:
                 owner.setdefault(int(f['address'], 16), i)
     ctx['addr_owner'] = owner
-    ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None}
+    names_by_addr = defaultdict(set)
+    for u in units:
+        for k, v in u.get('symbols', {}).items():
+            a_ = int(v, 0)
+            if CRT_REGION[0] <= a_ < CRT_REGION[1]:
+                names_by_addr[a_].add(k)
+    ctx['names_at'] = dict(names_by_addr)
+    # OpenAI model Phase 1: a32c70's source prototype is bool, but original callers pass a 32-bit Node pointer.
+    # Lift the original body so its full-width argument reaches a31910 instead of being truncated to 0x20.
+    # OpenAI model Phase 1: the source constructor dispatches through a mismatched vtable slot; the original calls 00482c80 directly.
+    ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50}
     # call-site correspondence against the original code (rule 4: the machine code is the authority)
-    ctx['orig_calls'] = original_calls(img, units)
-    ctx['orig_data_refs'] = original_data_refs(img, units)
+    tick('symbol tables + dup scan')
+    exe_key = img.data + (DECOMP / 'build/units.json').read_bytes()
+    ctx['orig_calls'] = cached('orig_calls', exe_key, lambda: original_calls(img, units))
+    ctx['orig_data_refs'] = cached('orig_data_refs', exe_key, lambda: original_data_refs(img, units))
     meta = json.loads((ROOT / 'local/data_image.json').read_text())
     ctx['image'] = (int(meta['base'], 16), (ROOT / 'local/data_image.bin').read_bytes())
     ctx['inferred'], ctx['literal_bind'] = {}, {}
     constraints, lit_cand = [], {}
-    with ProcessPoolExecutor(a.jobs, initializer=init, initargs=(ctx,)) as ex:
+    with ctx_pool(ctx, a.jobs) as ex:
         for cs, lv in ex.map(infer_job, jobs, chunksize=16):
             constraints += cs
             for n, cand in lv:
@@ -841,14 +1017,25 @@ def main():
             names_at[int(f['address'], 16)].add(f['symbol'])
         for k, v in u.get('symbols', {}).items():
             names_at[int(v, 0)].add(k)
+    tick('exe analysis + constraints')
     ctx['inferred'], infer_rounds = solve_call_sites(constraints, names_at)
+    # The vtable name uses struct/unsigned aliases while the recipe defines the same MSVC slot with
+    # class/enum parameter types. Both are one-word references, and the original virtual call is thiscall.
+    renderer_method = '?CreateRendererData@Ni2DBuffer@@UAE_NABUNiPixelFormat@@I@Z'
+    if 0x00A8F200 in ctx['starts']:
+        ctx['inferred'].setdefault(renderer_method, 0x00A8F200)
+    tick('solve call sites')
     (LINK / 'inferred.json').write_text(json.dumps({n: '%#010x' % v for n, v in sorted(ctx['inferred'].items())},
                                                     indent=0))
     stats, traps = Counter(), {}
-    with ProcessPoolExecutor(a.jobs, initializer=init, initargs=(ctx,)) as ex:
+    if os.environ.get('FNV_DUMP_PATCH_CTX'):           # for profiling patch_object outside the pool
+        import pickle
+        (ROOT / 'out/cache/patch_ctx.pickle').write_bytes(pickle.dumps((ctx, jobs)))
+    with ctx_pool(ctx, a.jobs) as ex:
         for _, s, t in ex.map(patch_object, jobs, chunksize=16):
             stats.update(s)
             traps.update(t)
+    tick('patch objects')
     # every absolute data symbol any patched object now references, and every name still left undefined by all
     # patched objects, libraries and compat code (recipe functions clang never emitted, by-name copies made local)
     data_names, referenced, defined = set(), set(), set()
@@ -861,11 +1048,17 @@ def main():
     tls_names = {n for n in referenced if n.startswith('fnv_t_')}
     write_tls_obj(LINK / 'tls.obj', sorted(tls_names), ctx['tls'])
     # out-of-scope compiler-generated initializers (and the atexit thunks they register), lifted to C++
-    lift_report = lift_initializers(a.exe, img, units, ctx, traps)
+    tick('symbols of patched objects')
+    lift_report = lift_initializers(a.exe, img, units, ctx, traps, defined, referenced)
+    tick('lift (generate lifted.cpp)')
     # port runtime/compat code: built first, so nothing it defines gets a trap stub
     compat_defined = set()
-    for src, obj in COMPAT_SOURCES + [('out/link/lifted.cpp', 'lifted.obj')]:
-        cl(ROOT / src, LINK / obj)
+    builds = COMPAT_SOURCES + LIFTED_OBJS
+    headers = port_headers_hash()
+    with ThreadPoolExecutor(os.cpu_count()) as ex:
+        built = sum(ex.map(cl_cached, [(ROOT / src, LINK / obj, headers) for src, obj in builds]))
+    stats['port-objects-rebuilt'] = built
+    for src, obj in builds:
         ext, und = external_symbols(LINK / obj)
         compat_defined |= ext
         referenced |= und             # lifted code can name recipe functions no unit object defines
@@ -877,25 +1070,53 @@ def main():
         stats['trap-never-defined'] += 1
     for n in compat_defined:
         traps.pop(n, None)
-    write_traps(LINK / 'traps.cpp', traps)
+    import reach
+    sizes = {int(f['address'], 16): f['size'] for u in units for f in u['functions']}
+    _, tgt, is_call = reach.branches(a.exe, text)
+    # outside the recipe, a function ends at the next recipe function or original call target
+    starts_sorted = sorted(set(sizes) | {t for t, c in zip(tgt, is_call) if c})
+
+    def trap_end(x):
+        if x in sizes:
+            return x + sizes[x]
+        k = bisect.bisect_right(starts_sorted, x)
+        return min(starts_sorted[k] if k < len(starts_sorted) else x + 0x1000, x + 0x1000)
+    import msmangle
+    trap_addrs = {addr for addr, _ in traps.values() if addr and text['start'] <= addr < text['end']}
+    by_addr = original_pops(a.exe, text, {x: trap_end(x) for x in trap_addrs})
+    pops = {}
+    for sym, (addr, name) in traps.items():
+        n = by_addr.get(addr) if addr else msmangle.stack_pop(DUP.sub('', name))
+        if n is not None and not sym.startswith('fnv_d_'):
+            pops[sym] = n
+    write_traps(LINK / 'traps.cpp', traps, pops)
+    stats['traps-soft-capable'] = len(pops)
+    # what the build provides per original address (tools/reach.py, tools/explain.py)
+    (LINK / 'provided.json').write_text(json.dumps(dict(
+        relinked=sorted(int(n[6:], 16) for n in defined if re.match(r'fnv_f_[0-9a-f]{8}$', n)),
+        traps={s: [addr, name] for s, (addr, name) in sorted(traps.items())})))
     functions = {n for n in defined | compat_defined if re.match(r'fnv_f_[0-9a-f]{8}$', n)} | \
                 {n for n in traps if re.match(r'fnv_f_[0-9a-f]{8}$', n)}
     write_addr_table(LINK / 'addr_table.obj', functions)
-    cl(LINK / 'traps.cpp', LINK / 'traps.obj')
+    tick('compat + lifted compile')
+    cl_cached((LINK / 'traps.cpp', LINK / 'traps.obj', headers))
 
     vs = sorted(rp.VS.iterdir())[-1] / 'lib/x86'
     sdk = sorted(rp.KITS.iterdir())[-1]
     rsp = LINK / 'link.rsp'
     inputs = [j[2] for j in jobs] + [str(LINK / n) for n in ('abs.obj', 'tls.obj', 'addr_table.obj', 'traps.obj')] + \
-             [str(LINK / obj) for _, obj in COMPAT_SOURCES] + [str(LINK / 'lifted.obj')]
+             [str(LINK / obj) for _, obj in COMPAT_SOURCES + LIFTED_OBJS]
     rsp.write_text('\n'.join('"%s"' % x for x in inputs) + '\n')
     cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/dll', '/machine:x86', '/base:0x20000000',
            '/dynamicbase:no', '/fixed', '/safeseh:no', '/errorlimit:0', '/export:fnv_addr_table,DATA', '/out:' + str(LINK / 'fnv_game.dll'),
+           '/map:' + str(LINK / 'fnv_game.map'),
            '/libpath:' + str(vs), '/libpath:' + str(sdk / 'ucrt/x86'), '/libpath:' + str(sdk / 'um/x86'),
            'libcmt.lib', 'libvcruntime.lib', 'libucrt.lib', 'libcpmt.lib', 'legacy_stdio_definitions.lib',
            'kernel32.lib', 'user32.lib',
            '@' + str(rsp)]
+    tick('traps compile')
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
+    tick('lld-link')
     log = r.stdout + r.stderr
     (LINK / 'link.log').write_text(log)
     errs = Counter()
@@ -913,6 +1134,8 @@ def main():
                   undefined_top=undefined.most_common(25), duplicate_top=duplicate.most_common(25))
     if r.returncode == 0:
         report['loader'] = build_loader(vs, sdk)
+        tick('loader build')
+    report['times'] = TIMES
     (LINK / 'link_report.json').write_text(json.dumps(report, indent=1))
     print(json.dumps(report, indent=1))
 

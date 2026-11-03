@@ -837,7 +837,33 @@ def overlay_path(index, unit):
     return OUT / ('%04d' % index) / Path(unit['source']).name
 
 
+def cache_key(unit, rounds):
+    """Inputs of one unit's overlay run: these rules, the port's compat headers, the unit's source and recipe."""
+    import hashlib
+    h = hashlib.sha1(Path(__file__).read_bytes() + json.dumps([unit, rounds], sort_keys=True).encode())
+    for p in sorted((ROOT / 'port/compat').glob('*.h')):
+        h.update(p.read_bytes())
+    h.update((DECOMP / unit['source']).read_bytes())
+    return h.hexdigest()
+
+
 def process(index, unit, rounds):
+    """One unit through the overlay; skipped (previous record returned) when its inputs and object are unchanged."""
+    key = cache_key(unit, rounds)
+    out = overlay_path(index, unit)
+    rec_path = out.parent / (out.name + '.overlay.json')
+    if rec_path.exists():
+        rec = json.loads(rec_path.read_text())
+        if rec.get('key') == key and (not rec['ok'] or Path(obj_path(index, unit)).exists()):
+            return unit['source'], rec['ok'], rec['changes'], Counter(dict(rec.get('remaining', [])))
+    source, ok, record, remaining = process_uncached(index, unit, rounds)
+    rec = json.loads(rec_path.read_text())
+    rec.update(key=key, remaining=list(remaining.items()))          # in first-seen order (the report uses it)
+    rec_path.write_text(json.dumps(rec, indent=1))
+    return source, ok, record, remaining
+
+
+def process_uncached(index, unit, rounds):
     orig = DECOMP / unit['source']
     text = orig.read_text(errors='replace')
     # 'types': the global MSVC unions come from fnv_msvc_xmm.h (the unit's own standard copies are unified onto

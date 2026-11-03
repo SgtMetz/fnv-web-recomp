@@ -20,6 +20,7 @@ import argparse
 import bisect
 import json
 import re
+import struct
 import subprocess
 import sys
 from collections import Counter, defaultdict
@@ -40,27 +41,110 @@ LIBS = ['libcmt.lib', 'libvcruntime.lib', 'libcpmt.lib', 'oldnames.lib', 'libucr
         'advapi32.lib', 'gdi32.lib', 'shell32.lib', 'ole32.lib', 'winmm.lib']
 
 
-def nm(path):
+def coff_nm(data):
+    """[(llvm-nm type letter, name)] of an i386 COFF object, in place of running llvm-nm (same letters, same
+    symbols: section definitions, file records and .debug*/.sxdata names follow llvm-nm's COFF rules)."""
+    _, nsec, _, symptr, nsym, opt, _ = struct.unpack_from('<HHIIIHH', data)
+    strptr = symptr + nsym * 18
+    out = []
+    i = 0
+    while i < nsym:
+        o = symptr + i * 18
+        raw, value, sec, _, sc, aux = struct.unpack_from('<8sIhHBB', data, o)
+        i += 1 + aux
+        if raw[:4] == b'\0\0\0\0':
+            off = strptr + struct.unpack_from('<I', raw, 4)[0]
+            name = bytes(data[off:data.index(b'\0', off)]).decode('latin1')
+        else:
+            name = raw.rstrip(b'\0').decode('latin1')
+        if sc == 103 or (aux and (sc == 3 or (sc == 2 and sec == -1))):
+            continue                                       # file record / section definition: not listed
+        weak = sc == 105
+        external = sc == 2 or weak
+        if weak:
+            search = struct.unpack_from('<I', data, o + 18 + 4)[0] if aux else 0
+            out.append(('W' if search == 3 else 'w', name))
+            continue
+        if sc == 2 and sec == 0:
+            out.append(('C' if value else 'U', name))
+            continue
+        if name.startswith(('.debug', '.sxdata')):
+            letter = 'N'
+        elif sec == -1:
+            letter = 'a'
+        elif sec == -2:
+            letter = 'n'
+        elif sec > 0:
+            h = 20 + (sec - 1) * 40
+            flags = struct.unpack_from('<I', data, h + 36)[0]
+            secname = bytes(data[h:h + 8]).rstrip(b'\0')
+            if secname.startswith(b'.idata'):
+                letter = 'i'
+            elif flags & 0x20:
+                letter = 't'
+            elif flags & 0x40000000 and not flags & 0x80000000:
+                letter = 'r'
+            elif flags & 0x40:
+                letter = 'd'
+            elif flags & 0x80:
+                letter = 'b'
+            elif flags & 0x200:
+                letter = 'i'
+            else:
+                letter = '?'
+        else:
+            letter = '?'
+        out.append((letter.upper() if external and letter != 'N' else letter, name))
+    return out
+
+
+def nm_lines(path):
+    """[(letter, name)] for an object (parsed here) or a library (llvm-nm)."""
+    path = Path(path)
+    if path.suffix.lower() == '.obj':
+        return coff_nm(path.read_bytes())
     r = subprocess.run([NM, '--no-sort', str(path)], capture_output=True, text=True, errors='replace')
-    defined, undefined = set(), set()
+    out = []
     for line in r.stdout.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == 'U':
-            undefined.add(parts[1])
-        elif len(parts) >= 3 and parts[1] in 'TDBRCVtdbr':
-            defined.add(parts[2])       # lowercase: static functions/data, globalised by the link step
+            out.append(('U', parts[1]))
+        elif len(parts) >= 3:
+            out.append((parts[1], parts[2]))
+    return out
+
+
+def nm(path):
+    defined, undefined = set(), set()
+    for letter, name in nm_lines(path):
+        if letter == 'U':
+            undefined.add(name)
+        elif letter in 'TDBRCVtdbr':
+            defined.add(name)       # lowercase: static functions/data, globalised by the link step
     return defined, undefined
 
 
 def library_symbols():
+    """Names the toolchain libraries define; cached in out/cache by the libraries' paths, sizes and mtimes."""
     msvc = sorted(VS.iterdir())[-1] / 'lib/x86'
     sdk = sorted(KITS.iterdir())[-1]
-    out = set()
+    paths = []
     for lib in LIBS:
         for d in (msvc, sdk / 'ucrt/x86', sdk / 'um/x86'):
             if (d / lib).exists():
-                out |= nm(d / lib)[0]
+                paths.append(d / lib)
                 break
+    key = '\n'.join('%s %d %d' % (p, p.stat().st_size, p.stat().st_mtime_ns) for p in paths)
+    cache = ROOT / 'out/cache/library_symbols.json'
+    if cache.exists():
+        c = json.loads(cache.read_text())
+        if c['key'] == key:
+            return set(c['names'])
+    out = set()
+    for p in paths:
+        out |= nm(p)[0]
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(dict(key=key, names=sorted(out))))
     return out
 
 
