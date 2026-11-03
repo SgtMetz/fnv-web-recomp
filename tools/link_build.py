@@ -1242,6 +1242,10 @@ def main():
     tick('symbol tables + dup scan')
     exe_key = img.data + (DECOMP / 'build/units.json').read_bytes()
     ctx['orig_calls'] = cached('orig_calls', exe_key, lambda: original_calls(img, units))
+    # 0x4f1540 returns a raw type byte, but a chosen source declaration says bool. Both its
+    # compiled body and callers mask AL to one bit, corrupting extra-data presence flags.
+    ctx['lift_replace'] |= {0x004F1540} | {f for f, calls in ctx['orig_calls'].items()
+                                           if 0x004F1540 in calls and owner.get(f) is not None}
     ctx['orig_data_refs'] = cached('orig_data_refs', exe_key, lambda: original_data_refs(img, units))
     # Functions that call a target through a declaration whose stack pop disagrees with the original callee: the
     # original relies on the difference (leaked pushes become later arguments), clang code cannot. Lift them.
