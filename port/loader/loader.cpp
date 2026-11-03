@@ -359,8 +359,127 @@ DWORD WINAPI startup_watchdog(void* arg)
     fflush(g_log);
     return 0;
 }
+
+// Debug aid (FNV_TRACE_AT=<original hex address>): break at a relinked function, then single-step, keeping the last
+// kTraceRing EIPs. on_crash prints them (resolved to relinked functions), which shows what ran before a wild jump.
+const int kTraceRing = 4096;
+DWORD g_traceRing[kTraceRing];
+DWORD g_traceRegs[kTraceRing][5];
+volatile LONG g_traceIdx = 0;
+volatile LONG g_tracing = 0;
+unsigned char* g_traceAddr = nullptr;
+unsigned char g_traceOrig = 0;
+DWORD g_traceThread = 0;
+struct EntryRec { DWORD orig, ecx, esp, ret; };
+const int kEntryRing = 1024;
+EntryRec g_entries[kEntryRing];
+volatile LONG g_entryIdx = 0;
+DWORD g_watchAddr = 0, g_watchPrev = 0;
+struct WatchHit { LONG step; DWORD eip, from, to; };
+WatchHit g_watchHits[64];
+int g_watchCount = 0;
+
+LONG CALLBACK trace_handler(EXCEPTION_POINTERS* ep)
+{
+    auto r = ep->ExceptionRecord;
+    if (r->ExceptionCode == EXCEPTION_BREAKPOINT && g_traceAddr && r->ExceptionAddress == g_traceAddr)
+    {
+        DWORD old;
+        VirtualProtect(g_traceAddr, 1, PAGE_EXECUTE_READWRITE, &old);
+        *g_traceAddr = g_traceOrig;
+        VirtualProtect(g_traceAddr, 1, old, &old);
+        if (const char* w = getenv("FNV_TRACE_WATCH")) { g_watchAddr = (DWORD)strtoul(w, nullptr, 16); g_watchPrev = *(DWORD*)g_watchAddr; }
+        g_tracing = 1;
+        g_traceThread = GetCurrentThreadId();
+        ep->ContextRecord->EFlags |= 0x100;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP && g_tracing && GetCurrentThreadId() == g_traceThread)
+    {
+        LONG k = g_traceIdx++;
+        {
+            // function entry? (EIP equals a relinked function start)
+            auto it = std::lower_bound(g_byPtr.begin(), g_byPtr.end(), (void*)ep->ContextRecord->Eip, [](const AddrEntry& e, void* q) { return e.relinked < q; });
+            if (it != g_byPtr.end() && it->relinked == (void*)ep->ContextRecord->Eip)
+            {
+                EntryRec& e = g_entries[(g_entryIdx++) & (kEntryRing - 1)];
+                e.orig = it->original; e.ecx = ep->ContextRecord->Ecx; e.esp = ep->ContextRecord->Esp;
+                e.ret = IsBadReadPtr((void*)ep->ContextRecord->Esp, 4) ? 0 : *(DWORD*)ep->ContextRecord->Esp;
+            }
+        }
+        if (g_watchAddr && !IsBadReadPtr((void*)g_watchAddr, 4))
+        {
+            DWORD v = *(DWORD*)g_watchAddr;
+            if (v != g_watchPrev)
+            {
+                if (g_watchCount < 64) g_watchHits[g_watchCount++] = WatchHit{k, ep->ContextRecord->Eip, g_watchPrev, v};
+                g_watchPrev = v;
+            }
+        }
+        auto c = ep->ContextRecord;
+        g_traceRing[k & (kTraceRing - 1)] = c->Eip;
+        g_traceRegs[k & (kTraceRing - 1)][0] = c->Eax; g_traceRegs[k & (kTraceRing - 1)][1] = c->Ecx;
+        g_traceRegs[k & (kTraceRing - 1)][2] = c->Edx; g_traceRegs[k & (kTraceRing - 1)][3] = c->Esp;
+        g_traceRegs[k & (kTraceRing - 1)][4] = c->Ebp;
+        ep->ContextRecord->EFlags |= 0x100;
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void dump_trace()
+{
+    if (!g_tracing) return;
+    g_tracing = 0;
+    LONG n = g_traceIdx;
+    LONG count = n < kTraceRing ? n : kTraceRing;
+    fprintf(g_log, "[trace] %ld steps recorded; last %ld (oldest first, function changes only):\n", (long)n, (long)count);
+    DWORD prevFn = 0;
+    for (LONG i = n - count; i < n; ++i)
+    {
+        DWORD ip = g_traceRing[i & (kTraceRing - 1)];
+        auto it = std::upper_bound(g_byPtr.begin(), g_byPtr.end(), (void*)ip, [](void* p, const AddrEntry& e) { return p < e.relinked; });
+        DWORD fn = 0, off = 0;
+        if (it != g_byPtr.begin()) { --it; fn = it->original; off = ip - (DWORD)it->relinked; }
+        if (fn != prevFn || i == n - 1)
+        {
+            if (off < 0x2000) fprintf(g_log, "[trace]   %08lx fnv_f_%08lx+0x%lx\n", ip, fn, off);
+            else fprintf(g_log, "[trace]   %08lx (outside table)\n", ip);
+            prevFn = fn;
+        }
+    }
+    for (int w = 0; w < g_watchCount; ++w)
+        fprintf(g_log, "[trace] watch %08lx changed at step %ld (eip after the write: %08lx): %08lx -> %08lx\n", g_watchAddr, (long)g_watchHits[w].step, g_watchHits[w].eip, g_watchHits[w].from, g_watchHits[w].to);
+    if (g_watchAddr) fprintf(g_log, "[trace] watch %08lx now %08lx (hits %d)\n", g_watchAddr, *(DWORD*)g_watchAddr, g_watchCount);
+    {
+        LONG m = g_entryIdx, cnt = m < kEntryRing ? m : kEntryRing, from = m - (cnt < 120 ? cnt : 120);
+        fprintf(g_log, "[trace] last function entries (original address, ecx, esp, return address):\n");
+        for (LONG i = from; i < m; ++i)
+        {
+            EntryRec& e = g_entries[i & (kEntryRing - 1)];
+            fprintf(g_log, "[trace]   enter %08lx ecx=%08lx esp=%08lx ret=%08lx\n", e.orig, e.ecx, e.esp, e.ret);
+        }
+    }
+    if (getenv("FNV_TRACE_FULL"))
+        if (FILE* ff = fopen("trace_full.txt", "w"))
+        {
+            for (LONG i = n - count; i < n; ++i)
+            {
+                auto& g = g_traceRegs[i & (kTraceRing - 1)];
+                fprintf(ff, "%08lx eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ebp=%08lx\n", g_traceRing[i & (kTraceRing - 1)], g[0], g[1], g[2], g[3], g[4]);
+            }
+            fclose(ff);
+        }
+    fprintf(g_log, "[trace] last 48 steps in detail:\n");
+    for (LONG i = n - 48 > n - count ? n - 48 : n - count; i < n; ++i)
+    {
+        auto& g = g_traceRegs[i & (kTraceRing - 1)];
+        fprintf(g_log, "[trace]   %08lx eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ebp=%08lx\n", g_traceRing[i & (kTraceRing - 1)], g[0], g[1], g[2], g[3], g[4]);
+    }
+}
 LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
 {
+    g_tracing = 0;
     auto r = ep->ExceptionRecord;
     CONTEXT* ctx = ep->ContextRecord;
     fprintf(g_log, "[loader] exception 0x%08lx at %p (access %s 0x%08lx)\n", r->ExceptionCode, r->ExceptionAddress,
@@ -393,6 +512,7 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
                 ++shown;
             }
     }
+    g_tracing = 1; dump_trace();
     fflush(g_log);
     return EXCEPTION_EXECUTE_HANDLER;
 }
@@ -512,6 +632,21 @@ int main(int argc, char** argv)
     std::sort(g_byPtr.begin(), g_byPtr.end(), [](const AddrEntry& a, const AddrEntry& b) { return a.relinked < b.relinked; });
     fprintf(g_log, "[loader] %s at %p, %zu relinked functions\n", dllPath, (void*)game, g_table.size());
     AddVectoredExceptionHandler(1, redirect_original_code);
+    if (const char* at = getenv("FNV_TRACE_AT"))
+    {
+        DWORD orig = (DWORD)strtoul(at, nullptr, 16);
+        if (void* f = relinked(orig))
+        {
+            g_traceAddr = (unsigned char*)f;
+            g_traceOrig = *g_traceAddr;
+            DWORD old;
+            VirtualProtect(g_traceAddr, 1, PAGE_EXECUTE_READWRITE, &old);
+            *g_traceAddr = 0xCC;
+            VirtualProtect(g_traceAddr, 1, old, &old);
+            AddVectoredExceptionHandler(1, trace_handler);
+            fprintf(g_log, "[loader] trace armed at original 0x%08lx (%p)\n", orig, f);
+        }
+    }
 
     // 3. code pointers in data, from the exe's own relocation table
     g_thunks = (unsigned char*)VirtualAlloc(nullptr, 1 << 22, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
@@ -697,6 +832,14 @@ int main(int argc, char** argv)
     auto winMain = (int(__stdcall*)(HINSTANCE, HINSTANCE, LPSTR, int))relinked(kWinMain);
     if (!winMain)
         return fail("WinMain not relinked");
+    if (const char* d = getenv("FNV_DUMP"))   // "hexaddr:words" - words of the data image just before WinMain
+    {
+        DWORD addr = (DWORD)strtoul(d, nullptr, 16);
+        const char* c = strchr(d, ':');
+        int words = c ? atoi(c + 1) : 8;
+        for (int i = 0; i < words; ++i)
+            fprintf(g_log, "[dump] %08lx: %08lx\n", addr + i * 4, *(DWORD*)(addr + i * 4));
+    }
     fprintf(g_log, "[loader] calling WinMain\n");
     fflush(g_log);
     if (g_watchdogStart) SetEvent(g_watchdogStart);

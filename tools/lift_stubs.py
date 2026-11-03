@@ -434,7 +434,7 @@ class Lifter:
         if mnem == 'sahf':
             return 'SAHF();'
         if mnem == 'jmp' and ops.strip() in REG32:
-            return 'CALL_AT((void*)(uintptr_t)s.%s, s.esp + 4u); RETURN(0);' % ops.strip()
+            return 'TAILCALL((void*)(uintptr_t)s.%s);' % ops.strip()
         if mnem == 'jmp' and ops.strip().startswith('dword ptr'):
             operand = self.parse(ops.strip())
             if operand[0] == 'mem':
@@ -454,11 +454,11 @@ class Lifter:
                                 labels.add(target)
                                 action = 'goto L_%08x;' % target
                             else:
-                                action = 'CALL_AT(%s, s.esp + 4u); RETURN(0);' % self.code_ptr(target)
+                                action = 'TAILCALL(%s);' % self.code_ptr(target)
                             cases.append('case %d: %s' % (i & 0xffffffff, action))
                         cases = ' '.join(cases)
                         return 'switch (s.%s) { %s default: fnv_trap(0x%08xu, "lifted: invalid code jump-table index"); } RETURN(0);' % (index.group(1), cases, table_addr)
-            return 'CALL_AT((void*)(uintptr_t)%s, s.esp + 4u); RETURN(0);' % self.read(operand)
+            return 'TAILCALL((void*)(uintptr_t)%s);' % self.read(operand)
         if mnem.startswith('j') and (mnem == 'jmp' or mnem[1:] in COND):
             tgt = num(ops.split()[0])
             if entry <= tgt < end and tgt not in self.stub_starts - {entry}:
@@ -469,10 +469,10 @@ class Lifter:
             if mnem != 'jmp':
                 target = self.resolve_code(tgt)
                 if (target and target[0] == 'sym') or self.is_code(tgt):
-                    return 'if (%s) { CALL_AT(%s, s.esp + 4u); RETURN(0); }' % (
+                    return 'if (%s) { TAILCALL(%s); }' % (
                         COND[mnem[1:]], self.code_ptr(tgt))
                 raise Unsupported('conditional jump out of function')
-            return 'CALL_AT(%s, s.esp + 4u); RETURN(0);' % self.code_ptr(tgt)       # tail call
+            return 'TAILCALL(%s);' % self.code_ptr(tgt)       # tail call
         if mnem == 'call':
             o = ops.strip()
             if o.startswith('dword ptr'):

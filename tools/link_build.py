@@ -797,7 +797,37 @@ def void_mismatches(units):
             a = int(v, 0)
             if a in defs and return_kind(k) == 'value':
                 wants_value.add(a)
-    return {a for a, d in defs.items() if return_kind(d) == 'void' and a in wants_value}
+    undecorated = {a for a, d in defs.items() if return_kind(d) is None and a in wants_value}
+    src_void = source_void_returns(units, undecorated) if undecorated else set()
+    return {a for a, d in defs.items() if (return_kind(d) == 'void' or a in src_void) and a in wants_value}
+
+
+def source_void_returns(units, wanted):
+    """Addresses in `wanted` whose definition (the line after its `// @fnv 0x...` comment in the decomp source) is
+    declared `void`. C-linkage names (`_FUN_00658c10`) carry no return code, so the source decides."""
+    out = set()
+    by_unit = {}
+    for u in units:
+        for f in u['functions']:
+            a = int(f['address'], 16)
+            if a in wanted:
+                by_unit.setdefault(u['source'], set()).add(a)
+    for source, addrs in by_unit.items():
+        try:
+            lines = (DECOMP / source).read_text(errors='replace').splitlines()
+        except OSError:
+            continue
+        for k, line in enumerate(lines):
+            m = re.match(r'\s*//\s*@fnv\s+0x([0-9a-fA-F]{8})', line)
+            if not m or int(m.group(1), 16) not in addrs:
+                continue
+            j = k + 1
+            while j < len(lines) and (not lines[j].strip() or lines[j].lstrip().startswith('//')):
+                j += 1
+            decl = re.sub(r'(extern\s+"C"|static|inline|__forceinline|__declspec\([^)]*\)|virtual)', ' ', lines[j] if j < len(lines) else '')
+            if re.match(r'\s*void(?!\s*\*)', decl):
+                out.add(int(m.group(1), 16))
+    return out
 
 
 def original_data_refs(img, units):

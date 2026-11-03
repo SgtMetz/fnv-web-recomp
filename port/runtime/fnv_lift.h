@@ -104,6 +104,8 @@ inline void fnv_lift_do_call(FnvLiftState& s, void* fn, uint32_t args)
 }
 #define CALL(fn) fnv_lift_do_call(s, (fn), s.esp)
 #define CALL_AT(fn, args) fnv_lift_do_call(s, (fn), (args))
+// tail jump: the target's `ret N` pops the caller's arguments, so this function returns with the same pop
+#define TAILCALL(fn) do { uint32_t e0__ = s.esp; fnv_lift_do_call(s, (fn), e0__ + 4u); RETURN(s.esp - e0__); } while (0)
 
 enum { FOP_ADD, FOP_SUB, FOP_MUL, FOP_DIV, FOP_MIN, FOP_MAX };
 // packed/scalar float op on n lanes (4 = ps, 1 = ss): d = d op src (min/max return src on NaN, as SSE does)
