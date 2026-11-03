@@ -458,6 +458,46 @@ LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
                         while (len < 60 && s[len] >= 0x20 && s[len] < 0x7f) ++len;
                         if (len >= 4) fprintf(g_log, "[bp]     %s -> \"%.*s\"\n", ai < 0 ? "ecx" : "arg", len, s);
                     }
+                    // FNV_BP_MEM=path[,path...]: dump memory reachable from the entry state. A path is a base
+                    // (ecx, edx, eax, esi, edi, a0..a3 = stack arguments) followed by "/hex" steps, each meaning
+                    // p = *(p + hex), "+hex"/"-hex" steps (p += / -= hex), and an optional ":n" word count
+                    // (default 8, max 32), e.g. "ecx/8/c:4" or "a0-14:12".
+                    if (const char* mem = getenv("FNV_BP_MEM"))
+                        for (const char* q = mem; q && *q;)
+                        {
+                            DWORD p = 0;
+                            if (q[0] == 'a' && q[1] >= '0' && q[1] <= '3') p = sp[1 + (q[1] - '0')];
+                            else if (!strncmp(q, "ecx", 3)) p = c->Ecx;
+                            else if (!strncmp(q, "edx", 3)) p = c->Edx;
+                            else if (!strncmp(q, "eax", 3)) p = c->Eax;
+                            else if (!strncmp(q, "esi", 3)) p = c->Esi;
+                            else if (!strncmp(q, "edi", 3)) p = c->Edi;
+                            const char* e = q;
+                            while (*e && *e != 0x2c && *e != '/' && *e != '+' && *e != '-' && *e != ':') ++e;
+                            bool ok = true;
+                            while (*e == '/' || *e == '+' || *e == '-')
+                            {
+                                char* end;
+                                DWORD off = (DWORD)strtoul(e + 1, &end, 16);
+                                char op = *e;
+                                e = end;
+                                if (op != '/') { p = op == '+' ? p + off : p - off; continue; }
+                                if (IsBadReadPtr((void*)(p + off), 4)) { ok = false; break; }
+                                p = *(DWORD*)(p + off);
+                            }
+                            int n = 8;
+                            if (*e == ':') { char* end; n = (int)strtoul(e + 1, &end, 10); e = end; }
+                            const char* pe = e;
+                            while (*pe && *pe != 0x2c) ++pe;
+                            fprintf(g_log, "[bp]     mem %.*s = %08lx:", (int)(pe - q), q, p);
+                            for (int k = 0; ok && k < n && k < 32; ++k)
+                            {
+                                if (IsBadReadPtr((void*)(p + 4 * k), 4)) break;
+                                fprintf(g_log, " %08lx", ((DWORD*)p)[k]);
+                            }
+                            fprintf(g_log, ok ? "\n" : " (unreadable)\n");
+                            q = *pe ? pe + 1 : nullptr;
+                        }
                     fflush(g_log);
                 }
                 if (b.hits <= 40 && g_retN < 64 && !getenv("FNV_BP_NORET"))
