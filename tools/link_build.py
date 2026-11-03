@@ -1230,8 +1230,9 @@ def main():
     # OpenAI model Phase 1: the source constructor dispatches through a mismatched vtable slot; the original calls 00482c80 directly.
     # 0x52bd40/0x52b8f0: TESImageSpaceModifier::ResetFormData/ctor (the compiled version leaks 4 bytes per loop iteration).
     # 0xc7f4a0 and its callers 0xc7f4e0/0xc7f500: an MSVC register-convention helper (eax/esi/edx), see hkvector4.cpp.
+    # 0xd32ae0: the compiled source reads past its declared arguments and optimizes to a bare return.
     ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50, 0x0052BD40, 0x0052B8F0,
-        0x00C7F4A0, 0x00C7F4E0, 0x00C7F500}
+        0x00C7F4A0, 0x00C7F4E0, 0x00C7F500, 0x00D32AE0}
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():
