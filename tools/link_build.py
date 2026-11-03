@@ -1153,7 +1153,7 @@ def main():
     # OpenAI model Phase 1: a32c70's source prototype is bool, but original callers pass a 32-bit Node pointer.
     # Lift the original body so its full-width argument reaches a31910 instead of being truncated to 0x20.
     # OpenAI model Phase 1: the source constructor dispatches through a mismatched vtable slot; the original calls 00482c80 directly.
-    ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50}
+    ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50, 0x0052BD40, 0x0052B8F0}   # + TESImageSpaceModifier::ResetFormData/ctor (compiled version leaks 4 bytes per loop iteration)
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():

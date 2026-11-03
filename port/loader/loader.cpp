@@ -415,6 +415,8 @@ __declspec(naked) void bp_ret_tramp()
     }
 }
 
+char g_bpRing[64][200];
+volatile LONG g_bpRingIdx = 0;
 LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
 {
     auto r = ep->ExceptionRecord;
@@ -425,6 +427,12 @@ LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
             {
                 Bp& b = g_bps[i];
                 CONTEXT* c = ep->ContextRecord;
+                {
+                    DWORD* sp3 = (DWORD*)c->Esp;
+                    LONG k3 = InterlockedIncrement(&g_bpRingIdx) - 1;
+                    snprintf(g_bpRing[k3 & 63], sizeof(g_bpRing[0]), "%08lx hit %d ecx=%08lx edx=%08lx ret=%08lx args %08lx %08lx %08lx %08lx", b.original, b.hits + 1,
+                             c->Ecx, c->Edx, sp3[0], sp3[1], sp3[2], sp3[3], sp3[4]);
+                }
                 if (b.hits++ < 40)
                 {
                     DWORD* sp = (DWORD*)c->Esp;
@@ -700,6 +708,12 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
                 describe((void*)sp[i]);
                 ++shown;
             }
+    }
+    if (g_bpRingIdx > 0)
+    {
+        LONG n3 = g_bpRingIdx, from = n3 > 64 ? n3 - 64 : 0;
+        fprintf(g_log, "[bpring] last %ld breakpoint hits before the crash:\n", (long)(n3 - from));
+        for (LONG i = from; i < n3; ++i) fprintf(g_log, "[bpring] %s\n", g_bpRing[i & 63]);
     }
     g_tracing = 1; dump_trace();
     fflush(g_log);
