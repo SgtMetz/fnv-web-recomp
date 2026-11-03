@@ -4,6 +4,19 @@
 // the emulated stack, then reports what the callee popped (stdcall/thiscall) and any x87 return value.
 #include "fnv_lift.h"
 
+// Thread-local storage for lifted original code. It does `mov eax,[__tls_index]` on the original slot (0 in the data
+// image), `mov ecx, fs:[0x2c]`, `mov edx,[ecx+eax*4]`, then `[edx + original .tls offset]`. The DLL carries the
+// original template in .tls$FNV (start marker fnv_tls_fnv_start), so fs:[0x2c] becomes a per-thread one-entry
+// array holding this thread's address of that copy.
+extern "C" __declspec(thread) char fnv_tls_fnv_start;
+static __declspec(thread) void* fnv_lift_tls_slot;
+
+extern "C" uint32_t __cdecl fnv_lift_tls_array(void)
+{
+    fnv_lift_tls_slot = &fnv_tls_fnv_start;
+    return (uint32_t)(uintptr_t)&fnv_lift_tls_slot;
+}
+
 extern "C" {
 
 // fn: callee; ecx: this/fastcall arg; args: emulated stack at the call (first argument first); out: results

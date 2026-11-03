@@ -305,7 +305,17 @@ int main(int argc, char** argv)
         *slash = 0;
     SetCurrentDirectoryA(gameDir);
     SetDllDirectoryA(gameDir);
+    // log first-chance faults while the DLL initialises (DllMain/CRT init failures report only error 1114)
+    PVOID loadVeh = AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ep) -> LONG {
+        DWORD code = ep->ExceptionRecord->ExceptionCode;
+        if (code != 0xE06D7363 && code != 0x406D1388)
+            fprintf(g_log, "[loader] during DLL load: exception 0x%08lx at %p (data 0x%08lx)\n", code,
+                    ep->ExceptionRecord->ExceptionAddress,
+                    ep->ExceptionRecord->NumberParameters >= 2 ? (DWORD)ep->ExceptionRecord->ExceptionInformation[1] : 0);
+        return EXCEPTION_CONTINUE_SEARCH;
+    });
     HMODULE game = LoadLibraryA(dllPath);
+    RemoveVectoredExceptionHandler(loadVeh);
     if (!game)
         return fail("cannot load fnv_game.dll");
     auto table = (const AddrEntry*)GetProcAddress(game, "fnv_addr_table");
@@ -470,6 +480,23 @@ int main(int argc, char** argv)
     fprintf(g_log, "[loader] initializers: %zu ran, %zu blocked, %zu skipped (not relinked)\n", ran, blocked,
             skipped);
     fflush(g_log);
+
+    // debug: FNV_PROBE_ALLOC=1 calls the relinked allocators and prints what they return, then exits
+    if (getenv("FNV_PROBE_ALLOC") && *getenv("FNV_PROBE_ALLOC") == '1')
+    {
+        auto niNew = (void*(__cdecl*)(unsigned int))relinked(0x00AA13E0);          // NiMemObject::operator new
+        auto niMalloc = (void*(__cdecl*)(unsigned int))relinked(0x00AA1070);       // NiMalloc
+        auto mmAlloc = (void*(__fastcall*)(void*, void*, unsigned int))relinked(0x00AA3E40); // MemoryManager::Allocate
+        for (unsigned int size : {0x1Cu, 0x40u, 0x400u, 0x10000u})
+        {
+            void* a = niNew ? niNew(size) : nullptr;
+            void* b = niMalloc ? niMalloc(size) : nullptr;
+            void* c = mmAlloc ? mmAlloc((void*)0x011F6238, nullptr, size) : nullptr;
+            fprintf(g_log, "[probe] size %#x: NiNew %p NiMalloc %p MemoryManager::Allocate %p\n", size, a, b, c);
+        }
+        fflush(g_log);
+        return 0;
+    }
 
     // 6. WinMain
     auto winMain = (int(__stdcall*)(HINSTANCE, HINSTANCE, LPSTR, int))relinked(kWinMain);

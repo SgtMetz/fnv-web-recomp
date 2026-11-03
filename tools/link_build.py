@@ -283,7 +283,12 @@ def patch_object(job):
 
     for i, s in entries:
         name, sec = s['name'], s['section']
-        if sec > 0 and name in own and s['storage'] in (EXTERNAL, STATIC) and sec not in vsec:
+        if sec > 0 and name in own and s['storage'] in (EXTERNAL, STATIC) and sec not in vsec                 and own[name] in c['lift_replace']:
+            # the original's machine code replaces this definition (see void_mismatches): keep it unexported
+            p.rename(i, 'fnv_f_%08x__fnvreplaced%d' % (own[name], index))
+            p.set(i, storage=STATIC)
+            stats['replaced-by-lifted'] += 1
+        elif sec > 0 and name in own and s['storage'] in (EXTERNAL, STATIC) and sec not in vsec:
             if c['addr_owner'].get(own[name]) == index:
                 p.rename(i, 'fnv_f_%08x' % own[name])
                 p.set(i, storage=EXTERNAL)
@@ -545,10 +550,14 @@ def write_tls_obj(path, names, tls):
         off = len(strings)
         strings += n.encode() + b'\0'
         syms += struct.pack('<IIIhHBB', 0, off, int(n[6:], 16) - tls[0], 1, 0, EXTERNAL, 0)
+    # start marker: lifted original code reaches the original TLS layout through it (fnv_lift_tls_array)
+    off = len(strings)
+    strings += b'_fnv_tls_fnv_start\0'
+    syms += struct.pack('<IIIhHBB', 0, off, 0, 1, 0, EXTERNAL, 0)
     struct.pack_into('<I', strings, 0, len(strings))
     data_ptr = 20 + 40
     symptr = data_ptr + len(body)
-    header = struct.pack('<HHIIIHH', 0x14c, 1, 0, symptr, len(names) + 2, 0, 0)
+    header = struct.pack('<HHIIIHH', 0x14c, 1, 0, symptr, len(names) + 3, 0, 0)
     section = struct.pack('<8sIIIIIIHHI', b'.tls$FNV', 0, 0, len(body), data_ptr, 0, 0, 0, 0, 0xC0300040)
     Path(path).write_bytes(header + section + body + bytes(syms) + bytes(strings))
 
@@ -646,6 +655,39 @@ def original_calls(img, units):
     return out
 
 
+STATIC_CLASS = set('CDKLSTYZ')       # MS mangling: static members / globals: <class><cc><return>
+MEMBER_CLASS = set('ABEFIJMNQRUV')   # instance members: <class><this-cv><cc><return>
+
+
+def return_kind(name):
+    """'void' / 'value' from a decorated function name's return-type code, or None (ctor/dtor/unknown)."""
+    if not name.startswith('?') or name.startswith(('??_', '??$')):
+        return None
+    i = name.find('@@')
+    t = name[i + 2:] if i >= 0 else ''
+    if not t:
+        return None
+    r = t[2:3] if t[0] in STATIC_CLASS else t[3:4] if t[0] in MEMBER_CLASS else ''
+    if not r or r == '@':
+        return None
+    return 'void' if r == 'X' else 'value'
+
+
+def void_mismatches(units):
+    """Recipe functions defined as returning void while other units call the same address expecting a value. The
+    decomp matched because the original leaves its last call's result in eax; clang does not, so callers read
+    garbage (e.g. 0x00AA13E0, NiMemObject::operator new). The machine code is the authority: these are lifted from
+    the original instead."""
+    defs = {int(f['address'], 16): f['symbol'] for u in units for f in u['functions']}
+    wants_value = set()
+    for u in units:
+        for k, v in u.get('symbols', {}).items():
+            a = int(v, 0)
+            if a in defs and return_kind(k) == 'value':
+                wants_value.add(a)
+    return {a for a, d in defs.items() if return_kind(d) == 'void' and a in wants_value}
+
+
 def original_data_refs(img, units):
     """{recipe function address: set of absolute data addresses it references}, from the exe's .reloc fixups that
     lie inside the function (EH tails included)."""
@@ -706,11 +748,16 @@ def lift_initializers(exe, img, units, ctx, traps):
     allow = set(gaps)
     lifter = lift_stubs.Lifter(exe, resolve, (text['start'], text['end']), gap_end=gap_end,
                                allow=lambda x: lift_stubs.LIFT_REGION[0] <= x < lift_stubs.LIFT_REGION[1] or x in allow)
-    lifter.run(entries + gaps)
+    sizes = {s: n for s, n in spans}
+    replace = sorted(ctx['lift_replace'])
+    allow.update(replace)
+    bounded = dict((a, a + sizes[a]) for a in replace)
+    lifter.gap_end = lambda x: bounded[x] if x in bounded else gap_end(x)
+    lifter.run(entries + gaps + replace)
     (LINK / 'lifted.cpp').write_text(lifter.source())
     for g in gaps:                     # now defined by lifted.obj
         traps.pop('fnv_c_%08x' % g, None)
-    return dict(initializers=len(entries), gap_functions=len(gaps), lifted=len(lifter.lifted), unsupported=len(lifter.unsupported),
+    return dict(initializers=len(entries), gap_functions=len(gaps), replaced=len(replace), lifted=len(lifter.lifted), unsupported=len(lifter.unsupported),
                 unsupported_top=sorted(Counter(re.sub(r'0x[0-9a-f]+', 'N', v) for v in lifter.unsupported.values())
                                        .items(), key=lambda x: -x[1])[:15],
                 unbound_code_pointers=len(lifter.traps))
@@ -769,6 +816,7 @@ def main():
             for f in u['functions']:
                 owner.setdefault(int(f['address'], 16), i)
     ctx['addr_owner'] = owner
+    ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None}
     # call-site correspondence against the original code (rule 4: the machine code is the authority)
     ctx['orig_calls'] = original_calls(img, units)
     ctx['orig_data_refs'] = original_data_refs(img, units)
@@ -821,7 +869,9 @@ def main():
         ext, und = external_symbols(LINK / obj)
         compat_defined |= ext
         referenced |= und             # lifted code can name recipe functions no unit object defines
-    for n in referenced - defined - data_names - tls_names - ctx['libsyms'] - ctx['compat'] - compat_defined - set(traps):
+    # defined by tls.obj, or by the toolchain for implicit TLS (lld/CRT), never trap stubs
+    generated = {'_fnv_tls_fnv_start', '__tls_array', '__tls_index', '__tls_used', '___tls_array'}
+    for n in referenced - defined - data_names - tls_names - generated - ctx['libsyms'] - ctx['compat'] - compat_defined - set(traps):
         m = re.match(r'fnv_[fc]_([0-9a-f]{8})$', n)
         traps[n] = (int(m.group(1), 16) if m else 0, n)
         stats['trap-never-defined'] += 1

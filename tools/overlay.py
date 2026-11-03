@@ -420,6 +420,72 @@ def explicit_constructor_calls(lines, diags, src, record):
     return changed
 
 
+def qualify_namespaced_calls(lines, diags, src, record):
+    """A function `dropc` made namespaced (its extern "C" declaration was one global entity under VC2008) is called
+    from outside the namespace; clang suggests the qualified name. Qualify that call."""
+    changed = False
+    for d in diags:
+        m = re.match(r"(use of undeclared identifier|unknown type name) '(\w+)'; did you mean '((?:\w+::)+)\2'\?",
+                     d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src):
+            continue
+        i, x, ns = d['line'] - 1, m.group(2), m.group(3)
+        if m.group(1) == 'unknown type name':      # an SDK type that only exists inside that namespace
+            new = re.sub(r'(?<![\w:.>])%s\b' % re.escape(x), ns + x, lines[i])
+        else:
+            new = re.sub(r'(?<![\w:.>])%s(\s*\()' % re.escape(x), ns + x + r'\1', lines[i])
+        if new != lines[i]:
+            lines[i] = new
+            record.append(dict(rule='qualify-call', line=d['line'], name=ns + x))
+            changed = True
+    return changed
+
+
+def sdk_pointer_args(lines, diags, src, record):
+    """A decomp stand-in pointer (e.g. CRITICAL_SECTION_STUB*) passed to the Windows SDK declaration of the same
+    import (VC2008 merged both extern "C" declarations into one function): cast the argument to the SDK pointer
+    typedef. Only for SDK typedef parameters (LPxxx / Pxxx), so ordinary type errors stay errors."""
+    edits = {}
+    for d in diags:
+        m = re.match(r"cannot initialize a parameter of type '((?:LP|P)[A-Z_0-9]+)'.* with an [lr]value of type '[^']+\*'",
+                     d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src) or not d['ranges']:
+            continue
+        l1, c1, l2, c2 = d['ranges'][0]
+        edits.setdefault(l1, set()).add((c1, '(%s)(' % m.group(1)))
+        edits.setdefault(l2, set()).add((c2, ')'))
+    for ln, points in edits.items():
+        line = lines[ln - 1]
+        for col, text in sorted(points, key=lambda p: (p[0], p[1] != ')'), reverse=True):
+            line = line[:col - 1] + text + line[col - 1:]
+        lines[ln - 1] = line
+        record.append(dict(rule='sdk-ptr-arg', line=ln))
+    return bool(edits)
+
+
+def explicit_sized_delete(lines, diags, src, record, unit_syms):
+    """An explicit `operator delete(p, n)` call whose namespaced declaration `nsnew` removed: when the unit's recipe
+    binds exactly one namespaced sized delete (??3<ns>@@YAXPAXI@Z), call a block-scope declaration carrying that
+    decorated name, so the link binds it to the same address the original called."""
+    sized = [k for k in unit_syms if re.match(r'^\?\?3\w+@@YAXPAXI@Z$', k)]
+    if len(sized) != 1:
+        return False
+    changed = False
+    for d in diags:
+        if d['kind'] != 'error' or not same_file(d['file'], src) or \
+                d['msg'] != "no matching function for call to 'operator delete'":
+            continue
+        i = d['line'] - 1
+        if 'operator delete(' not in lines[i] or 'fnv_sized_delete' in lines[i]:
+            continue
+        lines[i] = re.sub(r'\boperator delete\(', '{ void fnv_sized_delete(void*, unsigned int) __asm__("%s"); '
+                          'fnv_sized_delete(' % sized[0], lines[i], count=1)
+        lines[i] = re.sub(r'\);\s*$', '); }', lines[i])
+        record.append(dict(rule='sized-delete', line=d['line'], target=sized[0]))
+        changed = True
+    return changed
+
+
 def declaration_start(lines, i):
     """0-based index of the first line of the namespace-scope declaration that contains line i."""
     ns = namespace_depths(lines)
@@ -440,26 +506,70 @@ def declaration_start(lines, i):
     return j
 
 
+def patch_header_copy(src, header, defn_line, use_line, record):
+    """Late specialisation and its first use both inside a header the unit includes directly ("name"): write a
+    patched copy next to the overlay source (searched first for quoted includes) with the specialisation declared
+    ahead of the declaration holding the use. The decomp's header is never modified."""
+    copy = Path(src).parent / header.name
+    unit_text = Path(src).read_text(errors='replace')
+    if not re.search(r'#\s*include\s*"%s"' % re.escape(header.name), unit_text):
+        return False
+    hl = (copy if copy.exists() else header).read_text(errors='replace').split('\n')
+    defn = hl[defn_line - 1].strip()
+    prefixed = defn.startswith('template')
+    if not prefixed and defn_line > 1 and re.match(r'^\s*template\s*<\s*>\s*$', hl[defn_line - 2]):
+        prefixed = True
+    # the definition can wrap: join until the parameter list closes
+    k, text = defn_line - 1, ''
+    while k < len(hl):
+        text += ' ' + hl[k].strip()
+        if text.count('(') and text.count('(') == text.count(')'):
+            break
+        k += 1
+    m = re.match(r'^\s*(?:template\s*<\s*>\s*)?(.+?\))\s*(const)?', text.split('{')[0])
+    if not m:
+        return False
+    decl = 'template <> %s%s;  // [overlay specdecl, header copy]' % (m.group(1), ' const' if m.group(2) else '')
+    j = declaration_start(hl, use_line - 1)
+    hl[j] = decl + '\n' + hl[j]
+    if not prefixed:
+        hl[defn_line - 1] = 'template <> ' + hl[defn_line - 1].lstrip()
+    copy.write_text('\n'.join(hl))
+    record.append(dict(rule='specdecl-header', header=header.name, line=defn_line))
+    return True
+
+
 def specialization_before_use(lines, diags, src, record):
     """A member specialisation defined after the template was instantiated (VC2008 still used it everywhere):
     declare it ahead of the declaration holding the first use, which clang's note names. Inserts a line, so it runs
     alone in its round (the caller re-diagnoses)."""
     for k, d in enumerate(diags):
-        if d['kind'] != 'error' or not same_file(d['file'], src) or \
-                not re.match(r"explicit specialization of '\w+' after instantiation", d['msg']):
+        if d['kind'] != 'error' or not re.match(r"explicit specialization of '\w+' after instantiation", d['msg']):
             continue
+        here = same_file(d['file'], src)
+        hnote = next((n for n in diags[k + 1:k + 4] if n['kind'] == 'note' and 'first required here' in n['msg']
+                      and same_file(n['file'], d['file'])), None)
+        if not here and hnote is not None and patch_header_copy(src, Path(d['file']), d['line'], hnote['line'], record):
+            return True
         note = next((n for n in diags[k + 1:k + 4] if n['kind'] == 'note' and 'first required here' in n['msg']
                      and same_file(n['file'], src)), None)
-        defn = lines[d['line'] - 1].strip()
+        # the definition may sit in a shared header (read-only here): take its text from there
+        src_lines = lines if here else Path(d['file']).read_text(errors='replace').splitlines()
+        if d['line'] > len(src_lines):
+            continue
+        defn = src_lines[d['line'] - 1].strip()
+        if not here and not defn.startswith('template'):
+            prev = src_lines[d['line'] - 2].strip() if d['line'] > 1 else ''
+            defn = (prev + ' ' + defn) if re.match(r'^template\s*<\s*>$', prev) else defn
         m = re.match(r'^(template\s*<\s*>\s*)?(.+?\))\s*(const)?\s*(\{.*)?$', defn)
         if note is None or not m:
             continue
         decl = 'template <> %s%s;  // [overlay specdecl]' % (m.group(2), ' const' if m.group(3) else '')
         j = declaration_start(lines, note['line'] - 1)
         lines[j] = decl + '\n' + lines[j]
-        if not m.group(1):
+        if here and not m.group(1):
             lines[d['line'] - 1] = 'template <> ' + lines[d['line'] - 1].lstrip()
-        record.append(dict(rule='specdecl', line=d['line'], at=j + 1))
+        record.append(dict(rule='specdecl', line=d['line'], at=j + 1, header=not here))
         return True
     return False
 
@@ -646,7 +756,7 @@ def sdk_conflict_renames(lines, diags, src, record):
     return changed
 
 
-def fix_round(lines, diags, src, record):
+def fix_round(lines, diags, src, record, unit=None):
     # rules that insert lines put a newline inside one entry; re-split so list indices match the file's line numbers
     lines[:] = '\n'.join(lines).split('\n')
     if drop_extern_c(lines, diags, src, record):
@@ -655,13 +765,24 @@ def fix_round(lines, diags, src, record):
         return True                        # it inserted a line: re-diagnose before line-based rules run
     if inherited_member_specializations(lines, diags, src, record):
         return True                        # it inserted a line too
-    changed = apply_fixits(lines, diags, src, record)
+    # Column-based rules first, each only on lines nothing has changed yet this round (their columns come from
+    # this round's diagnostics); a skipped edit is re-diagnosed with fresh columns next round.
+    changed = False
+    before = list(lines)
+    for rule in (apply_fixits, lvalue_wraps, literal_param_casts, sdk_pointer_args):
+        fresh = [d for d in diags if not same_file(d['file'], src) or
+                 (d['line'] <= len(lines) and lines[d['line'] - 1] == before[d['line'] - 1] and
+                  all(r[0] <= len(lines) and r[2] <= len(lines) and lines[r[0] - 1] == before[r[0] - 1] and
+                      lines[r[2] - 1] == before[r[2] - 1] for r in d.get('ranges', ())) and
+                  all(f['l1'] <= len(lines) and lines[f['l1'] - 1] == before[f['l1'] - 1] for f in d.get('fixits', ())))]
+        changed |= rule(lines, fresh, src, record)
+    # text rules (regexes over the current line text) after them
     changed |= const_casts(lines, diags, src, record)
-    changed |= lvalue_wraps(lines, diags, src, record)
-    changed |= literal_param_casts(lines, diags, src, record)
     changed |= interlocked_addresses(lines, diags, src, record)
     changed |= exception_spec_and_delete(lines, diags, src, record)
     changed |= explicit_constructor_calls(lines, diags, src, record)
+    changed |= qualify_namespaced_calls(lines, diags, src, record)
+    changed |= explicit_sized_delete(lines, diags, src, record, (unit or {}).get('symbols', {}))
     changed |= incomplete_if_not_exists(lines, diags, src, record)
     changed |= rename_namespaced_specializations(lines, diags, src, record)
     changed |= spec_conversions(lines, diags, src, record)
@@ -753,7 +874,7 @@ def process(index, unit, rounds):
             modern = True
             record.append(dict(rule='modern'))
             changed = True
-        if not fix_round(lines, diags, out, record) and not changed:
+        if not fix_round(lines, diags, out, record, unit) and not changed:
             break
     (out.parent / (out.name + '.overlay.json')).write_text(json.dumps(dict(source=unit['source'], ok=ok,
                                                                           rounds=r + 1, modern=modern,

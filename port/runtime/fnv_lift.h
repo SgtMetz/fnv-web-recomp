@@ -7,6 +7,8 @@
 #include <string.h>
 
 extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);
+extern "C" uint32_t __cdecl fnv_lift_tls_array(void);
+#include <intrin.h>
 
 extern "C" {
 struct FnvLiftCall
@@ -58,6 +60,7 @@ struct FnvLiftState
 #define M8(a) (*(uint8_t*)(uintptr_t)(a))
 #define M16(a) (*(uint16_t*)(uintptr_t)(a))
 #define M32(a) (*(uint32_t*)(uintptr_t)(a))
+#define M64(a) (*(uint64_t*)(uintptr_t)(a))
 #define MF(a) (*(float*)(uintptr_t)(a))
 #define MD(a) (*(double*)(uintptr_t)(a))
 #define X(i) (s.xmm[i])
@@ -100,6 +103,47 @@ inline void fnv_lift_do_call(FnvLiftState& s, void* fn, uint32_t args)
 }
 #define CALL(fn) fnv_lift_do_call(s, (fn), s.esp)
 #define CALL_AT(fn, args) fnv_lift_do_call(s, (fn), (args))
+
+enum { FOP_ADD, FOP_SUB, FOP_MUL, FOP_DIV, FOP_MIN, FOP_MAX };
+// packed/scalar float op on n lanes (4 = ps, 1 = ss): d = d op src (min/max return src on NaN, as SSE does)
+inline void SSEF(uint8_t* d, const uint8_t* src, int n, int op)
+{
+    float a[4], b[4];
+    memcpy(a, d, 16);
+    memcpy(b, src, n * 4);
+    for (int i = 0; i < n; ++i)
+    {
+        switch (op)
+        {
+        case FOP_ADD: a[i] = a[i] + b[i]; break;
+        case FOP_SUB: a[i] = a[i] - b[i]; break;
+        case FOP_MUL: a[i] = a[i] * b[i]; break;
+        case FOP_DIV: a[i] = a[i] / b[i]; break;
+        case FOP_MIN: a[i] = a[i] < b[i] ? a[i] : b[i]; break;
+        default: a[i] = a[i] > b[i] ? a[i] : b[i]; break;
+        }
+    }
+    memcpy(d, a, 16);
+}
+// bitwise and / andnot / or / xor over 128 bits
+inline void SSEB(uint8_t* d, const uint8_t* src, int op)
+{
+    for (int i = 0; i < 16; ++i)
+        d[i] = op == 0 ? (d[i] & src[i]) : op == 1 ? ((uint8_t)~d[i] & src[i]) : op == 2 ? (d[i] | src[i]) : (d[i] ^ src[i]);
+}
+
+// shufps: lanes 0,1 from d, lanes 2,3 from src, selected by imm
+inline void SHUFPS(uint8_t* d, const uint8_t* src, unsigned int imm)
+{
+    float a[4], b[4], r[4];
+    memcpy(a, d, 16);
+    memcpy(b, src, 16);
+    r[0] = a[imm & 3];
+    r[1] = a[(imm >> 2) & 3];
+    r[2] = b[(imm >> 4) & 3];
+    r[3] = b[(imm >> 6) & 3];
+    memcpy(d, r, 16);
+}
 
 inline void UNPCKLPS(uint8_t* d, const uint8_t* src)
 {

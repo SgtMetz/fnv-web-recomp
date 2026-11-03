@@ -124,9 +124,10 @@ class Lifter:
         m = re.match(r'^(?:(byte|word|dword|qword|xmmword|tbyte) ptr )?(\w+:)?\[(.*)\]$', op)
         if m:
             if m.group(2) == 'fs:':
-                if m.group(3).strip() not in ('0', '0x0'):
-                    raise Unsupported('fs: offset')
-                return ('fs', 32, 's.fs0')
+                off = num(m.group(3).strip())
+                if off == 0:
+                    return ('fs', 32, 's.fs0')       # SEH chain head: private to the lifted call
+                return ('fsr', 32, off)              # other TEB fields: read-only (fs:[0x2c] = TLS array)
             return ('mem', SIZES[m.group(1) or 'dword'], self.mem_addr(m.group(3)))
         if op in REG32:
             return ('reg', 32, 's.' + op)
@@ -147,6 +148,8 @@ class Lifter:
         size = size or sz
         if k in ('reg', 'fs'):
             return e
+        if k == 'fsr':
+            return 'fnv_lift_tls_array()' if e == 0x2c else '(uint32_t)__readfsdword(%#x)' % e
         if k == 'reg16':
             return '(s.%s & 0xffffu)' % e
         if k == 'reg8':
@@ -234,12 +237,33 @@ class Lifter:
             # inc/dec leave CF alone
             return '{ int cf_ = s.cf; uint32_t a_ = %s, r_ = a_ %s 1u; %s(a_, 1u, r_, %d); s.cf = cf_; %s }' % (
                 a, '+' if mnem == 'inc' else '-', 'ADDF' if mnem == 'inc' else 'SUBF', bits, self.write(P[0], 'r_'))
+        if mnem in ('sbb', 'adc'):
+            bits = P[0][1]
+            a, b = self.read(P[0]), self.read(P[1], bits)
+            if mnem == 'sbb':
+                return '{ uint32_t a_ = %s, b_ = (%s) + (uint32_t)s.cf, r_ = a_ - b_; SUBF(a_, b_, r_, %d); %s }' % (
+                    a, b, bits, self.write(P[0], 'r_'))
+            return '{ uint32_t a_ = %s, b_ = (%s) + (uint32_t)s.cf, r_ = a_ + b_; ADDF(a_, b_, r_, %d); %s }' % (
+                a, b, bits, self.write(P[0], 'r_'))
         if mnem.startswith('set') and mnem[3:] in COND:
             return self.write(P[0], '(%s) ? 1u : 0u' % COND[mnem[3:]])
         if mnem.startswith('cmov') and mnem[4:] in COND:
             return 'if (%s) { %s }' % (COND[mnem[4:]], self.write(P[0], self.read(P[1])))
         if mnem == 'cdq':
             return 's.edx = (s.eax & 0x80000000u) ? 0xffffffffu : 0u;'
+        if mnem == 'rdtsc':
+            return '{ uint64_t t_ = __rdtsc(); s.eax = (uint32_t)t_; s.edx = (uint32_t)(t_ >> 32); }'
+        if mnem.startswith('prefetch'):
+            return ''
+        if mnem == 'shufps':
+            d, s_, imm = P[0], P[1], P[2][2]
+            src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
+            return 'SHUFPS(X(%s), %s, %du);' % (d[2], src, imm & 0xff)
+        if mnem in ('fiadd', 'fimul', 'fisub', 'fisubr', 'fidiv', 'fidivr') and P and P[0][0] == 'mem':
+            v = '(double)(int%d_t)M%d(%s)' % (P[0][1], P[0][1], P[0][2])
+            f = {'fiadd': 'ST(0) + %s', 'fimul': 'ST(0) * %s', 'fisub': 'ST(0) - %s', 'fisubr': '%s - ST(0)',
+                 'fidiv': 'ST(0) / %s', 'fidivr': '%s / ST(0)'}[mnem]
+            return 'ST(0) = %s;' % (f % v)
         if mnem == 'cwde':
             return 's.eax = (uint32_t)(int32_t)(int16_t)s.eax;'
         if mnem == 'sahf':
@@ -342,6 +366,17 @@ class Lifter:
                  'fdiv': 'ST(0) / %s', 'fdivr': '%s / ST(0)'}[mnem]
             return 'ST(0) = %s;' % (f % v)
         # ---- SSE ----
+        if mnem in ('addps', 'subps', 'mulps', 'divps', 'addss', 'subss', 'mulss', 'divss', 'minps', 'maxps'):
+            d, s_ = P[0], P[1]
+            src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
+            op = mnem[:3]
+            return 'SSEF(X(%s), %s, %d, %s);' % (d[2], src, 1 if mnem.endswith('ss') else 4,
+                                                {'add': 'FOP_ADD', 'sub': 'FOP_SUB', 'mul': 'FOP_MUL', 'div': 'FOP_DIV',
+                                                 'min': 'FOP_MIN', 'max': 'FOP_MAX'}[op])
+        if mnem in ('andps', 'andnps', 'orps', 'xorps'):
+            d, s_ = P[0], P[1]
+            src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
+            return 'SSEB(X(%s), %s, %d);' % (d[2], src, ('andps', 'andnps', 'orps', 'xorps').index(mnem))
         if mnem in ('movaps', 'movups', 'movss', 'unpcklps'):
             d, s_ = P[0], P[1]
             src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
