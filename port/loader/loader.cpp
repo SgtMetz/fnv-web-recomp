@@ -234,6 +234,20 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
         describe((void*)ebp[1]);
         fputc('\n', g_log);
     }
+    // optimised code keeps no frame pointer: also list stack words that point into relinked code
+    DWORD* sp = (DWORD*)ep->ContextRecord->Esp;
+    if (!g_byPtr.empty())
+    {
+        DWORD lo = (DWORD)g_byPtr.front().relinked, hi = (DWORD)g_byPtr.back().relinked + 0x10000;
+        int shown = 0;
+        for (int i = 0; i < 256 && shown < 16 && !IsBadReadPtr(sp + i, 4); ++i)
+            if (sp[i] >= lo && sp[i] < hi)
+            {
+                fprintf(g_log, "[loader]   stack+%03x %08lx", i * 4, sp[i]);
+                describe((void*)sp[i]);
+                ++shown;
+            }
+    }
     fflush(g_log);
     return EXCEPTION_EXECUTE_HANDLER;
 }

@@ -283,20 +283,185 @@ def lvalue_wraps(lines, diags, src, record):
             continue
         if 'cannot bind to a temporary of type' in d['msg']:
             r = d['ranges'][0]
-        elif 'C-style cast from rvalue to reference type' in d['msg']:
+        elif 'C-style cast from rvalue to reference type' in d['msg'] or \
+                'reinterpret_cast from rvalue to reference type' in d['msg']:
             r = d['ranges'][-1]
         else:
             continue
         l1, c1, l2, c2 = r
-        if l1 == l2:
-            edits.setdefault(l1, set()).add((c1, c2))
-    for ln, spans in edits.items():
+        # point insertions, so a range may span lines: '(' opener at the start, ')' at the end
+        edits.setdefault(l1, set()).add((c1, 'fnv_lvalue('))
+        edits.setdefault(l2, set()).add((c2, ')'))
+    for ln, points in edits.items():
         line = lines[ln - 1]
-        for c1, c2 in sorted(spans, reverse=True):
-            line = line[:c1 - 1] + 'fnv_lvalue(' + line[c1 - 1:c2 - 1] + ')' + line[c2 - 1:]
+        # right to left; at one column a closing ')' goes before an opening wrapper
+        for col, text in sorted(points, key=lambda p: (p[0], p[1] != ')'), reverse=True):
+            line = line[:col - 1] + text + line[col - 1:]
         lines[ln - 1] = line
-        record.append(dict(rule='lvalue', line=ln, edits=len(spans)))
+        record.append(dict(rule='lvalue', line=ln, edits=len(points)))
     return bool(edits)
+
+
+def literal_param_casts(lines, diags, src, record):
+    """VC2008 passed a string literal to a non-const pointer parameter (`f("")` with `void*`); cast the argument
+    (clang's source range) to the parameter type named by the diagnostic. Right to left per line."""
+    edits = {}
+    for d in diags:
+        m = re.match(r"cannot initialize a parameter of type '([^']+\*)' with an lvalue of type 'const char\[\d+\]'",
+                     d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src) or not d['ranges']:
+            continue
+        l1, c1, _, _ = d['ranges'][0]
+        edits.setdefault(l1, set()).add((c1, '(%s)' % m.group(1)))
+    for ln, points in edits.items():
+        line = lines[ln - 1]
+        for col, text in sorted(points, reverse=True):
+            line = line[:col - 1] + text + line[col - 1:]
+        lines[ln - 1] = line
+        record.append(dict(rule='literalcast', line=ln))
+    return bool(edits)
+
+
+def interlocked_addresses(lines, diags, src, record):
+    """`&InterlockedX` used as a __stdcall function pointer: point it at the matching wrapper
+    (port/compat/fnv_overlay_helpers.h); in clang the name is an intrinsic with no such address."""
+    changed = False
+    for d in diags:
+        m = re.match(r"address of overloaded function '_?Interlocked(\w+)' does not match required type", d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src):
+            continue
+        i = d['line'] - 1
+        new = re.sub(r'&\s*_?Interlocked%s\b' % m.group(1), '&fnv_Interlocked%s_stdcall' % m.group(1), lines[i])
+        if new != lines[i]:
+            lines[i] = new
+            record.append(dict(rule='interlocked', line=d['line']))
+            changed = True
+    return changed
+
+
+def inherited_member_specializations(lines, diags, src, record):
+    """`template <> R C<A>::f(P) {...}` where f is inherited from a base of C (VC2008 accepted it as a definition at
+    the recipe address): give the body a home in a helper struct deriving from C<A> that declares f, so `this` and the
+    inherited members keep working. Its mangled name changes; the @fnv source map binds it to its address. Any
+    forward declaration the specdecl rule added is dropped."""
+    changed = False
+    for d in diags:
+        if d['kind'] != 'error' or not same_file(d['file'], src) or \
+                not d['msg'].startswith('no function template matches function template specialization'):
+            continue
+        i = d['line'] - 1
+        m = re.match(r'^(\s*)template\s*<\s*>\s*(.+?)\s+(\w+\s*<.*>)::(\w+)\s*\((.*)\)\s*(const)?\s*(;)?\s*(//.*)?$',
+                     lines[i])
+        if not m:
+            continue
+        if m.group(7):                       # a declaration (e.g. the specdecl line): drop it
+            lines[i] = '// [overlay inherited-spec] ' + lines[i]
+            changed = True
+            continue
+        # a `template <>` written on its own line above (comments may sit between) goes with the definition
+        j = i - 1
+        while j >= 0 and (not lines[j].strip() or lines[j].strip().startswith('//')):
+            j -= 1
+        if j >= 0 and re.match(r'^\s*template\s*<\s*>\s*$', lines[j]):
+            lines[j] = '// [overlay inherited-spec] ' + lines[j]
+        k = sum(1 for c in record if c['rule'] == 'inherited-spec') + 1
+        helper = 'FnvSpecHelper%d' % k
+        const = ' const' if m.group(6) else ''
+        lines[i] = '%sstruct %s : %s { %s %s(%s)%s; };\n%s%s %s::%s(%s)%s' % (
+            m.group(1), helper, m.group(3), m.group(2), m.group(4), m.group(5), const,
+            m.group(1), m.group(2), helper, m.group(4), m.group(5), const)
+        record.append(dict(rule='inherited-spec', line=d['line'], helper=helper))
+        changed = True
+    return changed
+
+
+def exception_spec_and_delete(lines, diags, src, record):
+    """Two VC2008 leniencies:
+       * `throw()` in a function-pointer typedef: dropped (exception specifications have no effect on codegen here);
+       * a class with only a placement `operator delete` under a virtual destructor: C++ deletes the destructor,
+         VC2008 fell back to the global operator delete; declare a usual one that does exactly that."""
+    changed = False
+    for d in diags:
+        if d['kind'] != 'error' or not same_file(d['file'], src):
+            continue
+        i = d['line'] - 1
+        if d['msg'] == 'exception specifications are not allowed in typedefs':
+            new = re.sub(r'\bthrow\s*\([^)]*\)', '', lines[i])
+            if new != lines[i]:
+                lines[i] = new
+                record.append(dict(rule='typedef-throw', line=d['line']))
+                changed = True
+        elif re.match(r"deleted function '~\w+' cannot override a non-deleted function", d['msg']):
+            j = i
+            while j < len(lines) and '{' not in lines[j]:
+                j += 1
+            if j < len(lines) and 'operator delete(void* p) { ::operator delete(p); }' not in lines[j]:
+                k = lines[j].index('{')
+                lines[j] = lines[j][:k + 1] + ' public: void operator delete(void* p) { ::operator delete(p); } ' + \
+                    lines[j][k + 1:]
+                record.append(dict(rule='usual-delete', line=d['line']))
+                changed = True
+    return changed
+
+
+def explicit_constructor_calls(lines, diags, src, record):
+    """`X::X();` as a statement in a member of X (VC2008 ran the constructor on this): placement-construct this."""
+    changed = False
+    for d in diags:
+        m = re.match(r"qualified reference to '(\w+)' is a constructor name rather than a type", d['msg'])
+        if d['kind'] != 'error' or not m or not same_file(d['file'], src):
+            continue
+        i, x = d['line'] - 1, m.group(1)
+        new = re.sub(r'^(\s*)(?:this->)?%s::%s\s*\(\s*\)\s*;' % (x, x), r'\1fnv_construct_in_place(this);', lines[i])
+        if new != lines[i]:
+            lines[i] = new
+            record.append(dict(rule='ctor-call', line=d['line']))
+            changed = True
+    return changed
+
+
+def declaration_start(lines, i):
+    """0-based index of the first line of the namespace-scope declaration that contains line i."""
+    ns = namespace_depths(lines)
+    total, depth = [], 0
+    for l in lines:                      # brace depth at the start of each line
+        total.append(depth)
+        code = re.sub(r'//.*', '', l)
+        depth += code.count('{') - code.count('}')
+    j = i
+    while j > 0 and total[j] > ns[j]:    # walk out of function/class bodies
+        j -= 1
+    # then back over the declaration's own leading lines (return type, template<>, attributes)
+    while j > 0:
+        prev = lines[j - 1].strip()
+        if not prev or prev.startswith(('//', '#', '/*')) or prev.endswith((';', '}', '{')) or total[j - 1] > ns[j - 1]:
+            break
+        j -= 1
+    return j
+
+
+def specialization_before_use(lines, diags, src, record):
+    """A member specialisation defined after the template was instantiated (VC2008 still used it everywhere):
+    declare it ahead of the declaration holding the first use, which clang's note names. Inserts a line, so it runs
+    alone in its round (the caller re-diagnoses)."""
+    for k, d in enumerate(diags):
+        if d['kind'] != 'error' or not same_file(d['file'], src) or \
+                not re.match(r"explicit specialization of '\w+' after instantiation", d['msg']):
+            continue
+        note = next((n for n in diags[k + 1:k + 4] if n['kind'] == 'note' and 'first required here' in n['msg']
+                     and same_file(n['file'], src)), None)
+        defn = lines[d['line'] - 1].strip()
+        m = re.match(r'^(template\s*<\s*>\s*)?(.+?\))\s*(const)?\s*(\{.*)?$', defn)
+        if note is None or not m:
+            continue
+        decl = 'template <> %s%s;  // [overlay specdecl]' % (m.group(2), ' const' if m.group(3) else '')
+        j = declaration_start(lines, note['line'] - 1)
+        lines[j] = decl + '\n' + lines[j]
+        if not m.group(1):
+            lines[d['line'] - 1] = 'template <> ' + lines[d['line'] - 1].lstrip()
+        record.append(dict(rule='specdecl', line=d['line'], at=j + 1))
+        return True
+    return False
 
 
 def incomplete_if_not_exists(lines, diags, src, record):
@@ -482,11 +647,21 @@ def sdk_conflict_renames(lines, diags, src, record):
 
 
 def fix_round(lines, diags, src, record):
+    # rules that insert lines put a newline inside one entry; re-split so list indices match the file's line numbers
+    lines[:] = '\n'.join(lines).split('\n')
     if drop_extern_c(lines, diags, src, record):
         return True                        # re-diagnose before any rename rule touches these names
+    if specialization_before_use(lines, diags, src, record):
+        return True                        # it inserted a line: re-diagnose before line-based rules run
+    if inherited_member_specializations(lines, diags, src, record):
+        return True                        # it inserted a line too
     changed = apply_fixits(lines, diags, src, record)
     changed |= const_casts(lines, diags, src, record)
     changed |= lvalue_wraps(lines, diags, src, record)
+    changed |= literal_param_casts(lines, diags, src, record)
+    changed |= interlocked_addresses(lines, diags, src, record)
+    changed |= exception_spec_and_delete(lines, diags, src, record)
+    changed |= explicit_constructor_calls(lines, diags, src, record)
     changed |= incomplete_if_not_exists(lines, diags, src, record)
     changed |= rename_namespaced_specializations(lines, diags, src, record)
     changed |= spec_conversions(lines, diags, src, record)

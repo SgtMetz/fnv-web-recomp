@@ -261,6 +261,11 @@
   "0x00ecdd16": {
    "symbol": "__gcvt",
    "source": "name"
+  },
+  "0x00ec408c": {
+   "symbol": "@fnv_check_cookie_orig@4",
+   "source": "disasm",
+   "evidence": "cmp ecx,[0x11c16bc]; jne report; ret (__security_check_cookie); port/compat/fnv_crt_orig.cpp"
   }
  }
 }

@@ -36,7 +36,7 @@ NM = r'C:\Program Files\LLVM\bin\llvm-nm.exe'
 VS = Path(r'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC')
 KITS = Path(r'C:\Program Files (x86)\Windows Kits\10\Lib')
 DUP = re.compile(r'__fnvdup\d+')
-LIBS = ['libcmt.lib', 'libvcruntime.lib', 'libcpmt.lib', 'oldnames.lib', 'libucrt.lib', 'kernel32.lib', 'user32.lib',
+LIBS = ['libcmt.lib', 'libvcruntime.lib', 'libcpmt.lib', 'oldnames.lib', 'libucrt.lib', 'legacy_stdio_definitions.lib', 'kernel32.lib', 'user32.lib',
         'advapi32.lib', 'gdi32.lib', 'shell32.lib', 'ole32.lib', 'winmm.lib']
 
 
