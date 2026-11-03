@@ -305,8 +305,28 @@ class Lifter:
             mask = {8: 0xff, 16: 0xffff}.get(size, 0xffffffff)
             return '%#xu' % (e & mask)
         if k == 'mem':
+            # ConstructObject indexes a 120-byte switch selector embedded in original .text. The loader
+            # cannot map that section at its old address because its own image occupies the same range.
+            # Embed the table in the ignored generated output, reading it from the player's executable.
+            if size == 8 and '0x46943cu' in e:
+                data = self.original_bytes(0x46943c, 120)
+                values = ','.join(str(v) for v in data)
+                return '([](uint32_t i) -> uint32_t { static const uint8_t t[] = {%s}; return t[i]; })(%s - 0x46943cu)' % (values, e)
             return {8: 'M8(%s)', 16: 'M16(%s)', 32: 'M32(%s)'}[size] % e
         raise Unsupported('read ' + k)
+
+    def original_bytes(self, addr, count):
+        data = open(self.exe, 'rb').read()
+        pe, = struct.unpack_from('<I', data, 0x3c)
+        _, nsec, _, _, _, opt_size, _ = struct.unpack_from('<HHIIIHH', data, pe + 4)
+        opt = pe + 24
+        base, = struct.unpack_from('<I', data, opt + 28)
+        for i in range(nsec):
+            _, _, rva, size, raw, *_ = struct.unpack_from('<8sIIIIIIHHI', data, opt + opt_size + i * 40)
+            if base + rva <= addr and addr + count <= base + rva + size:
+                start = raw + addr - base - rva
+                return data[start:start + count]
+        raise Unsupported('original code table outside image')
 
     def code_jump_table(self, addr, entry, index_reg, jump_addr):
         """Read bounded absolute jump-table entries embedded in the original .text section."""
