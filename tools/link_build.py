@@ -788,6 +788,46 @@ def return_kind(name):
     return 'void' if r == 'X' else 'value'
 
 
+def narrow_mismatches(units):
+    """Recipe functions defined with a bool/char/short return while another unit's name for the same address returns
+    a pointer, reference or 32-bit integer, and whose original code never writes AL/AX: the original hands back a full
+    32-bit EAX (usually a callee's result passed through), but clang masks it (`and al, 1`). 0x6a7ad0 is an
+    element-reference accessor selected as `bool S3e60::FUN_006a7ad0(unsigned)`; NavMeshInfoMap::
+    ValidateNavMeshInfoArrays (0x6b7cb0) then dereferences the masked pointer and calls 0x6286d0 with this = 0.
+    Lift these from the original (0x6a7af0 was the first one found by hand)."""
+    def rtype(name):
+        if not name.startswith('?') or name.startswith(('??_', '??$', '??0', '??1')):
+            return None
+        i = name.find('@@')
+        t = name[i + 2:] if i >= 0 else ''
+        if not t:
+            return None
+        return (t[2:] if t[0] in STATIC_CLASS else t[3:] if t[0] in MEMBER_CLASS else '') or None
+
+    def narrow(r):
+        return r is not None and (r.startswith('_N') or r[:1] in 'CDEFG')
+
+    def wide(r):
+        return r is not None and (r[:1] in 'PQAHIJK' or r.startswith(('_J', '_K')))
+
+    defs = {int(f['address'], 16): (f['symbol'], f['size']) for u in units for f in u['functions']}
+    wants_wide = {int(v, 0) for u in units for k, v in u.get('symbols', {}).items()
+                  if int(v, 0) in defs and wide(rtype(k))}
+    cand = {a for a, (d, _) in defs.items() if narrow(rtype(d)) and a in wants_wide}
+    spans = sorted((a, a + defs[a][1]) for a in cand)
+    starts = [s[0] for s in spans]
+    writes_al = set()
+    op = re.compile(r'^\s*([0-9a-f]+):\s+\S+\s+(?:al|ax)\b')
+    for line in (ROOT / 'out/exe_text.asm').read_text(errors='replace').splitlines():
+        m = op.match(line)
+        if m:
+            x = int(m.group(1), 16)
+            k = bisect.bisect_right(starts, x) - 1
+            if k >= 0 and spans[k][0] <= x < spans[k][1]:
+                writes_al.add(spans[k][0])
+    return cand - writes_al
+
+
 def void_mismatches(units):
     """Recipe functions defined as returning void while other units call the same address expecting a value. The
     decomp matched because the original leaves its last call's result in eax; clang does not, so callers read
@@ -1247,7 +1287,11 @@ def main():
         0x00406340,  # Effect cleanup's synthetic deleter destructor is unbound; use its original delete path.
         0x0048A010,  # Model-list delete expressions introduce an unbound synthetic destructor.
         0x004313C0,  # ExtraMapMarker destructor must call the original MapMarkerData deleting destructor.
-        0x009FC780}  # DirectShow enumerator must invoke COM AddRef through the actual interface vtable.
+        0x009FC780,  # DirectShow enumerator must invoke COM AddRef through the actual interface vtable.
+        0x004786E0}  # Destructible-data copy: `delete stage` uses the unbound synthetic ??1CopyStage; original deletes.
+    # bool/char-declared bodies whose original passes a full 32-bit EAX through (see narrow_mismatches)
+    if not os.environ.get('FNV_NO_NARROWLIFT'):
+        ctx['lift_replace'] |= {a_ for a_ in narrow_mismatches(units) if owner.get(a_) is not None}
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():
