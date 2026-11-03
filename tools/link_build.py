@@ -1234,7 +1234,8 @@ def main():
     ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50, 0x0052BD40, 0x0052B8F0,
         0x00C7F4A0, 0x00C7F4E0, 0x00C7F500, 0x00D32AE0,
         0x00540C50,  # Land texture ctor: original calls ResetFormData directly, compiled virtual slot is null.
-        0x00618AA0}  # Topic loader's synthetic array specialization has no binding; original calls the real Add.
+        0x00618AA0,  # Topic loader's synthetic array specialization has no binding; original calls the real Add.
+        0x006A7AF0}  # Element accessor returns a pointer; selected bool body masks its low byte and corrupts writes.
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():
