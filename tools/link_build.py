@@ -852,11 +852,18 @@ def leak_callers(units, orig_calls, owner):
 # Placeholder virtual methods the decomp declares on a by-value member (so clang calls them directly): dispatch through
 # the object's vtable at the given byte offset instead.
 VDISPATCH = {}      # filled per link: unresolved placeholder virtual names -> vtable byte offset
+# Virtuals of abstract bases that the recipe binds to addresses which are not those functions (the original slots are
+# _purecall): clang calls them directly on by-value members, so they dispatch through the object's vtable instead.
+VSLOTS = {'?Init@BaseFormComponent@@UAEXXZ': 0, '?Free@BaseFormComponent@@UAEXXZ': 4,
+          '?CopyFromBase@BaseFormComponent@@UAEXPAV1@@Z': 8, '?CompareWithBase@BaseFormComponent@@UAE_NPAV1@@Z': 12,
+          '?SetModelFilePath@TESModel@@UAEXPBD@Z': 0x18}       # TESModel slot 6 (see tescasinochips.h)
 
 
 def vdispatch_offset(name):
     """Byte offset in the vtable for a placeholder virtual (`?v04@Cls@@UAE...` = offset 4 when a multiple of 4,
     `?Name_v3@Cls@@UAE...` = slot 3), else None. Only thiscall virtuals (`UAE`)."""
+    if name in VSLOTS:
+        return VSLOTS[name]
     m = re.match(r'^\?(\w*?)@[^@]*(?:@[^@]*)*@@UAE', name)
     if not m:
         return None
@@ -870,6 +877,65 @@ def vdispatch_offset(name):
     return None
 
 
+
+
+def vtable_slots(path):
+    """{virtual method name: byte offset} from the clang vftables (`??_7Class@@6B@`, primary only) an object defines."""
+    p = CoffPatch(Path(path).read_bytes())
+    syms = dict(p.symbols())
+    out = {}
+    for i, s in syms.items():
+        if not (s['name'].startswith('??_7') and s['name'].endswith('@@6B@')) or s['section'] <= 0:
+            continue
+        h = 20 + (s['section'] - 1) * 40
+        relptr, = struct.unpack_from('<I', p.data, h + 24)
+        count, = struct.unpack_from('<H', p.data, h + 32)
+        for off, sym in struct.iter_unpack('<II2x', p.data[relptr:relptr + count * 10]):
+            name = syms[sym]['name'] if sym in syms else ''
+            if off >= s['value'] and '@@UAE' in name and not name.startswith('??'):
+                out.setdefault(name, set()).add(off - s['value'])
+    return out
+
+
+def declared_slots():
+    """{(class, method): byte offset} for classes the decomp declares without a base class: the order of their
+    `virtual` declarations is the vtable order (a virtual destructor takes one slot). Overloaded names are left out.
+    Covers shell classes whose vtable clang never emits (no key function)."""
+    head = re.compile(r'\b(?:struct|class)\s+(\w+)\s*\{')
+    virt = re.compile(r'\bvirtual\b[^;{(]*?(~?\w+)\s*\(')
+    found = defaultdict(set)
+    for path in DECOMP.joinpath('src').rglob('*'):
+        if path.suffix not in ('.cpp', '.h'):
+            continue
+        text = path.read_text(errors='replace')
+        for m in head.finditer(text):
+            depth, k, stmt, names = 1, m.end(), [], []
+            start = k
+            while k < len(text) and depth:
+                c = text[k]
+                if c == '{':
+                    if depth == 1:
+                        stmt.append(text[start:k])
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 1:
+                        start = k + 1
+                elif c == ';' and depth == 1:
+                    stmt.append(text[start:k])
+                    start = k + 1
+                k += 1
+            for st in stmt:
+                v = virt.search(st)
+                if v:
+                    names.append(v.group(1))
+            if not names:
+                continue
+            counts = Counter(names)
+            for i, n in enumerate(names):
+                if counts[n] == 1:
+                    found[(m.group(1), n)].add(i * 4)
+    return {k: next(iter(v)) for k, v in found.items() if len(v) == 1}
 
 
 def popfix_map():
@@ -1102,6 +1168,9 @@ def main():
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
     a = ap.parse_args()
     units = json.loads((DECOMP / 'build/units.json').read_text())['units']
+    for u in units:
+        for n in VSLOTS:
+            u.get('symbols', {}).pop(n, None)
     img = Image(a.exe)
     text = next(s for s in img.sections if s['name'] == '.text')
     seen = defaultdict(set)
@@ -1159,7 +1228,10 @@ def main():
     # OpenAI model Phase 1: a32c70's source prototype is bool, but original callers pass a 32-bit Node pointer.
     # Lift the original body so its full-width argument reaches a31910 instead of being truncated to 0x20.
     # OpenAI model Phase 1: the source constructor dispatches through a mismatched vtable slot; the original calls 00482c80 directly.
-    ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50, 0x0052BD40, 0x0052B8F0}   # + TESImageSpaceModifier::ResetFormData/ctor (compiled version leaks 4 bytes per loop iteration)
+    # 0x52bd40/0x52b8f0: TESImageSpaceModifier::ResetFormData/ctor (the compiled version leaks 4 bytes per loop iteration).
+    # 0xc7f4a0 and its callers 0xc7f4e0/0xc7f500: an MSVC register-convention helper (eax/esi/edx), see hkvector4.cpp.
+    ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50, 0x0052BD40, 0x0052B8F0,
+        0x00C7F4A0, 0x00C7F4E0, 0x00C7F500}
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():
@@ -1173,6 +1245,18 @@ def main():
     # original relies on the difference (leaked pushes become later arguments), clang code cannot. Lift them.
     if not os.environ.get('FNV_NO_LEAKLIFT'):
         ctx['lift_replace'] |= leak_callers(units, ctx['orig_calls'], owner)
+    # MSVC register-convention helpers (arguments in eax/ebx/esi/edi, tools/reg_inputs.py) and their direct callers:
+    # clang cannot reproduce that convention, lifted code passes every register
+    if not os.environ.get('FNV_NO_REGLIFT'):
+        import reg_inputs
+        spans_ = {int(f['address'], 16): f['size'] for u in units for f in u['functions']}
+        reg_in = cached('reg_inputs', exe_key + (ROOT / 'tools/reg_inputs.py').read_bytes(),
+                        lambda: reg_inputs.flagged(a.exe, (text['start'], text['end']), spans_))
+        reg_callers = {fn for fn, tg in ctx['orig_calls'].items() if tg & set(reg_in)}
+        ctx['lift_replace'] |= {x for x in set(reg_in) | reg_callers if owner.get(x) is not None}
+        stats_reg = (len(reg_in), len(reg_callers))
+    else:
+        stats_reg = (0, 0)
     meta = json.loads((ROOT / 'local/data_image.json').read_text())
     ctx['image'] = (int(meta['base'], 16), (ROOT / 'local/data_image.bin').read_bytes())
     ctx['inferred'], ctx['literal_bind'] = {}, {}
@@ -1207,6 +1291,7 @@ def main():
     (LINK / 'inferred.json').write_text(json.dumps({n: '%#010x' % v for n, v in sorted(ctx['inferred'].items())},
                                                     indent=0))
     stats, traps = Counter(), {}
+    stats['reg-input-functions'], stats['reg-input-callers'] = stats_reg
     if os.environ.get('FNV_DUMP_PATCH_CTX'):           # for profiling patch_object outside the pool
         import pickle
         (ROOT / 'out/cache/patch_ctx.pickle').write_bytes(pickle.dumps((ctx, jobs)))
@@ -1243,9 +1328,26 @@ def main():
         referenced |= und             # lifted code can name recipe functions no unit object defines
     # defined by tls.obj, or by the toolchain for implicit TLS (lld/CRT), never trap stubs
     generated = {'_fnv_tls_fnv_start', '__tls_array', '__tls_index', '__tls_used', '___tls_array'}
+    # slots of every virtual in clang's own vftables: a direct call to an unbound virtual dispatches through the
+    # object's vtable (agreeing names only)
+    slot_sets = defaultdict(set)
+    with ProcessPoolExecutor(a.jobs) as ex:
+        for d_ in ex.map(vtable_slots, [j[1] for j in jobs], chunksize=32):
+            for n_, v_ in d_.items():
+                slot_sets[n_] |= v_
+    slots_ = {n_: next(iter(v_)) for n_, v_ in slot_sets.items() if len(v_) == 1}
+    stats['vtable-slot-names'] = len(slots_)
+    decl_slots = cached('declared_slots', (DECOMP / 'build/units.json').read_bytes() + Path(__file__).read_bytes(),
+                        declared_slots)
     for n_ in set(traps) | set(referenced):
         if n_ not in defined and (n_ not in traps or traps[n_][0] == 0):
             off_ = vdispatch_offset(n_)
+            if off_ is None and n_ in slots_:
+                off_ = slots_[n_]
+            m_ = re.match(r'^\?(\w+)@(\w+)@', n_) if off_ is None and '@@UAE' in n_ else None
+            if m_ and (m_.group(2), m_.group(1)) in decl_slots:
+                off_ = decl_slots[(m_.group(2), m_.group(1))]
+                stats['virtual-slots-from-declarations'] += 1
             if off_ is not None:
                 VDISPATCH[n_] = off_
     for n_ in VDISPATCH:

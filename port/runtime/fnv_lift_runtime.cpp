@@ -72,14 +72,14 @@ __declspec(naked) void __cdecl fnv_lift_call(void* fn, unsigned int ecx, const u
         cld
         rep movsd
         mov [ebp - 0x18], esp
-        mov eax, [ebp + 20]        // out: register inputs at +24..+36
+        mov eax, [ebp + 20]        // out: register inputs at +24..+40
         mov edx, [eax + 24]
         mov esi, [eax + 32]
         mov edi, [eax + 36]
         mov ebx, [eax + 28]
+        mov eax, [eax + 40]
         mov ecx, [ebp + 12]
-        mov eax, [ebp + 8]
-        call eax
+        call dword ptr [ebp + 8]
         mov ebx, [ebp + 20]        // out
         mov [ebx], eax
         mov [ebx + 4], edx

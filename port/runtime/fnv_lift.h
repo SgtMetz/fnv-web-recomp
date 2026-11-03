@@ -20,6 +20,7 @@ struct FnvLiftCall
     double st0;
     unsigned int in_edx, in_ebx, in_esi, in_edi;   // register inputs besides ecx (fastcall edx, compiler-internal
                                                    // conventions that pass values in ebx/esi/edi)
+    unsigned int in_eax;                           // LTCG helpers also take an argument in eax
 };
 void __cdecl fnv_lift_call(void* fn, unsigned int ecx, const unsigned int* args, FnvLiftCall* out);
 }
@@ -32,6 +33,7 @@ struct FnvLiftReturn
     uint32_t pop;
     double st0;
     uint32_t in_ebx, in_esi, in_edi;   // the caller's ebx/esi/edi at entry (filled by the naked entry)
+    uint32_t in_eax;                   // and its eax (LTCG helpers take an argument there)
 };
 
 static const int kLiftArgWords = 32;   // native argument words copied in (return address included)
@@ -77,7 +79,7 @@ struct FnvLiftState
 };
 
 #define LIFT_STATE(c, d, a, o) FnvLiftState s((c), (d), (a)); FnvLiftReturn* lift_out__ = (o); \
-    s.ebx = lift_out__->in_ebx; s.esi = lift_out__->in_esi; s.edi = lift_out__->in_edi
+    s.ebx = lift_out__->in_ebx; s.esi = lift_out__->in_esi; s.edi = lift_out__->in_edi; s.eax = lift_out__->in_eax
 #define RETURN(nbytes) do { lift_out__->eax = s.eax; lift_out__->edx = s.edx; lift_out__->fpush = s.depth > 0; \
     lift_out__->pop = (uint32_t)(nbytes); lift_out__->st0 = s.depth > 0 ? ST(0) : 0.0; return; } while (0)
 
@@ -122,6 +124,7 @@ inline void fnv_lift_do_call(FnvLiftState& s, void* fn, uint32_t args)
     r.in_ebx = s.ebx;
     r.in_esi = s.esi;
     r.in_edi = s.edi;
+    r.in_eax = s.eax;
     fnv_lift_call(fn, s.ecx, (const unsigned int*)(uintptr_t)args, &r);
     s.eax = r.eax;
     s.edx = r.edx;

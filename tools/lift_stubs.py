@@ -966,11 +966,12 @@ LIFT_ENTRY = '''extern "C" __declspec(naked) void entry_{a:08x}(void)
     __asm {{
         push ebp
         mov ebp, esp
-        sub esp, 36
-        lea eax, [ebp - 36]
-        mov [ebp - 12], ebx
-        mov [ebp - 8], esi
-        mov [ebp - 4], edi
+        sub esp, 40
+        mov [ebp - 4], eax
+        mov [ebp - 16], ebx
+        mov [ebp - 12], esi
+        mov [ebp - 8], edi
+        lea eax, [ebp - 40]
         push eax
         lea eax, [ebp + 4]
         push eax
@@ -978,15 +979,15 @@ LIFT_ENTRY = '''extern "C" __declspec(naked) void entry_{a:08x}(void)
         push ecx
         call body_{a:08x}
         add esp, 16
-        cmp dword ptr [ebp - 28], 0
+        cmp dword ptr [ebp - 32], 0
         je no_fpu
-        fld qword ptr [ebp - 20]
+        fld qword ptr [ebp - 24]
     no_fpu:
-        mov ecx, [ebp - 24]
+        mov ecx, [ebp - 28]
         mov eax, [ebp + 4]
         mov [ebp + ecx + 4], eax
-        mov eax, [ebp - 36]
-        mov edx, [ebp - 32]
+        mov eax, [ebp - 40]
+        mov edx, [ebp - 36]
         mov esp, ebp
         pop ebp
         add esp, ecx
