@@ -2,7 +2,31 @@
 // initializers and atexit thunks; see tools/lift_stubs.py). Lifted code keeps an explicit machine state and calls
 // real (relinked or CRT) functions through fnv_lift_call, which runs the callee on the native stack with a copy of
 // the emulated stack, then reports what the callee popped (stdcall/thiscall) and any x87 return value.
+#include <windows.h>
 #include "fnv_lift.h"
+
+static __declspec(thread) FnvLiftArena fnv_lift_tl_arena;
+static const size_t kLiftArenaBytes = 96u << 20;      // reserved per thread that runs lifted code (committed 1 MB at a time)
+
+FnvLiftArena& fnv_lift_arena()
+{
+    FnvLiftArena& a = fnv_lift_tl_arena;
+    if (!a.base)
+    {
+        a.base = (char*)VirtualAlloc(nullptr, kLiftArenaBytes, MEM_RESERVE, PAGE_READWRITE);
+        a.top = 0;
+        a.committed = 0;
+    }
+    size_t need = a.top + kLiftStackWords * 4 + 64;
+    if (need > kLiftArenaBytes)
+        __debugbreak();                                  // lifted calls nested deeper than the arena
+    while (a.committed < need)
+    {
+        VirtualAlloc(a.base + a.committed, 1u << 20, MEM_COMMIT, PAGE_READWRITE);
+        a.committed += 1u << 20;
+    }
+    return a;
+}
 
 // Thread-local storage for lifted original code. It does `mov eax,[__tls_index]` on the original slot (0 in the data
 // image), `mov ecx, fs:[0x2c]`, `mov edx,[ecx+eax*4]`, then `[edx + original .tls offset]`. The DLL carries the

@@ -412,6 +412,12 @@ class Lifter:
             return 'if (%s) { %s }' % (COND[mnem[4:]], self.write(P[0], self.read(P[1])))
         if mnem == 'cdq':
             return 's.edx = (s.eax & 0x80000000u) ? 0xffffffffu : 0u;'
+        if mnem == 'pushfd':
+            return 'PUSH(((uint32_t)s.cf) | 2u | ((uint32_t)s.pf << 2) | ((uint32_t)s.zf << 6) | ((uint32_t)s.sf << 7) | 0x200u | ((uint32_t)s.of << 11) | lift_flags_id());'
+        if mnem == 'popfd':
+            return '{ uint32_t f_ = POP(); s.cf = f_ & 1; s.pf = (f_ >> 2) & 1; s.zf = (f_ >> 6) & 1; s.sf = (f_ >> 7) & 1; s.of = (f_ >> 11) & 1; lift_flags_id() = f_ & 0x200000u; }'
+        if mnem == 'cpuid':
+            return '{ int r_[4]; __cpuidex(r_, (int)s.eax, (int)s.ecx); s.eax = r_[0]; s.ebx = r_[1]; s.ecx = r_[2]; s.edx = r_[3]; }'
         if mnem == 'rdtsc':
             return '{ uint64_t t_ = __rdtsc(); s.eax = (uint32_t)t_; s.edx = (uint32_t)(t_ >> 32); }'
         if mnem.startswith('prefetch'):
@@ -548,7 +554,7 @@ class Lifter:
                 return '{ double v_ = ST(0); ST(0) = ST(%d); ST(%d) = v_; }' % (b & 7, b & 7)
             return {0xE0: 'ST(0) = -ST(0);', 0xE1: 'ST(0) = fabs(ST(0));', 0xE4: 'FCOM(ST(0), 0.0);',
                     0xE8: 'FPUSH(1.0);', 0xEE: 'FPUSH(0.0);', 0xFA: 'ST(0) = sqrt(ST(0));',
-                    0xFE: 'ST(0) = sin(ST(0));', 0xFF: 'ST(0) = cos(ST(0));'}.get(b) or self._unsup(mnem, ops)
+                    0xFB: '{ double v_ = ST(0); ST(0) = sin(v_); FPUSH(cos(v_)); }', 0xFE: 'ST(0) = sin(ST(0));', 0xFF: 'ST(0) = cos(ST(0));'}.get(b) or self._unsup(mnem, ops)
         if raw[0] == 0xDD and len(raw) == 2 and raw[1] >= 0xC0:
             b = raw[1]
             if 0xD0 <= b <= 0xD7:
@@ -618,6 +624,32 @@ class Lifter:
                     return 'memcpy((void*)(uintptr_t)%s, X(%s), 4);' % (d[2], s_[2])
                 return 'memcpy(X(%s), X(%s), 4);' % (d[2], s_[2])
             return 'UNPCKLPS(X(%s), %s);' % (d[2], src)
+        if mnem in ('sqrtss', 'rsqrtss', 'rcpps', 'unpckhps') and len(P) == 2:
+            d, s_ = P[0], P[1]
+            src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
+            return '%s(X(%s), %s);' % (mnem.upper(), d[2], src)
+        if re.match(r'cmp(eq|lt|le|unord|neq|nlt|nle|ord)(ps|ss)$', mnem) and len(P) == 2:
+            pred = ('eq', 'lt', 'le', 'unord', 'neq', 'nlt', 'nle', 'ord').index(re.match(r'cmp([a-z]+)(ps|ss)$', mnem).group(1))
+            d, s_ = P[0], P[1]
+            src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
+            return 'CMPPS(X(%s), %s, %d, %d);' % (d[2], src, pred, 1 if mnem.endswith('ss') else 4)
+        if mnem == 'movmskps' and len(P) == 2:
+            return self.write(P[0], 'MOVMSKPS(X(%s))' % P[1][2])
+        if mnem == 'cvtsi2ss' and len(P) == 2:
+            return '{ float f_ = (float)(int32_t)(%s); memcpy(X(%s), &f_, 4); }' % (self.read(P[1]), P[0][2])
+        if mnem == 'bswap' and len(P) == 1:
+            return self.write(P[0], '__builtin_bswap32(%s)' % self.read(P[0]))
+        if mnem in ('rol', 'ror') and 1 <= len(P) <= 2:
+            cnt = self.read(P[1]) if len(P) > 1 else '1u'
+            fn = 'LIFT_ROL' if mnem == 'rol' else 'LIFT_ROR'
+            return self.write(P[0], '%s(%s, %s, %d)' % (fn, self.read(P[0]), cnt, P[0][1]))
+        if mnem == 'movlhps' and len(P) == 2:
+            return 'memcpy(X(%s) + 8, X(%s), 8);' % (P[0][2], P[1][2])
+        if mnem == 'rsqrtps' and len(P) == 2:
+            src = 'X(%s)' % P[1][2] if P[1][0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % P[1][2]
+            return '{ float a_[4]; memcpy(a_, %s, 16); for (int i_ = 0; i_ < 4; ++i_) a_[i_] = 1.0f / sqrtf(a_[i_]); memcpy(X(%s), a_, 16); }' % (src, P[0][2])
+        if mnem == 'fsincos':
+            return '{ double v_ = ST(0); ST(0) = sin(v_); FPUSH(cos(v_)); }'
         return self._unsup(mnem, ops)
 
     def _unsup(self, mnem, ops):

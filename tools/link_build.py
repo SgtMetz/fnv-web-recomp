@@ -259,7 +259,7 @@ def patch_object(job):
             addr = c['literal_bind'].get(name)
         return addr is not None and addr not in c['starts'] and not (c['text'][0] <= addr < c['text'][1])
 
-    def bind(name):
+    def bind(name, pf=False):
         base = DUP.sub('', name)
         if base == '__tls_index':
             return base, 'crt'          # the loader writes the DLL's own TLS index into the CRT's variable
@@ -293,6 +293,9 @@ def patch_object(job):
                 if c['starts'][addr] not in c['compiled']:
                     traps['fnv_f_%08x' % addr] = (addr, base)
                     return 'fnv_f_%08x' % addr, 'func-missing'
+                fix = c['popfix'].get(addr, {}).get(base) if pf else None
+                if fix:
+                    return 'fnv_pf_%08x_%d' % (addr, fix), 'func-popfix'
                 return 'fnv_f_%08x' % addr, 'func'
             if c['text'][0] <= addr < c['text'][1]:
                 if base in c['libsyms']:
@@ -379,7 +382,7 @@ def patch_object(job):
             if name in own:
                 new, kind = 'fnv_f_%08x' % own[name], 'func'
             else:
-                new, kind = bind(name)
+                new, kind = bind(name, pf=True)
             if new != name:
                 p.rename(i, new)
             stats[kind] += 1
@@ -739,7 +742,7 @@ def build_loader(vs, sdk):
     cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/machine:x86', '/subsystem:console', '/base:0x400000', '/fixed',
            '/dynamicbase:no', '/largeaddressaware', '/out:' + str(LINK / 'FalloutNV_relinked.exe'),
            '/libpath:' + str(vs), '/libpath:' + str(sdk / 'ucrt/x86'), '/libpath:' + str(sdk / 'um/x86'),
-           str(LINK / 'loader.obj'), 'libcmt.lib', 'kernel32.lib']
+           str(LINK / 'loader.obj'), 'libcmt.lib', 'kernel32.lib', 'user32.lib']
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
     return dict(exit=r.returncode, log=(r.stdout + r.stderr)[-2000:])
 
@@ -799,7 +802,112 @@ def void_mismatches(units):
                 wants_value.add(a)
     undecorated = {a for a, d in defs.items() if return_kind(d) is None and a in wants_value}
     src_void = source_void_returns(units, undecorated) if undecorated else set()
-    return {a for a, d in defs.items() if (return_kind(d) == 'void' or a in src_void) and a in wants_value}
+    out = {a for a, d in defs.items() if (return_kind(d) == 'void' or a in src_void) and a in wants_value}
+    # machine-code evidence (tools/ret_users.py): a caller in the original reads eax/st0 after the call, or the call
+    # is a tail pass-through of such a function. A `void` definition cannot supply that value.
+    used = ret_used()
+    if used:
+        cand = {a for a in defs if a in used and a not in out}
+        decl_void = {a for a in cand if return_kind(defs[a]) == 'void'}
+        decl_void |= source_void_returns(units, {a for a in cand if return_kind(defs[a]) is None})
+        out |= decl_void
+    return out
+
+
+def ret_used():
+    p = ROOT / 'out/ret_used.json'
+    if not p.exists():
+        return {}
+    return {int(k, 16): v for k, v in json.loads(p.read_text()).items()}
+
+
+def leak_callers(units, orig_calls, owner):
+    """Recipe functions (with an owning unit) whose unit references some callee under a name whose declared pop differs
+    from the callee's original `ret N`, and which call that callee in the original code."""
+    p = ROOT / 'out/pop_mismatch.json'
+    if not p.exists():
+        return set()
+    mm = {int(a, 16): e for a, e in json.loads(p.read_text()).items()}
+    out = set()
+    for u in units:
+        s = {int(v, 0) for n, v in u.get('symbols', {}).items()
+             if int(v, 0) in mm and n in mm[int(v, 0)]['declared']}
+        if not s:
+            continue
+        for f in u['functions']:
+            fa = int(f['address'], 16)
+            if orig_calls.get(fa, set()) & s and owner.get(fa) is not None:
+                out.add(fa)
+    return out
+
+
+# Placeholder virtual methods the decomp declares on a by-value member (so clang calls them directly): dispatch through
+# the object's vtable at the given byte offset instead.
+VDISPATCH = {}      # filled per link: unresolved placeholder virtual names -> vtable byte offset
+
+
+def vdispatch_offset(name):
+    """Byte offset in the vtable for a placeholder virtual (`?v04@Cls@@UAE...` = offset 4 when a multiple of 4,
+    `?Name_v3@Cls@@UAE...` = slot 3), else None. Only thiscall virtuals (`UAE`)."""
+    m = re.match(r'^\?(\w*?)@[^@]*(?:@[^@]*)*@@UAE', name)
+    if not m:
+        return None
+    head = m.group(1)
+    k = re.fullmatch(r'v([0-9a-f]{2})', head)
+    if k and int(k.group(1), 16) % 4 == 0:
+        return int(k.group(1), 16)
+    k = re.search(r'_v(\d+)$', head)
+    if k:
+        return int(k.group(1)) * 4
+    return None
+
+
+
+
+def popfix_map():
+    """{address: {name: declared pop}} for references whose declaration pops more than the original callee does
+    (tools/pop_check.py). clang-compiled callers assume the declared pop; those names bind to adjusting thunks."""
+    p = ROOT / 'out/pop_mismatch.json'
+    if not p.exists():
+        return {}
+    out = {}
+    for a, e in json.loads(p.read_text()).items():
+        for name, d in e['declared'].items():
+            if d != e['actual'] and (d - e['actual']) % 4 == 0 and e['actual'] % 4 == 0 and d % 4 == 0 and d >= 0:
+                out.setdefault(int(a, 16), {})[name] = d
+    return out
+
+
+def write_popfix(path, popfix, actual):
+    """Naked thunks: the real callee pops `actual` bytes; the caller was compiled to expect `declared`. The thunk
+    parks the return address in the first unpopped argument slot, calls the callee, and returns with the rest."""
+    lines = ['// generated by tools/link_build.py (popfix)']
+    seen = set()
+    for addr, names in sorted(popfix.items()):
+        for d in sorted(set(names.values())):
+            if (addr, d) in seen:
+                continue
+            seen.add((addr, d))
+            a = actual[addr]
+            lines.append('extern "C" void pf_target_%08x_%d(void) __asm__("fnv_f_%08x");' % (addr, d, addr))
+            lines.append('extern "C" __declspec(naked) void pf_%08x_%d(void) __asm__("fnv_pf_%08x_%d");' % (addr, d, addr, d))
+            if d > a:
+                body = ('__asm { pop eax } __asm { mov [esp + %d], eax } __asm { call pf_target_%08x_%d } __asm { ret %d }'
+                        % (a, addr, d, d - a - 4))
+            else:
+                # the callee pops more than the caller pushed: slide the return address and arguments down by the
+                # difference, so the callee's `ret` leaves esp exactly where the caller expects it
+                pad = a - d
+                body = '__asm { sub esp, %d } ' % pad
+                for i in range(1 + a // 4):      # the callee's own argument bytes: real ones when the caller pushed more
+                    body += '__asm { mov eax, [esp + %d] } __asm { mov [esp + %d], eax } ' % (pad + 4 * i, 4 * i)
+                body += '__asm { jmp pf_target_%08x_%d }' % (addr, d)
+            lines.append('extern "C" __declspec(naked) void pf_%08x_%d(void) { %s }' % (addr, d, body))
+    for k_, (name_, off_) in enumerate(sorted(VDISPATCH.items())):
+        lines.append('extern "C" __declspec(naked) void vd_%d(void) __asm__("%s");' % (k_, name_))
+        lines.append('extern "C" __declspec(naked) void vd_%d(void) { __asm { mov eax, [ecx] } __asm { jmp dword ptr [eax + %d] } }' % (k_, off_))
+    Path(path).write_text(chr(10).join(lines) + chr(10))
+    return len(seen)
 
 
 def source_void_returns(units, wanted):
@@ -913,12 +1021,29 @@ def lift_initializers(exe, img, units, ctx, traps, defined, referenced=()):
                       if re.match(r'fnv_f_[0-9a-f]{8}$', n) and int(n[6:], 16) in sizes} |
                      {v for v in table if v in sizes and 'fnv_f_%08x' % v not in defined} |
                      {v for v in startup_targets if v in sizes})
+    # code pointers stored in the data image (vtables, callback tables) that nothing defines: lifted too, so a virtual
+    # call into a unit that does not compile yet runs the original code instead of a logging trap
+    data_ptrs = set()
+    for va_ in img.relocs():
+        if 0x00FDF000 <= va_ < 0x01274000:
+            v_ = img.u32(va_)
+            if v_ and text['start'] <= v_ < text['end']:
+                data_ptrs.add(v_)
+    ptr_missing = sorted(v for v in data_ptrs if v in sizes and 'fnv_f_%08x' % v not in defined)
+    ptr_other = sorted(v for v in data_ptrs if v not in sizes and not inside_recipe(v) and v not in ctx['crt_map'])
+    missing = sorted(set(missing) | set(ptr_missing))
     missing = [m for m in missing if m not in ctx['lift_replace']]
+    allow.update(ptr_other)
     allow.update(replace)
     allow.update(missing)
     bounded = dict((x, x + sizes[x]) for x in replace + missing)
     lifter.gap_end = lambda x: bounded[x] if x in bounded else dyn_bound[x] if x in dyn_bound else gap_end(x)
-    lifter.run(entries + gaps + replace + missing)
+    # the original CRT's startup steps (the loader calls them before the initializers; __tmainCRTStartup itself is not run):
+    # _heap_init, _mtinit (FLS index + main thread's _tiddata), _ioinit, and _cinit's first helper
+    crt_startup = [0x00EDDB6A, 0x00ED1327, 0x00ED7E18, 0x00ED248E]
+    crt_startup += [v for v in (img.u32(p_) for p_ in range(0x010113C4, 0x010113E8, 4)) if v]   # __xi_a..__xi_z (C initializers)
+    allow.update(crt_startup)
+    lifter.run(entries + gaps + replace + missing + crt_startup + ptr_other)
     for k, src in enumerate(lifter.shards(LIFT_SHARDS)):
         # OpenAI Phase 1: keep the recovered GetTaskletValue entry behind its null-safe ABI wrapper.
         if 'static void body_00b00a80' in src:
@@ -1021,11 +1146,16 @@ def main():
     # Lift the original body so its full-width argument reaches a31910 instead of being truncated to 0x20.
     # OpenAI model Phase 1: the source constructor dispatches through a mismatched vtable slot; the original calls 00482c80 directly.
     ctx['lift_replace'] = {a for a in void_mismatches(units) if owner.get(a) is not None} | {0x00A32C70, 0x00482C50}
+    ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     # call-site correspondence against the original code (rule 4: the machine code is the authority)
     tick('symbol tables + dup scan')
     exe_key = img.data + (DECOMP / 'build/units.json').read_bytes()
     ctx['orig_calls'] = cached('orig_calls', exe_key, lambda: original_calls(img, units))
     ctx['orig_data_refs'] = cached('orig_data_refs', exe_key, lambda: original_data_refs(img, units))
+    # Functions that call a target through a declaration whose stack pop disagrees with the original callee: the
+    # original relies on the difference (leaked pushes become later arguments), clang code cannot. Lift them.
+    if not os.environ.get('FNV_NO_LEAKLIFT'):
+        ctx['lift_replace'] |= leak_callers(units, ctx['orig_calls'], owner)
     meta = json.loads((ROOT / 'local/data_image.json').read_text())
     ctx['image'] = (int(meta['base'], 16), (ROOT / 'local/data_image.bin').read_bytes())
     ctx['inferred'], ctx['literal_bind'] = {}, {}
@@ -1054,6 +1184,8 @@ def main():
     renderer_method = '?CreateRendererData@Ni2DBuffer@@UAE_NABUNiPixelFormat@@I@Z'
     if 0x00A8F200 in ctx['starts']:
         ctx['inferred'].setdefault(renderer_method, 0x00A8F200)
+    # NiMalloc (0xaa1070) under a namespaced declaration the recipe never maps (unit blk_00ec0000_od_ob1_variant)
+    ctx['inferred'].setdefault('?NiMalloc@fnv_00ec20c0@@YAPAXI@Z', 0x00AA1070)
     tick('solve call sites')
     (LINK / 'inferred.json').write_text(json.dumps({n: '%#010x' % v for n, v in sorted(ctx['inferred'].items())},
                                                     indent=0))
@@ -1094,7 +1226,16 @@ def main():
         referenced |= und             # lifted code can name recipe functions no unit object defines
     # defined by tls.obj, or by the toolchain for implicit TLS (lld/CRT), never trap stubs
     generated = {'_fnv_tls_fnv_start', '__tls_array', '__tls_index', '__tls_used', '___tls_array'}
-    for n in referenced - defined - data_names - tls_names - generated - ctx['libsyms'] - ctx['compat'] - compat_defined - set(traps):
+    for n_ in set(traps) | set(referenced):
+        if n_ not in defined and (n_ not in traps or traps[n_][0] == 0):
+            off_ = vdispatch_offset(n_)
+            if off_ is not None:
+                VDISPATCH[n_] = off_
+    for n_ in VDISPATCH:
+        traps.pop(n_, None)
+    stats['virtual-placeholders-dispatched'] = len(VDISPATCH)
+    popfix_names = {n for n in referenced if n.startswith('fnv_pf_')} | set(VDISPATCH)
+    for n in referenced - defined - data_names - tls_names - generated - ctx['libsyms'] - ctx['compat'] - compat_defined - set(traps) - popfix_names:
         m = re.match(r'fnv_[fc]_([0-9a-f]{8})$', n)
         traps[n] = (int(m.group(1), 16) if m else 0, n)
         stats['trap-never-defined'] += 1
@@ -1120,6 +1261,14 @@ def main():
         if n is not None and not sym.startswith('fnv_d_'):
             pops[sym] = n
     write_traps(LINK / 'traps.cpp', traps, pops)
+    pf_actual = {int(a, 16): e['actual'] for a, e in json.loads((ROOT / 'out/pop_mismatch.json').read_text()).items()}         if (ROOT / 'out/pop_mismatch.json').exists() else {}
+    pf_needed = {}
+    for n in popfix_names:
+        m_ = re.match(r'fnv_pf_([0-9a-f]{8})_(\d+)$', n)
+        if not m_:
+            continue
+        pf_needed.setdefault(int(m_.group(1), 16), {})[n] = int(m_.group(2))
+    stats['popfix-thunks'] = write_popfix(LINK / 'popfix.cpp', pf_needed, pf_actual)
     stats['traps-soft-capable'] = len(pops)
     # what the build provides per original address (tools/reach.py, tools/explain.py)
     (LINK / 'provided.json').write_text(json.dumps(dict(
@@ -1130,11 +1279,12 @@ def main():
     write_addr_table(LINK / 'addr_table.obj', functions)
     tick('compat + lifted compile')
     cl_cached((LINK / 'traps.cpp', LINK / 'traps.obj', headers))
+    cl_cached((LINK / 'popfix.cpp', LINK / 'popfix.obj', headers))
 
     vs = sorted(rp.VS.iterdir())[-1] / 'lib/x86'
     sdk = sorted(rp.KITS.iterdir())[-1]
     rsp = LINK / 'link.rsp'
-    inputs = [j[2] for j in jobs] + [str(LINK / n) for n in ('abs.obj', 'tls.obj', 'addr_table.obj', 'traps.obj')] + \
+    inputs = [j[2] for j in jobs] + [str(LINK / n) for n in ('abs.obj', 'tls.obj', 'addr_table.obj', 'traps.obj', 'popfix.obj')] + \
              [str(LINK / obj) for _, obj in COMPAT_SOURCES + LIFTED_OBJS]
     rsp.write_text('\n'.join('"%s"' % x for x in inputs) + '\n')
     cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/dll', '/machine:x86', '/base:0x20000000',

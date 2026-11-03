@@ -32,6 +32,15 @@ struct FnvLiftReturn
 static const int kLiftArgWords = 32;   // native argument words copied in (return address included)
 static const int kLiftStackWords = 8192; // emulated frame storage; covers large shader compiler frames
 
+// Emulated frames come from a per-thread arena, not the native stack: game threads run on small stacks and lifted calls nest.
+struct FnvLiftArena
+{
+    char* base;
+    size_t top;
+    size_t committed;
+};
+FnvLiftArena& fnv_lift_arena();   // fnv_lift_runtime.cpp
+
 struct FnvLiftState
 {
     uint32_t eax, ecx, edx, ebx, esp, ebp, esi, edi;
@@ -41,17 +50,24 @@ struct FnvLiftState
     double st[8];
     int depth;                       // x87 stack depth (st[depth-1] is ST(0))
     alignas(16) uint8_t xmm[8][16];
-    alignas(16) uint32_t stack[kLiftStackWords];
+    uint32_t* stack;
+    size_t arena_mark;
 
     FnvLiftState(uint32_t in_ecx, uint32_t in_edx, const uint32_t* in_args)
         : eax(0), ecx(in_ecx), edx(in_edx), ebx(0), ebp(0), esi(0), edi(0), zf(0), sf(0), cf(0), of(0), pf(0),
           fs0(0), c0(0), c2(0), c3(0), depth(0)
     {
+        FnvLiftArena& a = fnv_lift_arena();
+        arena_mark = a.top;
+        stack = (uint32_t*)(a.base + a.top);
+        a.top += kLiftStackWords * 4;
         // [esp] = return address, [esp+4..] = the caller's arguments
         uint32_t* top = &stack[kLiftStackWords - kLiftArgWords - 8];
         memcpy(top, in_args, kLiftArgWords * 4);
         esp = (uint32_t)(uintptr_t)top;
     }
+    ~FnvLiftState() { fnv_lift_arena().top = arena_mark; }
+    FnvLiftState(const FnvLiftState&) = delete;
 };
 
 #define LIFT_STATE(c, d, a, o) FnvLiftState s((c), (d), (a)); FnvLiftReturn* lift_out__ = (o)
@@ -148,6 +164,60 @@ inline void SHUFPS(uint8_t* d, const uint8_t* src, unsigned int imm)
     memcpy(d, r, 16);
 }
 
+// ---- more SSE / integer helpers ----
+inline uint32_t& lift_flags_id() { static uint32_t v = 0x200000u; return v; }   // EFLAGS.ID: toggling it is how CRT code probes for CPUID
+inline void SQRTSS(uint8_t* d, const uint8_t* src) { float f; memcpy(&f, src, 4); f = sqrtf(f); memcpy(d, &f, 4); }
+inline void RSQRTSS(uint8_t* d, const uint8_t* src) { float f; memcpy(&f, src, 4); f = 1.0f / sqrtf(f); memcpy(d, &f, 4); }
+inline void RCPPS(uint8_t* d, const uint8_t* src)
+{
+    float a[4];
+    memcpy(a, src, 16);
+    for (int i = 0; i < 4; ++i) a[i] = 1.0f / a[i];
+    memcpy(d, a, 16);
+}
+inline void UNPCKHPS(uint8_t* d, const uint8_t* src)
+{
+    uint8_t t[16];
+    memcpy(t, d + 8, 4);
+    memcpy(t + 4, src + 8, 4);
+    memcpy(t + 8, d + 12, 4);
+    memcpy(t + 12, src + 12, 4);
+    memcpy(d, t, 16);
+}
+// pred: 0 eq, 1 lt, 2 le, 3 unord, 4 neq, 5 nlt, 6 nle, 7 ord
+inline void CMPPS(uint8_t* d, const uint8_t* src, int pred, int lanes)
+{
+    float a[4], b[4];
+    uint32_t r[4];
+    memcpy(a, d, 16);
+    memcpy(b, src, lanes * 4);
+    for (int i = 0; i < lanes; ++i)
+    {
+        bool nan = a[i] != a[i] || b[i] != b[i], v = false;
+        switch (pred)
+        {
+        case 0: v = a[i] == b[i]; break;
+        case 1: v = a[i] < b[i]; break;
+        case 2: v = a[i] <= b[i]; break;
+        case 3: v = nan; break;
+        case 4: v = !(a[i] == b[i]); break;
+        case 5: v = !(a[i] < b[i]); break;
+        case 6: v = !(a[i] <= b[i]); break;
+        default: v = !nan; break;
+        }
+        r[i] = v ? 0xffffffffu : 0u;
+    }
+    memcpy(d, r, lanes * 4);
+}
+inline uint32_t MOVMSKPS(const uint8_t* src)
+{
+    uint32_t w[4], m = 0;
+    memcpy(w, src, 16);
+    for (int i = 0; i < 4; ++i) m |= (w[i] >> 31) << i;
+    return m;
+}
+inline uint32_t LIFT_ROL(uint32_t v, unsigned c, int bits) { c &= 31; uint32_t m = lift_mask(bits); v &= m; c %= bits; return c ? (((v << c) | (v >> (bits - c))) & m) : v; }
+inline uint32_t LIFT_ROR(uint32_t v, unsigned c, int bits) { c &= 31; uint32_t m = lift_mask(bits); v &= m; c %= bits; return c ? (((v >> c) | (v << (bits - c))) & m) : v; }
 inline void UNPCKLPS(uint8_t* d, const uint8_t* src)
 {
     uint8_t t[16];

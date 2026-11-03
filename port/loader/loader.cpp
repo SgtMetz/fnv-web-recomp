@@ -424,6 +424,7 @@ LONG CALLBACK trace_handler(EXCEPTION_POINTERS* ep)
         ep->ContextRecord->EFlags |= 0x100;
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+    if (r->ExceptionCode == EXCEPTION_SINGLE_STEP) { fprintf(g_log, "[trace] stray single-step at %p on thread %lu (tracing=%ld, tracer thread %lu)\n", r->ExceptionAddress, GetCurrentThreadId(), (long)g_tracing, g_traceThread); fflush(g_log); }
     return EXCEPTION_CONTINUE_SEARCH;
 }
 
@@ -477,11 +478,27 @@ void dump_trace()
         fprintf(g_log, "[trace]   %08lx eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ebp=%08lx\n", g_traceRing[i & (kTraceRing - 1)], g[0], g[1], g[2], g[3], g[4]);
     }
 }
+DWORD g_mainThreadId = 0;
 LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
 {
+    if (const char* dc = getenv("FNV_DUMP_CRASH"))   // "hexaddr:words[,hexaddr:words...]"
+    {
+        for (const char* q = dc; q && *q;)
+        {
+            DWORD addr = (DWORD)strtoul(q, nullptr, 16);
+            const char* c = strchr(q, 0x3a);
+            int words = c ? atoi(c + 1) : 8;
+            for (int i = 0; i < words; ++i)
+                if (!IsBadReadPtr((void*)(addr + i * 4), 4))
+                    fprintf(g_log, "[crashdump] %08lx: %08lx\n", addr + i * 4, *(DWORD*)(addr + i * 4));
+            q = strchr(q, 0x2c);
+            if (q) ++q;
+        }
+    }
     g_tracing = 0;
     auto r = ep->ExceptionRecord;
     CONTEXT* ctx = ep->ContextRecord;
+    fprintf(g_log, "[loader] crash on thread %lu (process main thread %lu)\n", GetCurrentThreadId(), g_mainThreadId);
     fprintf(g_log, "[loader] exception 0x%08lx at %p (access %s 0x%08lx)\n", r->ExceptionCode, r->ExceptionAddress,
             r->NumberParameters >= 2 ? (r->ExceptionInformation[0] ? "write" : "read") : "-",
             r->NumberParameters >= 2 ? (DWORD)r->ExceptionInformation[1] : 0);
@@ -498,13 +515,13 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
     // optimised code keeps no frame pointer: also list stack words that point into relinked code
     DWORD* sp = (DWORD*)ctx->Esp;
     // Keep the raw top of the faulting stack; caller arguments can themselves be bad code pointers.
-    for (int i = 0; i < 16 && !IsBadReadPtr(sp + i, 4); ++i)
+    for (int i = 0; i < 120 && !IsBadReadPtr(sp + i, 4); ++i)
         fprintf(g_log, "[loader]   raw-stack+%03x %08lx\n", i * 4, sp[i]);
     if (!g_byPtr.empty())
     {
         DWORD lo = (DWORD)g_byPtr.front().relinked, hi = (DWORD)g_byPtr.back().relinked + 0x10000;
         int shown = 0;
-        for (int i = 0; i < 256 && shown < 16 && !IsBadReadPtr(sp + i, 4); ++i)
+        for (int i = 0; i < 4096 && shown < 24 && !IsBadReadPtr(sp + i, 4); ++i)
             if (sp[i] >= lo && sp[i] < hi)
             {
                 fprintf(g_log, "[loader]   stack+%03x %08lx", i * 4, sp[i]);
@@ -572,7 +589,34 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[i], "--dll"))
             dll = argv[++i];
     }
+    if (getenv("FNV_VEH_LOG"))   // first-chance exception log written with raw WriteFile (safe on any thread, any lock state)
+        AddVectoredExceptionHandler(1, [](EXCEPTION_POINTERS* ep) -> LONG {
+            static volatile LONG count = 0;
+            if (InterlockedIncrement(&count) > 200) return EXCEPTION_CONTINUE_SEARCH;
+            char buf[256];
+            int n = wsprintfA(buf, "[veh] thread %lu code %08lx at %08lx esp %08lx info %08lx %08lx\r\n", GetCurrentThreadId(), ep->ExceptionRecord->ExceptionCode,
+                              (DWORD)ep->ExceptionRecord->ExceptionAddress, ep->ContextRecord->Esp,
+                              ep->ExceptionRecord->NumberParameters > 0 ? (DWORD)ep->ExceptionRecord->ExceptionInformation[0] : 0,
+                              ep->ExceptionRecord->NumberParameters > 1 ? (DWORD)ep->ExceptionRecord->ExceptionInformation[1] : 0);
+            DWORD w; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
+            if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && !IsBadReadPtr((void*)ep->ContextRecord->Esp, 128))
+            {
+                DWORD* sp = (DWORD*)ep->ContextRecord->Esp;
+                n = wsprintfA(buf, "[veh]   stack %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\r\n", sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7]);
+                WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
+                int shown = 0;
+                for (int i = 8; i < 3000 && shown < 14 && !IsBadReadPtr(sp + i, 4); ++i)
+                    if (sp[i] >= 0x20001000 && sp[i] < 0x24000000)
+                    {
+                        n = wsprintfA(buf, "[veh]   dll word +%x = %08lx\r\n", i * 4, sp[i]);
+                        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
+                        ++shown;
+                    }
+            }
+            return EXCEPTION_CONTINUE_SEARCH;
+        });
     SetUnhandledExceptionFilter(on_crash);
+    { ULONG guarantee = 128 * 1024; SetThreadStackGuarantee(&guarantee); }   // let the crash handler run after a stack overflow
 
     if ((DWORD)g_reserved > kDataStart || (DWORD)g_reserved + sizeof(g_reserved) < kDataEnd)
         return fail("reserved section does not cover the original data range");
@@ -759,6 +803,52 @@ int main(int argc, char** argv)
     //    every blocker. FNV_STRICT_INIT=1 stops at the first one instead.
     bool strict = getenv("FNV_STRICT_INIT") && *getenv("FNV_STRICT_INIT") == '1';
     PVOID veh = AddVectoredExceptionHandler(1, guard_handler);
+    // The original CRT's startup (__tmainCRTStartup) is not run; its state is what the lifted CRT code the game still
+    // uses (per-thread data, errno, stdio) depends on. FNV_NO_CRT_STARTUP=1 skips it.
+    if (!getenv("FNV_NO_CRT_STARTUP"))
+    {
+        // _heap_init: the original creates its own CRT heap (and VC9 makes it terminate on corruption). The relinked build
+        // mixes the original CRT's allocator with the new one, so both use the process heap.
+        *(DWORD*)0x012705BC = (DWORD)GetProcessHeap();
+        *(DWORD*)0x01270948 = 1;
+        struct Step { DWORD addr; int arg; bool hasArg; const char* name; };
+        const Step steps[] = {{0x00ED1327, 0, false, "_mtinit"},
+                              {0x00ED7E18, 0, false, "_ioinit"}, {0x00ED248E, 0, false, "_cinit helper"}};
+        for (const Step& s : steps)
+        {
+            void* f = relinked(s.addr);
+            if (!f)
+            {
+                fprintf(g_log, "[loader] CRT startup: %s (0x%08lx) not in the build\n", s.name, s.addr);
+                continue;
+            }
+            g_guardThread = GetCurrentThreadId();
+            g_guardActive = 1;
+            g_guard = InitResult{0, 0, nullptr, {0}};
+            int rv = 0;
+            struct Caller { static int __cdecl call(void* fn, int arg, bool has) { return has ? ((int(__cdecl*)(int))fn)(arg) : ((int(__cdecl*)(void))fn)(); } };
+            // run under the same guard as the initializers: copy of run_initializer for a function with a result
+            InitResult r;
+            {
+                static int s_arg, s_has; static void* s_fn; static int s_rv;
+                s_arg = s.arg; s_has = s.hasArg; s_fn = f;
+                r = run_initializer([]() { s_rv = Caller::call(s_fn, s_arg, s_has != 0); });
+                rv = s_rv;
+            }
+            g_guardActive = 0;
+            fprintf(g_log, "[loader] CRT startup: %s -> %d%s\n", s.name, rv, r.code ? " (faulted)" : "");
+        }
+        // _cinit: the C initializer table (__xi_a..__xi_z), before the C++ one
+        for (DWORD p = 0x010113C4; p < 0x010113E8; p += 4)
+        {
+            auto f = *(int(__cdecl**)(void))p;
+            if (!f)
+                continue;
+            InitResult r = run_initializer((void(__cdecl*)(void))f);
+            if (r.code)
+                fprintf(g_log, "[loader] CRT startup: C initializer at 0x%08lx faulted\n", p);
+        }
+    }
     size_t ran = 0, skipped = 0, blocked = 0;
     for (DWORD p = kXcA; p < kXcZ; p += 4)
     {
@@ -840,6 +930,7 @@ int main(int argc, char** argv)
         for (int i = 0; i < words; ++i)
             fprintf(g_log, "[dump] %08lx: %08lx\n", addr + i * 4, *(DWORD*)(addr + i * 4));
     }
+    g_mainThreadId = GetCurrentThreadId();
     fprintf(g_log, "[loader] calling WinMain\n");
     fflush(g_log);
     if (g_watchdogStart) SetEvent(g_watchdogStart);
