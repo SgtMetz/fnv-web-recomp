@@ -7,6 +7,7 @@
 #include <string.h>
 
 extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);
+extern "C" void __cdecl fnv_trap_soft(unsigned int address, const char* name);
 extern "C" uint32_t __cdecl fnv_lift_tls_array(void);
 #include <intrin.h>
 
@@ -38,6 +39,7 @@ struct FnvLiftArena
     char* base;
     size_t top;
     size_t committed;
+    size_t size;
 };
 FnvLiftArena& fnv_lift_arena();   // fnv_lift_runtime.cpp
 

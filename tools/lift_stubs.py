@@ -504,6 +504,8 @@ class Lifter:
                         's.ecx = POP(); s.edi = POP(); s.edi = POP(); s.esi = POP(); '
                         's.ebx = POP(); s.esp = s.ebp; s.ebp = POP(); '
                         'PUSH(s.ecx); (void)POP();') % (addr + n)
+            if target == 0x00ec408c:      # __security_check_cookie: ecx vs the cookie, every other register preserved
+                return 'if (s.ecx != M32(0x011c16bcu)) fnv_trap_soft(0x00ec408cu, "security cookie mismatch in lifted code (continuing)");'
             if target == 0x00ed1714:      # __SEH_prolog4: same shape as 0xece255 with a handler/scope table and frame size
                 return ('PUSH(0x%08xu); PUSH(0x00ecc8e0u); PUSH(s.fs0); '
                         's.eax = M32(s.esp + 0x10u); M32(s.esp + 0x10u) = s.ebp; s.ebp = s.esp + 0x10u; '
@@ -521,6 +523,23 @@ class Lifter:
             resolved = self.resolve_code(target)
             if resolved and any(name in resolved[1].lower() for name in ('chkstk', 'alloca_probe')):
                 return 's.esp -= s.eax;'
+            if resolved:
+                # CRT helpers that take/return x87 registers cannot go through the generic native call
+                nm = resolved[1].lstrip('_').lower()
+                if nm in ('ftol2_sse', 'ftol2', 'ftol'):
+                    return '{ int64_t v_ = (int64_t)ST(0); FPOP(); s.eax = (uint32_t)v_; s.edx = (uint32_t)((uint64_t)v_ >> 32); }'
+                shifts = {'allshl': 'v_ = c_ >= 64 ? 0 : v_ << c_;', 'aullshr': 'v_ = c_ >= 64 ? 0 : v_ >> c_;',
+                          'allshr': 'v_ = (uint64_t)((int64_t)v_ >> (c_ >= 64 ? 63 : c_));'}
+                if nm in shifts:           # edx:eax shifted by cl, result in edx:eax
+                    return '{ uint64_t v_ = ((uint64_t)s.edx << 32) | s.eax; unsigned c_ = s.ecx & 0xffu; %s s.eax = (uint32_t)v_; s.edx = (uint32_t)(v_ >> 32); }' % shifts[nm]
+                unary = {'ciacos': 'acos', 'ciasin': 'asin', 'ciatan': 'atan', 'cicos': 'cos', 'cisin': 'sin', 'citan': 'tan',
+                         'cisqrt': 'sqrt', 'cilog': 'log', 'cilog10': 'log10', 'ciexp': 'exp', 'cicosh': 'cosh',
+                         'cisinh': 'sinh', 'citanh': 'tanh'}
+                if nm in unary:
+                    return 'ST(0) = %s(ST(0));' % unary[nm]
+                binary = {'cipow': 'pow', 'cifmod': 'fmod', 'ciatan2': 'atan2'}
+                if nm in binary:           # st(1) op st(0) -> result in st(0), one value popped
+                    return '{ double y_ = ST(0), x_ = ST(1); FPOP(); ST(0) = %s(x_, y_); }' % binary[nm]
             return 'CALL(%s);' % self.code_ptr(target)
         if mnem == 'ret':
             pop = num(ops) if ops else 0
@@ -528,6 +547,8 @@ class Lifter:
             if prev != pop:
                 self.ret_pop[entry] = max(prev, pop)
             return 'RETURN(%d);' % pop
+        if mnem == 'rep stosw':
+            return 'while (s.ecx) { M16(s.edi) = (uint16_t)s.eax; s.edi += 2; s.ecx--; }'
         if mnem in ('rep stosd', 'rep movsd', 'rep stosb', 'rep movsb'):
             w = 4 if mnem.endswith('d') else 1
             m = 'M32' if w == 4 else 'M8'
@@ -643,6 +664,28 @@ class Lifter:
             cnt = self.read(P[1]) if len(P) > 1 else '1u'
             fn = 'LIFT_ROL' if mnem == 'rol' else 'LIFT_ROR'
             return self.write(P[0], '%s(%s, %s, %d)' % (fn, self.read(P[0]), cnt, P[0][1]))
+        if mnem in ('shld', 'shrd') and len(P) == 3:
+            cnt = self.read(P[2])
+            if mnem == 'shld':
+                v = '(c_ ? (uint32_t)((a_ << c_) | (b_ >> (32u - c_))) : a_)'
+            else:
+                v = '(c_ ? (uint32_t)((a_ >> c_) | (b_ << (32u - c_))) : a_)'
+            return '{ uint32_t a_ = %s, b_ = %s, c_ = (%s) & 31u; uint32_t r_ = %s; if (c_) { LOGICF(r_, 32); } %s }' % (
+                self.read(P[0]), self.read(P[1]), cnt, v, self.write(P[0], 'r_'))
+        if mnem == 'movhlps' and len(P) == 2:
+            return 'memcpy(X(%s), X(%s) + 8, 8);' % (P[0][2], P[1][2])
+        if mnem in ('pxor', 'movdqa', 'movdqu', 'movapd', 'movupd') and len(P) == 2:
+            d, s_ = P[0], P[1]
+            src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
+            if mnem == 'pxor':
+                return 'SSEB(X(%s), %s, 3);' % (d[2], src)
+            if d[0] == 'xmm':
+                return 'memcpy(X(%s), %s, 16);' % (d[2], src)
+            return 'memcpy((uint8_t*)(uintptr_t)%s, X(%s), 16);' % (d[2], s_[2])
+        if mnem == 'fldpi':
+            return 'FPUSH(3.14159265358979323846);'
+        if mnem == 'cld':
+            return ''
         if mnem == 'movlhps' and len(P) == 2:
             return 'memcpy(X(%s) + 8, X(%s), 8);' % (P[0][2], P[1][2])
         if mnem == 'rsqrtps' and len(P) == 2:

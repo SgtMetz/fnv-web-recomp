@@ -811,6 +811,14 @@ def void_mismatches(units):
         decl_void = {a for a in cand if return_kind(defs[a]) == 'void'}
         decl_void |= source_void_returns(units, {a for a in cand if return_kind(defs[a]) is None})
         out |= decl_void
+    # indirect callers (vtable slots) are invisible to ret_users: judge from the instruction before each `ret`
+    hint_p = ROOT / 'out/ret_hint.json'
+    if hint_p.exists() and not os.environ.get('FNV_NO_RETHINT'):
+        hint = {int(k, 16) for k in json.loads(hint_p.read_text())}
+        cand2 = {a for a in defs if a in hint and a not in out}
+        hv = {a for a in cand2 if return_kind(defs[a]) == 'void'}
+        hv |= source_void_returns(units, {a for a in cand2 if return_kind(defs[a]) is None})
+        out |= hv
     return out
 
 

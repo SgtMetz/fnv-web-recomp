@@ -11,6 +11,7 @@
 //   6. calls the relinked WinMain.
 // Nothing from the exe is written to disk.
 #include <windows.h>
+#include <shlobj.h>
 #include <intrin.h>
 #include <tlhelp32.h>
 #include <stdio.h>
@@ -363,7 +364,7 @@ DWORD WINAPI startup_watchdog(void* arg)
 
 // Debug aid (FNV_TRACE_AT=<original hex address>): break at a relinked function, then single-step, keeping the last
 // kTraceRing EIPs. on_crash prints them (resolved to relinked functions), which shows what ran before a wild jump.
-const int kTraceRing = 4096;
+const int kTraceRing = 262144;
 DWORD g_traceRing[kTraceRing];
 DWORD g_traceRegs[kTraceRing][5];
 volatile LONG g_traceIdx = 0;
@@ -386,6 +387,34 @@ Bp g_bps[32];
 int g_bpCount = 0;
 Bp* g_bpStepping[64];   // per thread id modulo 64: the breakpoint to re-arm after the single step
 
+__declspec(thread) DWORD g_retStk[64];
+__declspec(thread) DWORD g_retId[64];
+__declspec(thread) int g_retN = 0;
+extern "C" DWORD __cdecl bp_ret_log(DWORD eax, DWORD edx)
+{
+    int n = --g_retN;
+    if (n < 0) { g_retN = 0; return 0; }
+    fprintf(g_log, "[bp] %08lx returned eax=%08lx edx=%08lx\n", g_retId[n], eax, edx);
+    fflush(g_log);
+    return g_retStk[n];
+}
+__declspec(naked) void bp_ret_tramp()
+{
+    __asm {
+        push eax
+        push edx
+        push edx
+        push eax
+        call bp_ret_log
+        add esp, 8
+        mov ecx, eax
+        pop edx
+        pop eax
+        push ecx
+        ret
+    }
+}
+
 LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
 {
     auto r = ep->ExceptionRecord;
@@ -401,7 +430,32 @@ LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
                     DWORD* sp = (DWORD*)c->Esp;
                     fprintf(g_log, "[bp] %08lx hit %d thread %lu eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ret=%08lx args %08lx %08lx %08lx %08lx\n", b.original, b.hits,
                             GetCurrentThreadId(), c->Eax, c->Ecx, c->Edx, c->Esp, sp[0], sp[1], sp[2], sp[3], sp[4]);
+                    if (c->Ecx > 0x10000 && !IsBadReadPtr((void*)c->Ecx, 4))   // object chain: ecx -> *ecx -> vtable entries
+                    {
+                        DWORD o1 = *(DWORD*)c->Ecx;
+                        for (int lvl = 0; lvl < 2 && o1 > 0x10000 && !IsBadReadPtr((void*)o1, 16); ++lvl)
+                        {
+                            DWORD* v = (DWORD*)o1;
+                            fprintf(g_log, "[bp]     level%d %08lx: %08lx %08lx %08lx %08lx\n", lvl, o1, v[0], v[1], v[2], v[3]);
+                            o1 = v[0];
+                        }
+                    }
+                    for (int ai = -1; ai < 4; ++ai)   // strings reachable from ecx and the first stack arguments
+                    {
+                        DWORD v = ai < 0 ? c->Ecx : sp[1 + ai];
+                        if (v < 0x10000 || IsBadReadPtr((void*)v, 24)) continue;
+                        const char* s = (const char*)v;
+                        int len = 0;
+                        while (len < 60 && s[len] >= 0x20 && s[len] < 0x7f) ++len;
+                        if (len >= 4) fprintf(g_log, "[bp]     %s -> \"%.*s\"\n", ai < 0 ? "ecx" : "arg", len, s);
+                    }
                     fflush(g_log);
+                }
+                if (b.hits <= 40 && g_retN < 64 && !getenv("FNV_BP_NORET"))
+                {
+                    DWORD* sp2 = (DWORD*)c->Esp;
+                    g_retStk[g_retN] = sp2[0]; g_retId[g_retN] = b.original; ++g_retN;
+                    sp2[0] = (DWORD)&bp_ret_tramp;
                 }
                 DWORD old;
                 VirtualProtect(b.addr, 1, PAGE_EXECUTE_READWRITE, &old);
@@ -537,6 +591,62 @@ void log_exit_stack(const char* what, DWORD code)
         if (sp[i] >= 0x20001000 && sp[i] < 0x24000000) { fprintf(g_log, "[loader]   +%x %08lx", i * 4, sp[i]); describe((void*)sp[i]); ++shown; }
     fflush(g_log);
 }
+static int g_fileLog = -1;
+HANDLE WINAPI wrap_CreateFileA(LPCSTR n, DWORD acc, DWORD share, LPSECURITY_ATTRIBUTES sa, DWORD disp, DWORD fl, HANDLE tmpl)
+{
+    HANDLE h = CreateFileA(n, acc, share, sa, disp, fl, tmpl);
+    DWORD e = GetLastError();
+    if (g_fileLog < 0) g_fileLog = getenv("FNV_FILE_LOG") ? 1 : 0;
+    if (g_fileLog) { fprintf(g_log, "[file] open %s acc=%08lx disp=%lu -> %s (err %lu)\n", n, acc, disp, h == INVALID_HANDLE_VALUE ? "FAIL" : "ok", e); fflush(g_log); }
+    SetLastError(e);
+    return h;
+}
+DWORD WINAPI wrap_GetFileAttributesA(LPCSTR n)
+{
+    DWORD r = GetFileAttributesA(n);
+    DWORD e = GetLastError();
+    if (g_fileLog < 0) g_fileLog = getenv("FNV_FILE_LOG") ? 1 : 0;
+    if (g_fileLog) { fprintf(g_log, "[file] attrs %s -> %08lx\n", n, r); fflush(g_log); }
+    SetLastError(e);
+    return r;
+}
+int WINAPI wrap_MessageBoxA(HWND, LPCSTR text, LPCSTR caption, UINT type)
+{
+    fprintf(g_log, "[msgbox] %s: %s\n", caption ? caption : "", text ? text : "");
+    if (const char* dc = getenv("FNV_DUMP_MSGBOX"))   // "hexaddr:words[,hexaddr:words...]"
+        for (const char* q = dc; q && *q;)
+        {
+            DWORD addr = (DWORD)strtoul(q, nullptr, 16);
+            const char* c = strchr(q, ':');
+            int words = c ? atoi(c + 1) : 8;
+            for (int i = 0; i < words; ++i)
+                if (!IsBadReadPtr((void*)(addr + i * 4), 4))
+                    fprintf(g_log, "[msgdump] %08lx: %08lx\n", addr + i * 4, *(DWORD*)(addr + i * 4));
+            q = strchr(q, ',');
+            if (q) ++q;
+        }
+    fflush(g_log);
+    return IDOK;
+}
+VOID WINAPI wrap_OutputDebugStringA(LPCSTR s)
+{
+    fprintf(g_log, "[dbgstr] %s", s ? s : "");
+    fflush(g_log);
+}
+// SHGetFolderPathA(CSIDL_PERSONAL): give the game a private copy of "My Games\FalloutNV" (seeded from the real one) so
+// experiments never touch the player's INI files. FNV_REAL_DOCS=1 uses the real folder.
+static char g_docsRoot[MAX_PATH];
+HRESULT WINAPI wrap_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE tok, DWORD flags, LPSTR out)
+{
+    if ((csidl & 0xff) == CSIDL_PERSONAL && !getenv("FNV_REAL_DOCS") && g_docsRoot[0])
+    {
+        strcpy(out, g_docsRoot);
+        return S_OK;
+    }
+    typedef HRESULT(WINAPI * Fn)(HWND, int, HANDLE, DWORD, LPSTR);
+    static Fn real = (Fn)GetProcAddress(LoadLibraryA("shell32.dll"), "SHGetFolderPathA");
+    return real(hwnd, csidl, tok, flags, out);
+}
 VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
 BOOL WINAPI wrap_TerminateProcess(HANDLE h, UINT code) { if (h == GetCurrentProcess()) log_exit_stack("TerminateProcess", code); return TerminateProcess(h, code); }
 
@@ -642,6 +752,42 @@ int main(int argc, char** argv)
         }
         else fprintf(g_log, "[watchdog] DuplicateHandle failed\n");
     }
+    {   // private copy of the player's "My Games\FalloutNV" (see wrap_SHGetFolderPathA)
+        char exeDir[MAX_PATH];
+        GetModuleFileNameA(nullptr, exeDir, sizeof(exeDir));
+        char* slash = strrchr(exeDir, 0x5c);
+        if (slash) *slash = 0;
+        slash = strrchr(exeDir, 0x5c);
+        if (slash) *slash = 0;                              // out/link -> out
+        snprintf(g_docsRoot, sizeof(g_docsRoot), "%s/fnv_docs", exeDir);
+        char dir[MAX_PATH], src[MAX_PATH], dst[MAX_PATH], real[MAX_PATH];
+        snprintf(dir, sizeof(dir), "%s/My Games/FalloutNV", g_docsRoot);
+        CreateDirectoryA(g_docsRoot, nullptr);
+        snprintf(dst, sizeof(dst), "%s/My Games", g_docsRoot);
+        CreateDirectoryA(dst, nullptr);
+        CreateDirectoryA(dir, nullptr);
+        snprintf(dst, sizeof(dst), "%s/Saves", dir);
+        CreateDirectoryA(dst, nullptr);
+        typedef HRESULT(WINAPI * Fn)(HWND, int, HANDLE, DWORD, LPSTR);
+        Fn get = (Fn)GetProcAddress(LoadLibraryA("shell32.dll"), "SHGetFolderPathA");
+        if (get && get(nullptr, CSIDL_PERSONAL, nullptr, 0, real) == S_OK)
+            for (const char* name : {"Fallout.ini", "FalloutPrefs.ini"})
+            {
+                snprintf(src, sizeof(src), "%s/My Games/FalloutNV/%s", real, name);
+                snprintf(dst, sizeof(dst), "%s/%s", dir, name);
+                if (GetFileAttributesA(dst) == INVALID_FILE_ATTRIBUTES)
+                {
+                    CopyFileA(src, dst, TRUE);
+                    SetFileAttributesA(dst, FILE_ATTRIBUTE_NORMAL);
+                    if (!strcmp(name, "FalloutPrefs.ini") && !getenv("FNV_FULLSCREEN"))
+                    {   // a fullscreen mode must match a display mode exactly; test windowed
+                        WritePrivateProfileStringA("Display", "bFull Screen", "0", dst);
+                        WritePrivateProfileStringA("Display", "iSize W", "1280", dst);
+                        WritePrivateProfileStringA("Display", "iSize H", "720", dst);
+                    }
+                }
+            }
+    }
     const char* exe = getenv("FNV_EXE") ? getenv("FNV_EXE") : "E:\\Games\\Fallout New Vegas\\FalloutNV.exe";
     const char* dll = "fnv_game.dll";
     for (int i = 1; i + 1 < argc; ++i)
@@ -677,6 +823,11 @@ int main(int argc, char** argv)
             }
             return EXCEPTION_CONTINUE_SEARCH;
         });
+    // MSVC SetThreadName (RaiseException 0x406D1388 inside __try/__except) and debug-print exceptions: harmless without a debugger
+    AddVectoredExceptionHandler(0, [](EXCEPTION_POINTERS* ep) -> LONG {
+        DWORD c = ep->ExceptionRecord->ExceptionCode;
+        return (c == 0x406D1388 || c == 0x40010006 || c == 0x4001000A) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
+    });
     SetUnhandledExceptionFilter(on_crash);
     { ULONG guarantee = 128 * 1024; SetThreadStackGuarantee(&guarantee); }   // let the crash handler run after a stack overflow
 
@@ -868,6 +1019,11 @@ int main(int argc, char** argv)
                 !getenv("FNV_GAME_CRASH_FILTER"))
                 f = (FARPROC)&ignore_set_filter;     // keep the loader's crash report; the game's filter would hide it
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "ExitProcess")) f = (FARPROC)&wrap_ExitProcess;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "CreateFileA")) f = (FARPROC)&wrap_CreateFileA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SHGetFolderPathA")) f = (FARPROC)&wrap_SHGetFolderPathA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "MessageBoxA")) f = (FARPROC)&wrap_MessageBoxA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "OutputDebugStringA")) f = (FARPROC)&wrap_OutputDebugStringA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "GetFileAttributesA")) f = (FARPROC)&wrap_GetFileAttributesA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "TerminateProcess")) f = (FARPROC)&wrap_TerminateProcess;
             if (f)
             {

@@ -6,19 +6,29 @@
 #include "fnv_lift.h"
 
 static __declspec(thread) FnvLiftArena fnv_lift_tl_arena;
-static const size_t kLiftArenaBytes = 96u << 20;      // reserved per thread that runs lifted code (committed 1 MB at a time)
+static const size_t kLiftMainArenaBytes = 96u << 20;      // the first thread that runs lifted code (the game's main thread)
+static const size_t kLiftWorkerArenaBytes = 12u << 20;    // every other thread; address space is scarce in a 32-bit process
+static volatile LONG fnv_lift_arena_count;
 
 FnvLiftArena& fnv_lift_arena()
 {
     FnvLiftArena& a = fnv_lift_tl_arena;
     if (!a.base)
     {
-        a.base = (char*)VirtualAlloc(nullptr, kLiftArenaBytes, MEM_RESERVE, PAGE_READWRITE);
+        a.size = InterlockedIncrement(&fnv_lift_arena_count) == 1 ? kLiftMainArenaBytes : kLiftWorkerArenaBytes;
+        a.base = (char*)VirtualAlloc(nullptr, a.size, MEM_RESERVE, PAGE_READWRITE);
+        if (!a.base)
+        {
+            a.size = 2u << 20;
+            a.base = (char*)VirtualAlloc(nullptr, a.size, MEM_RESERVE, PAGE_READWRITE);
+        }
+        if (!a.base)
+            __debugbreak();
         a.top = 0;
         a.committed = 0;
     }
     size_t need = a.top + kLiftStackWords * 4 + 64;
-    if (need > kLiftArenaBytes)
+    if (need > a.size)
         __debugbreak();                                  // lifted calls nested deeper than the arena
     while (a.committed < need)
     {
