@@ -1275,8 +1275,20 @@ def main():
         reg_callers = {fn for fn, tg in ctx['orig_calls'].items() if tg & set(reg_in)}
         ctx['lift_replace'] |= {x for x in set(reg_in) | reg_callers if owner.get(x) is not None}
         stats_reg = (len(reg_in), len(reg_callers))
+        # ECX inputs reached through an ECX-less name (tools/reg_inputs.py ecx_free_callers): the original callee
+        # reads ECX (thiscall, or an LTCG helper), but the caller's unit declares it free/static __cdecl/__stdcall,
+        # so clang never loads ECX (0x9fdfe0 -> 0x9fdf20 CAsyncRequest::Complete, `int __stdcall FUN_009fdf20(void)`;
+        # the original relies on ECX = &request surviving the previous call). Candidates are the callees with a site
+        # whose original caller does not set ECX since its previous call; lift every caller that names a candidate
+        # without ECX (lifted code keeps the original ECX), and candidates whose own definition drops ECX.
+        ecx_callees, ecx_sites = cached('ecx_free_callers', exe_key + (ROOT / 'tools/reg_inputs.py').read_bytes(),
+                                        lambda: reg_inputs.ecx_free_callers(a.exe, (text['start'], text['end']), units))
+        ecx_cand = {t for _, t, wrote in ecx_sites if not wrote}
+        ecx_lift = {f for f, t, _ in ecx_sites if t in ecx_cand} | {t for t in ecx_cand if ecx_callees[t] is False}
+        ctx['lift_replace'] |= {x for x in ecx_lift if owner.get(x) is not None}
+        stats_reg += (len(ecx_cand), len(ecx_lift))
     else:
-        stats_reg = (0, 0)
+        stats_reg = (0, 0, 0, 0)
     # Tail-jumping thunks (adjustor thunks `sub [esp+4],N; jmp T`, COM forwarders `mov [esp+4],x; jmp [vtbl+N]`) whose
     # declared pop differs from what the original pops through its jump target (tools/tail_pops.py). pop_check.py only
     # sees `ret N`, and MSVC emits the same jmp for the decomp's __cdecl model, so the overlay matches; clang emits
@@ -1327,7 +1339,7 @@ def main():
     (LINK / 'inferred.json').write_text(json.dumps({n: '%#010x' % v for n, v in sorted(ctx['inferred'].items())},
                                                     indent=0))
     stats, traps = Counter(), {}
-    stats['reg-input-functions'], stats['reg-input-callers'] = stats_reg
+    stats['reg-input-functions'], stats['reg-input-callers'], stats['ecx-input-candidates'], stats['ecx-input-lifted'] = stats_reg
     if os.environ.get('FNV_DUMP_PATCH_CTX'):           # for profiling patch_object outside the pool
         import pickle
         (ROOT / 'out/cache/patch_ctx.pickle').write_bytes(pickle.dumps((ctx, jobs)))
