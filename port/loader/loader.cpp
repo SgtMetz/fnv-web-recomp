@@ -751,6 +751,40 @@ int fail(const char* what)
 }
 } // namespace
 
+// The relinked DLL has its own import table (compiled decomp code calls Win32 by name): apply the same wrappers there.
+static void patch_dll_imports(HMODULE dll)
+{
+    struct W { const char* name; void* fn; };
+    const W wraps[] = {{"CreateFileA", (void*)&wrap_CreateFileA}, {"GetFileAttributesA", (void*)&wrap_GetFileAttributesA},
+                       {"MessageBoxA", (void*)&wrap_MessageBoxA}, {"OutputDebugStringA", (void*)&wrap_OutputDebugStringA},
+                       {"ExitProcess", (void*)&wrap_ExitProcess}, {"TerminateProcess", (void*)&wrap_TerminateProcess},
+                       {"SHGetFolderPathA", (void*)&wrap_SHGetFolderPathA}, {"SetUnhandledExceptionFilter", (void*)&ignore_set_filter}};
+    auto base = (unsigned char*)dll;
+    auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
+    auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    int patched = 0;
+    for (auto d = (IMAGE_IMPORT_DESCRIPTOR*)(base + dir.VirtualAddress); dir.VirtualAddress && d->Name; ++d)
+    {
+        auto names = (IMAGE_THUNK_DATA32*)(base + (d->OriginalFirstThunk ? d->OriginalFirstThunk : d->FirstThunk));
+        auto slots = (IMAGE_THUNK_DATA32*)(base + d->FirstThunk);
+        for (int k = 0; names[k].u1.AddressOfData; ++k)
+        {
+            if (names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
+            const char* nm = (const char*)(base + names[k].u1.AddressOfData) + 2;
+            for (const W& w : wraps)
+                if (!strcmp(nm, w.name))
+                {
+                    DWORD old;
+                    VirtualProtect(&slots[k], 4, PAGE_READWRITE, &old);
+                    slots[k].u1.Function = (DWORD)w.fn;
+                    VirtualProtect(&slots[k], 4, old, &old);
+                    ++patched;
+                }
+        }
+    }
+    fprintf(g_log, "[loader] fnv_game.dll imports wrapped: %d\n", patched);
+}
+
 int main(int argc, char** argv)
 {
     if (getenv("FNV_STARTUP_WATCHDOG") && *getenv("FNV_STARTUP_WATCHDOG") == '1')
@@ -894,6 +928,7 @@ int main(int argc, char** argv)
     if (!getenv("FNV_KEEP_THREAD_ATTACH"))
         DisableThreadLibraryCalls(game);
     LoadLibraryA("uxtheme.dll");
+    patch_dll_imports(game);
     auto table = (const AddrEntry*)GetProcAddress(game, "fnv_addr_table");
     if (!table)
         return fail("fnv_addr_table export missing");
