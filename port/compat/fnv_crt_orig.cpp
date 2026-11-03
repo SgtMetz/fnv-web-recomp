@@ -5,11 +5,13 @@
 extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);
 extern "C" void __cdecl fnv_trap_soft(unsigned int address, const char* name);
 
-static void __cdecl cookie_mismatch(void)
+// `ret` is the return address into the function whose frame failed the check (a relinked DLL address: resolve it
+// with tools/addr2fn.py)
+static void __cdecl cookie_mismatch(uintptr_t ret)
 {
     static volatile long reported = 0;
     if (__sync_fetch_and_add(&reported, 1) < 5)
-        fnv_trap_soft(0x00EC408Cu, "security cookie mismatch in lifted code (continuing)");
+        fnv_trap_soft((unsigned int)ret, "security cookie mismatch, return address of the checking function (continuing)");
 }
 
 // __security_check_cookie (0x00EC408C): original code XORs its frame with the original CRT's cookie, which lives in
@@ -25,7 +27,9 @@ extern "C" __declspec(naked) void __fastcall fnv_check_cookie_orig(uintptr_t coo
         push eax
         push edx
         push ecx
+        push dword ptr [esp + 12]
         call cookie_mismatch
+        add esp, 4
         pop ecx
         pop edx
         pop eax

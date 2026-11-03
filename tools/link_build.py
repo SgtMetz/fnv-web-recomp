@@ -1151,6 +1151,19 @@ def lift_initializers(exe, img, units, ctx, traps, defined, referenced=()):
             if v_ and text['start'] <= v_ < text['end']:
                 data_ptrs.add(v_)
     ptr_missing = sorted(v for v in data_ptrs if v in sizes and 'fnv_f_%08x' % v not in defined)
+    # the same for function addresses used as immediates in code (callbacks stored at run time, e.g. 0xd2d9d0 does
+    # `mov [eax+0x20], 0xd2d460` and lifted 0xcfdbe0 later calls it). Code that stores the raw original address
+    # reaches the loader's call redirection, which needs the target in the build. Jump-table entries point inside
+    # functions and are filtered out by `v in sizes`.
+    if not os.environ.get('FNV_NO_IMMLIFT'):
+        imm_missing = set()
+        for va_ in img.relocs():
+            if text['start'] <= va_ < text['end']:
+                v_ = img.u32(va_)
+                if v_ in sizes and 'fnv_f_%08x' % v_ not in defined:
+                    imm_missing.add(v_)
+        print('   code-immediate function pointers lifted: %d' % len(imm_missing - set(ptr_missing)))
+        ptr_missing = sorted(set(ptr_missing) | imm_missing)
     ptr_other = sorted(v for v in data_ptrs if v not in sizes and not inside_recipe(v) and v not in ctx['crt_map'])
     missing = sorted(set(missing) | set(ptr_missing))
     missing = [m for m in missing if m not in ctx['lift_replace']]
@@ -1291,19 +1304,24 @@ def main():
         0x004786E0,  # Destructible-data copy: `delete stage` uses the unbound synthetic ??1CopyStage; original deletes.
         0x00431890,  # ExtraContainerChanges-style dtor: `delete pChanges` uses unbound ??1InventoryChanges; the
                      # original calls the deleting destructor 0x431920(1).
-        0x0057C8D0}  # Ref-set map dtor: the decomp's DtorBase_57c930 puts a clang vptr before an empty base, so clang
+        0x0057C8D0,  # Ref-set map dtor: the decomp's DtorBase_57c930 puts a clang vptr before an empty base, so clang
                      # calls the base dtor 0x57c930 with this+4 (it then clears a garbage map: null table read).
+        0x00DAF1E0,  # Havok GSK manifold: the unit calls its own static copy of 0xdae220 (another model type); the
+                     # compiled call faulted reading [0+3] after New Game. Lifted: crash moved to 0xd12040.
+        0x00C540A0}  # NiIntegersExtraData::LoadBinary: the lifted entry loader 0xc545d0 writes past the decomp's
+                     # local, the compiled frame fails its /GS cookie check (overrun) after New Game.
     # Compiled bodies that call a synthetic constructor/destructor/specialization nothing defines (tools/trap_refs.py,
     # generated from the previous link): the soft trap skips the call, e.g. 0x441c50 never constructs its
     # NiPointer<LoadedFile> (garbage DecRef later), 0x431890/0x4786e0 skip member destructors. The original calls
     # the real code; lift them. References only from unwind funclets (`[eh]`) and other unbound names are left to
-    # case-by-case fixes (lifting every EH-only user too broke the main menu).
+    # case-by-case fixes (lifting every EH-only user too broke the main menu). Plain unbound member names count too:
+    # 0xb5cbd0 calls `ActiveLightList::NewItem` (never defined), the trap returns 0 and the light list reads [0+8]
+    # right after New Game.
     trap_refs_p = ROOT / 'out/trap_refs.json'
     if trap_refs_p.exists() and not os.environ.get('FNV_NO_TRAPLIFT'):
         ctx['lift_replace'] |= {int(a_, 16) for a_, ns_ in json.loads(trap_refs_p.read_text()).items()
                                 if owner.get(int(a_, 16)) is not None and
-                                any((n_.startswith(('??0', '??1')) or '__fnvspec' in n_) and not n_.endswith('[eh]')
-                                    for n_ in ns_)}
+                                any(not n_.endswith('[eh]') for n_ in ns_)}
     # bool/char-declared bodies whose original passes a full 32-bit EAX through (see narrow_mismatches)
     if not os.environ.get('FNV_NO_NARROWLIFT'):
         ctx['lift_replace'] |= {a_ for a_ in narrow_mismatches(units) if owner.get(a_) is not None}
@@ -1315,6 +1333,14 @@ def main():
     tick('symbol tables + dup scan')
     exe_key = img.data + (DECOMP / 'build/units.json').read_bytes()
     ctx['orig_calls'] = cached('orig_calls', exe_key, lambda: original_calls(img, units))
+    # bool/char/short-declared parameters that the original reads as a full dword (tools/narrow_params.py): clang
+    # zero-extends the byte, so a forwarded pointer is truncated (0xa52b00 passed CloningProcess* as a byte)
+    if not os.environ.get('FNV_NO_NARROWPARAM'):
+        import narrow_params
+        np_ = cached('narrow_params', exe_key + (ROOT / 'tools/narrow_params.py').read_bytes(),
+                     lambda: sorted(narrow_params.scan(units)))
+        ctx['lift_replace'] |= {a_ for a_ in np_ if owner.get(a_) is not None}
+        print('   narrow-param lifts: %d' % sum(1 for a_ in np_ if owner.get(a_) is not None))
     # 0x4f1540 returns a raw type byte, but a chosen source declaration says bool. Both its
     # compiled body and callers mask AL to one bit, corrupting extra-data presence flags.
     ctx['lift_replace'] |= {0x004F1540} | {f for f, calls in ctx['orig_calls'].items()

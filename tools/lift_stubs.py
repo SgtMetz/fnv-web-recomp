@@ -648,7 +648,9 @@ class Lifter:
                         's.ebx = POP(); s.esp = s.ebp; s.ebp = POP(); '
                         'PUSH(s.ecx); (void)POP();') % (addr + n)
             if target == 0x00ec408c:      # __security_check_cookie: ecx vs the cookie, every other register preserved
-                return 'if (s.ecx != M32(0x011c16bcu)) fnv_trap_soft(0x00ec408cu, "security cookie mismatch in lifted code (continuing)");'
+                # report the call site: the function whose frame was overrun (the trap logs each address once)
+                return ('if (s.ecx != M32(0x011c16bcu)) fnv_trap_soft(0x%08xu, "security cookie mismatch in lifted '
+                        'code at this call site (continuing)");') % addr
             if target == 0x00ed1714:      # __SEH_prolog4: same shape as 0xece255 with a handler/scope table and frame size
                 return ('PUSH(0x%08xu); PUSH(0x00ecc8e0u); PUSH(s.fs0); '
                         's.eax = M32(s.esp + 0x10u); M32(s.esp + 0x10u) = s.ebp; s.ebp = s.esp + 0x10u; '

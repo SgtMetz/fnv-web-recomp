@@ -739,7 +739,19 @@ typedef HRESULT(WINAPI* DiStateFn)(void*, DWORD, void*);
 typedef HRESULT(WINAPI* DiDataFn)(void*, DWORD, FnvDiObj*, DWORD*, DWORD);
 DiCreateFn g_realDiCreate;
 DiCreateDevFn g_realCreateDev;
-struct DevReal { void** vtbl; DiAcquireFn acquire; DiStateFn state; DiDataFn data; };
+typedef HRESULT(WINAPI* DiCoopFn)(void*, HWND, DWORD);
+typedef HRESULT(WINAPI* DiFormatFn)(void*, const DWORD*);
+struct DevReal { void** vtbl; DiAcquireFn acquire; DiStateFn state; DiDataFn data; DiCoopFn coop; DiFormatFn format; };
+bool g_bg = false;      // FNV_BACKGROUND=1: off-screen, never activated, real keyboard/mouse ignored
+bool g_inLog = false;   // FNV_INPUT_LOG=1: log cooperative level and Acquire/GetDeviceState results as they change
+const char* dev_name(void* self);
+void in_log_hr(void* self, const char* what, HRESULT hr, HRESULT* last)
+{
+    if (!g_inLog || hr == *last) return;
+    *last = hr;
+    fprintf(g_log, "[input] %s %s -> %08lx (foreground %p)\n", dev_name(self), what, (unsigned long)hr, (void*)GetForegroundWindow());
+    fflush(g_log);
+}
 DevReal g_devReal[4];
 int g_devRealN = 0;
 const GUID kSysKeyboard = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
@@ -832,10 +844,15 @@ DevReal* dev_real(void* self)
     return nullptr;
 }
 
+const char* dev_name(void* self) { return self == g_inKbd ? "keyboard" : self == g_inMouse ? "mouse" : "device"; }
+
 HRESULT WINAPI in_acquire(void* self)
 {
     DevReal* r = dev_real(self);
     HRESULT hr = r ? r->acquire(self) : 0;
+    static HRESULT last[2] = {1, 1};
+    in_log_hr(self, "Acquire", hr, &last[self == g_inMouse]);
+    if (g_in.empty() && !g_bg) return hr;   // no script: the game sees the real result
     return hr < 0 ? 0 : hr;
 }
 
@@ -843,7 +860,10 @@ HRESULT WINAPI in_state(void* self, DWORD cb, void* data)
 {
     DevReal* r = dev_real(self);
     HRESULT hr = r ? r->state(self, cb, data) : -1;
-    if (hr < 0) { memset(data, 0, cb); hr = 0; }
+    static HRESULT last[2] = {1, 1};
+    in_log_hr(self, "GetDeviceState", hr, &last[self == g_inMouse]);
+    if (g_in.empty() && !g_bg) return hr;
+    if (hr < 0 || g_bg) { memset(data, 0, cb); hr = 0; }
     EnterCriticalSection(&g_inLock);
     input_tick();
     if (self == g_inKbd && cb >= 256)
@@ -864,7 +884,11 @@ HRESULT WINAPI in_data(void* self, DWORD cb, FnvDiObj* rg, DWORD* inout, DWORD f
     DevReal* r = dev_real(self);
     DWORD cap = inout ? *inout : 0;
     HRESULT hr = r ? r->data(self, cb, rg, inout, flags) : -1;
-    if (hr < 0) { if (inout) *inout = 0; hr = 0; }
+    static HRESULT last[2] = {1, 1};
+    in_log_hr(self, "GetDeviceData", hr, &last[self == g_inMouse]);
+    if (g_in.empty() && !g_bg) return hr;
+    if ((hr < 0 || g_bg) && inout) *inout = 0;
+    if (hr < 0 || g_bg) hr = 0;
     EnterCriticalSection(&g_inLock);
     input_tick();
     std::vector<FnvDiObj>* q = self == g_inKbd ? &g_inKbdEv : self == g_inMouse ? &g_inMouseEv : nullptr;
@@ -894,6 +918,33 @@ void patch_slot(void** vt, int slot, void* fn)
     VirtualProtect(&vt[slot], 4, old, &old);
 }
 
+HRESULT WINAPI in_coop(void* self, HWND h, DWORD flags)
+{
+    DevReal* r = dev_real(self);
+    HRESULT hr = r ? r->coop(self, h, flags) : -1;
+    fprintf(g_log, "[input] %s SetCooperativeLevel(hwnd %p, flags %lx) -> %08lx\n", dev_name(self), (void*)h,
+            (unsigned long)flags, (unsigned long)hr);
+    fflush(g_log);
+    return hr;
+}
+
+HRESULT WINAPI in_format(void* self, const DWORD* f)   // DIDATAFORMAT: dwSize, dwObjSize, dwFlags, dwDataSize, dwNumObjs, rgodf
+{
+    DevReal* r = dev_real(self);
+    HRESULT hr = r ? r->format(self, f) : -1;
+    fprintf(g_log, "[input] %s SetDataFormat(%p: size %lu objsize %lu flags %lx datasize %lu objs %lu rgodf %08lx) -> %08lx\n",
+            dev_name(self), (void*)f, f ? f[0] : 0, f ? f[1] : 0, f ? f[2] : 0, f ? f[3] : 0, f ? f[4] : 0, f ? f[5] : 0,
+            (unsigned long)hr);
+    if (f && f[5] && f[4])
+        for (DWORD i = 0; i < f[4] && i < 4; ++i)
+        {
+            const DWORD* o = (const DWORD*)f[5] + 4 * i;   // DIOBJECTDATAFORMAT: pguid, dwOfs, dwType, dwFlags
+            fprintf(g_log, "[input]   obj %lu pguid %08lx ofs %lu type %08lx flags %lx\n", i, o[0], o[1], o[2], o[3]);
+        }
+    fflush(g_log);
+    return hr;
+}
+
 HRESULT WINAPI in_create_device(void* self, REFGUID guid, void** dev, void* outer)
 {
     HRESULT hr = g_realCreateDev(self, guid, dev, outer);
@@ -909,6 +960,10 @@ HRESULT WINAPI in_create_device(void* self, REFGUID guid, void** dev, void* oute
         r.acquire = (DiAcquireFn)vt[7];
         r.state = (DiStateFn)vt[9];
         r.data = (DiDataFn)vt[10];
+        r.coop = (DiCoopFn)vt[13];
+        r.format = (DiFormatFn)vt[11];
+        patch_slot(vt, 11, (void*)&in_format);
+        patch_slot(vt, 13, (void*)&in_coop);
         patch_slot(vt, 7, (void*)&in_acquire);
         patch_slot(vt, 9, (void*)&in_state);
         patch_slot(vt, 10, (void*)&in_data);
@@ -945,10 +1000,63 @@ bool input_init()
             fclose(f);
             s = file.data();
         }
-    if (!s) return false;
+    g_inLog = getenv("FNV_INPUT_LOG") != nullptr;
+    if (!s && !g_inLog && !g_bg) return false;
     InitializeCriticalSection(&g_inLock);
     input_parse(s);
     return true;
+}
+
+// The player closing the window (title-bar X, Alt+F4) reaches DefWindowProcA as SC_CLOSE / WM_CLOSE and then
+// DestroyWindow. Log it, and mark a later crash as shutdown rather than gameplay.
+volatile LONG g_userClosed = 0;
+LRESULT WINAPI wrap_DefWindowProcA(HWND h, UINT msg, WPARAM wp, LPARAM lp)
+{
+    if (msg == WM_CLOSE || (msg == WM_SYSCOMMAND && (wp & 0xfff0) == SC_CLOSE))
+        if (!InterlockedExchange(&g_userClosed, 1))
+        {
+            fprintf(g_log, "[loader] window closed by the user (%s)\n", msg == WM_CLOSE ? "WM_CLOSE" : "SC_CLOSE");
+            fflush(g_log);
+        }
+    return DefWindowProcA(h, msg, wp, lp);
+}
+BOOL WINAPI wrap_DestroyWindow(HWND h)
+{
+    fprintf(g_log, "[loader] DestroyWindow(%p)%s\n", (void*)h, g_userClosed ? " after the user closed the window" : "");
+    fflush(g_log);
+    return DestroyWindow(h);
+}
+
+// FNV_BACKGROUND=1: the window is created to the right of every monitor, without a taskbar button, and never
+// activated, so a run does not cover or take focus from what the user is doing. tools/screenshot.ps1 still captures it
+// (PrintWindow). The game keeps running unfocused through bAlwaysActive=1 in the private INI.
+HWND WINAPI wrap_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD style, int x, int y, int w, int h, HWND parent,
+                                 HMENU menu, HINSTANCE inst, LPVOID param)
+{
+    if (g_bg && !parent)
+    {
+        x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64;
+        y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW;
+    }
+    HWND hw = CreateWindowExA(ex, cls, title, style, x, y, w, h, parent, menu, inst, param);
+    if (g_bg && !parent)
+    {
+        fprintf(g_log, "[loader] FNV_BACKGROUND: window %p created off-screen at %d,%d\n", (void*)hw, x, y);
+        fflush(g_log);
+    }
+    return hw;
+}
+BOOL WINAPI wrap_ShowWindow(HWND h, int cmd)
+{
+    if (g_bg && cmd != SW_HIDE && cmd != SW_MINIMIZE) cmd = SW_SHOWNOACTIVATE;
+    return ShowWindow(h, cmd);
+}
+BOOL WINAPI wrap_SetForegroundWindow(HWND h) { return g_bg ? TRUE : SetForegroundWindow(h); }
+BOOL WINAPI wrap_SetWindowPos(HWND h, HWND after, int x, int y, int cx, int cy, UINT flags)
+{
+    if (g_bg) flags |= SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE;
+    return SetWindowPos(h, after, x, y, cx, cy, flags);
 }
 
 VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
@@ -984,7 +1092,8 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
     g_tracing = 0;
     auto r = ep->ExceptionRecord;
     CONTEXT* ctx = ep->ContextRecord;
-    fprintf(g_log, "[loader] crash on thread %lu (process main thread %lu)\n", GetCurrentThreadId(), g_mainThreadId);
+    fprintf(g_log, "[loader] crash on thread %lu (process main thread %lu)%s\n", GetCurrentThreadId(), g_mainThreadId,
+            g_userClosed ? " during shutdown: the user closed the window" : "");
     fprintf(g_log, "[loader] exception 0x%08lx at %p (access %s 0x%08lx)\n", r->ExceptionCode, r->ExceptionAddress,
             r->NumberParameters >= 2 ? (r->ExceptionInformation[0] ? "write" : "read") : "-",
             r->NumberParameters >= 2 ? (DWORD)r->ExceptionInformation[1] : 0);
@@ -1104,6 +1213,29 @@ static void* __fastcall sysheap_realloc(void*, void*, void* p, size_t size)
 }
 static size_t __fastcall sysheap_size(void*, void*, const void* p) { return p ? _aligned_msize((void*)p, 16, 0) : 0; }
 
+// FNV_SKIP_INTRO=1: the New Game intro is played by the script command PlayBink (0x005d15d0) through
+// BSMovieThread 0x00ec2320 -> BSPlaybackFile::Play 0x00ec0e00 (thiscall: name, 7 bools, float; ret 0x24), which blocks
+// the main thread until the movie ends or a key skips it. For names containing "intro" this returns false without
+// playing, the original's own path when InitPlayback cannot open the file. Other movies play normally.
+typedef unsigned char(__fastcall* MoviePlayFn)(void*, void*, const char*, bool, bool, bool, bool, bool, bool, bool, float);
+static MoviePlayFn g_moviePlay;
+static unsigned char __fastcall skip_intro_play(void* self, void* edx, const char* name, bool b1, bool b2, bool b3,
+                                                bool b4, bool b5, bool b6, bool b7, float f)
+{
+    char low[MAX_PATH] = {};
+    for (int i = 0; name && name[i] && i < MAX_PATH - 1; ++i)
+        low[i] = (char)tolower((unsigned char)name[i]);
+    if (strstr(low, "intro"))
+    {
+        fprintf(g_log, "[loader] movie skipped (FNV_SKIP_INTRO): %s\n", name);
+        fflush(g_log);
+        return 0;
+    }
+    fprintf(g_log, "[loader] movie plays: %s\n", name ? name : "(null)");
+    fflush(g_log);
+    return g_moviePlay(self, edx, name, b1, b2, b3, b4, b5, b6, b7, f);
+}
+
 static void detour(DWORD original, void* to)
 {
     unsigned char* f = (unsigned char*)relinked(original);
@@ -1116,8 +1248,39 @@ static void detour(DWORD original, void* to)
     FlushInstructionCache(GetCurrentProcess(), f, 5);
 }
 
+// detour() that keeps the original callable: copies whole prologue instructions (the forms clang emits: push reg,
+// mov ebp,esp, sub esp,imm, push imm) to a trampoline ending in a jump back. nullptr if the prologue is not one of them.
+static void* detour_keep(DWORD original, void* to)
+{
+    unsigned char* f = (unsigned char*)relinked(original);
+    if (!f) { fprintf(g_log, "[loader] detour: 0x%08lx not in the build\n", original); return nullptr; }
+    int n = 0;
+    while (n < 5)
+    {
+        unsigned char b = f[n];
+        int len = (b >= 0x50 && b <= 0x57) ? 1
+                  : ((b == 0x89 && f[n + 1] == 0xe5) || (b == 0x8b && f[n + 1] == 0xec) || b == 0x6a) ? 2
+                  : (b == 0x83 && f[n + 1] == 0xec) ? 3
+                  : b == 0x68 ? 5
+                  : (b == 0x81 && f[n + 1] == 0xec) ? 6 : 0;
+        if (!len)
+        {
+            fprintf(g_log, "[loader] detour: 0x%08lx prologue byte %02x at +%d not handled, not hooked\n", original, b, n);
+            return nullptr;
+        }
+        n += len;
+    }
+    unsigned char* t = (unsigned char*)VirtualAlloc(nullptr, 64, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    memcpy(t, f, n);
+    t[n] = 0xE9;
+    *(LONG*)(t + n + 1) = (LONG)((f + n) - (t + n + 5));
+    detour(original, to);
+    return t;
+}
+
 int main(int argc, char** argv)
 {
+    g_bg = getenv("FNV_BACKGROUND") && *getenv("FNV_BACKGROUND") == '1';
     if (getenv("FNV_STARTUP_WATCHDOG") && *getenv("FNV_STARTUP_WATCHDOG") == '1')
     {
         g_watchdogStart = CreateEventA(nullptr, TRUE, FALSE, nullptr);
@@ -1166,6 +1329,8 @@ int main(int argc, char** argv)
                         WritePrivateProfileStringA("Display", "iSize H", "720", dst);
                     }
                 }
+                if (getenv("FNV_BACKGROUND") && *getenv("FNV_BACKGROUND") == '1')
+                    WritePrivateProfileStringA("General", "bAlwaysActive", "1", dst);   // keep running unfocused
             }
     }
     const char* exe = getenv("FNV_EXE") ? getenv("FNV_EXE") : "E:\\Games\\Fallout New Vegas\\FalloutNV.exe";
@@ -1283,6 +1448,11 @@ int main(int argc, char** argv)
         detour(0x00AA44C0, (void*)&sysheap_size);
         fprintf(g_log, "[loader] MemoryManager routed to the CRT heap (FNV_SYSHEAP=0 to keep the game's pools)\n");
     }
+    if (const char* si = getenv("FNV_SKIP_INTRO"); si && *si == '1')
+    {
+        g_moviePlay = (MoviePlayFn)detour_keep(0x00EC0E00, (void*)&skip_intro_play);
+        fprintf(g_log, "[loader] FNV_SKIP_INTRO=1: intro movies are skipped%s\n", g_moviePlay ? "" : " (hook NOT installed)");
+    }
     if (const char* bp = getenv("FNV_BP"))
     {
         for (const char* q = bp; q && *q && g_bpCount < 32;)
@@ -1325,7 +1495,7 @@ int main(int argc, char** argv)
     auto& rdir = pe.nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC];
     const unsigned char* rp = pe.at(rdir.VirtualAddress);
     const unsigned char* rend = rp + rdir.Size;
-    size_t toFunc = 0, toThunk = 0;
+    size_t toFunc = 0, toThunk = 0, diFormats = 0;
     std::vector<DWORD> unbound;
     while (rp < rend)
     {
@@ -1344,6 +1514,14 @@ int main(int argc, char** argv)
             DWORD v = *(DWORD*)va;
             if (v < g_textStart || v >= g_textEnd)
                 continue;                                     // data -> data stays as is
+            if (va >= kDataStart + 20 && ((DWORD*)va)[-5] == 0x18 && ((DWORD*)va)[-4] == 0x10 &&
+                v + 16 * ((DWORD*)va)[-1] <= g_textEnd)
+            {   // DIDATAFORMAT.rgodf: dinput8.lib's c_dfDI* object tables were linked into .text. They are data, so
+                // point at the original bytes instead of a lifted "function" (Acquire failed with DIERR_INVALIDPARAM)
+                *(const void**)va = pe.file.data() + text->PointerToRawData + (v - g_textStart);
+                ++diFormats;
+                continue;
+            }
             if (void* f = relinked(v))
             {
                 *(void**)va = f;
@@ -1377,7 +1555,7 @@ int main(int argc, char** argv)
                 continue;
             DWORD v = *(DWORD*)va;
             if (v < g_textStart || v >= g_textEnd)
-                continue;
+                continue;                                     // (DIDATAFORMAT tables were redirected above)
             size_t k = std::lower_bound(unbound.begin(), unbound.end(), v) - unbound.begin();
             if (k < unbound.size() && unbound[k] == v)
             {
@@ -1390,6 +1568,7 @@ int main(int argc, char** argv)
         }
         rp += block->SizeOfBlock;
     }
+    fprintf(g_log, "[loader] DirectInput data formats pointed at the original object tables: %zu\n", diFormats);
     fprintf(g_log, "[loader] code pointers in data: %zu -> relinked, %zu -> thunks (%zu distinct)\n", toFunc, toThunk,
             unbound.size());
 
@@ -1421,6 +1600,12 @@ int main(int argc, char** argv)
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "GetFileAttributesA")) f = (FARPROC)&wrap_GetFileAttributesA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "FindFirstFileA")) f = (FARPROC)&wrap_FindFirstFileA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "TerminateProcess")) f = (FARPROC)&wrap_TerminateProcess;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "DefWindowProcA")) f = (FARPROC)&wrap_DefWindowProcA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "DestroyWindow")) f = (FARPROC)&wrap_DestroyWindow;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "CreateWindowExA")) f = (FARPROC)&wrap_CreateWindowExA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "ShowWindow")) f = (FARPROC)&wrap_ShowWindow;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetForegroundWindow")) f = (FARPROC)&wrap_SetForegroundWindow;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetWindowPos")) f = (FARPROC)&wrap_SetWindowPos;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "DirectInput8Create") && input_init())
             {
                 g_realDiCreate = (DiCreateFn)f;

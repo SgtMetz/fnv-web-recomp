@@ -153,7 +153,48 @@ def passes_ecx(name):
     return r[0] in 'EFIJ'
 
 
+def passes_edx(name):
+    """True when a call through this decorated name loads EDX: __fastcall with a second register argument (a member
+    __fastcall's first parameter, or two dword parameters of a free one). False otherwise, None when unknown."""
+    m = re.match(r'^@\w+@(\d+)$', name)
+    if m:
+        return int(m.group(1)) >= 8
+    if re.match(r'^_\w+(@\d+)?$', name):
+        return False
+    import msmangle
+    r = msmangle.calling(name)
+    if r is None:
+        return None
+    cc, p, member = r
+    if cc not in 'IJ':
+        return False
+    try:
+        p.ret()
+        if p.peek() == 'X':
+            return False
+        n = 1 if member else 0
+        while p.peek() not in ('@', 'Z', ''):
+            if p.arg() != 4:
+                return None
+            n += 1
+            if n >= 2:
+                return True
+        return False
+    except msmangle.Fail:
+        return None
+
+
 def ecx_free_callers(exe, text_range, units):
+    return reg_free_callers(exe, text_range, units, 'ecx', passes_ecx)
+
+
+def edx_free_callers(exe, text_range, units):
+    """EDX-input functions reached through a name that does not load EDX (0xdae220, a Havok manifold helper taking
+    the manifold in EDX, called by 0xdaf1e0 through a cdecl name: the crash read [0+3] after New Game)."""
+    return reg_free_callers(exe, text_range, units, 'edx', passes_edx)
+
+
+def reg_free_callers(exe, text_range, units, reg, passes):
     """ECX-input functions reached through a name that does not load ECX (0x9fdf20 CAsyncRequest::Complete is
     thiscall, but 0x9fdfe0's unit calls it as `int __stdcall FUN_009fdf20(void)`; the original caller relies on
     ECX = &request surviving the previous call, an LTCG convention). clang never loads ECX for such a call.
@@ -168,7 +209,7 @@ def ecx_free_callers(exe, text_range, units):
             a = int(f['address'], 16)
             spans[a], defsym[a], unit_of[a] = f['size'], f['symbol'], k
     code = {a: decode(cache.lines(a, a + s)) for a, s in spans.items()}
-    reads = {a for a in spans if code_inputs(code[a], a, {'ecx'})}
+    reads = {a for a in spans if code_inputs(code[a], a, {reg})}
     names = [defaultdict(set) for _ in units]                 # per unit: callee address -> names it uses
     for k, u in enumerate(units):
         for n, v in u.get('symbols', {}).items():
@@ -186,14 +227,14 @@ def ecx_free_callers(exe, text_range, units):
                     t = None
                 if t in reads and t != f:
                     used = names[unit_of[f]].get(t) or ({defsym[t]} if unit_of.get(t) == unit_of[f] else set())
-                    kinds = {passes_ecx(x) for x in used}
+                    kinds = {passes(x) for x in used}
                     if False in kinds:
                         sites.append((f, t, set_ecx))
-                set_ecx = False                               # ECX is volatile across calls
+                set_ecx = False                               # ECX/EDX are volatile across calls
                 continue
-            if 'ecx' in effect(mnem, ops)[1]:
+            if reg in effect(mnem, ops)[1]:
                 set_ecx = True
-    callees = {t: passes_ecx(defsym[t]) for _, t, _ in sites}
+    callees = {t: passes(defsym[t]) for _, t, _ in sites}
     return callees, sites
 
 

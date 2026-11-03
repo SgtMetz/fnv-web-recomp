@@ -1,0 +1,9 @@
+# FNV_INPUT_FILE script: main menu -> New -> "Start a new game?" Yes.
+# Delays are ms from the previous step, the first counts from the first DirectInput poll (the splash screen).
+# The menu appears about 60 s after that. DIK codes: d0 Down, 1c Enter. No semicolons in comments.
+80000:key:d0
+1500:key:d0
+1500:key:1c
+0:log:NEW
+2500:key:1c
+0:log:YES
