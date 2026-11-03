@@ -31,13 +31,16 @@ extern "C" __declspec(noinline) void __cdecl fnv_trap_soft(unsigned int address,
     }
     if (!discovery)
         fnv_trap(address, name);
+    // once per address, or per name for name-only stubs (address 0): keying those by address alone logged only the
+    // first one and hid every later skipped name
     static unsigned int seen[4096];
     static unsigned int nseen = 0;
+    unsigned int key = address ? address : (unsigned int)(unsigned long)name;
     for (unsigned int i = 0; i < nseen; i++)
-        if (seen[i] == address)
+        if (seen[i] == key)
             return;
     if (nseen < 4096)
-        seen[nseen++] = address;
+        seen[nseen++] = key;
     fprintf(stderr, "[fnv] discover: skipped %s 0x%08x (%s)\n", address ? "address" : "name", address,
             name ? name : "?");
     fflush(stderr);

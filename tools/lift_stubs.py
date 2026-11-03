@@ -319,6 +319,14 @@ class Lifter:
             return None
         ins = [a for a in range(jump_addr - 1, entry - 1, -1) if a in self.ins]
         indices = None
+
+        def writes_index(mnem, ops):
+            # the instruction that produced the index ends the search for its bound: an earlier mask or compare
+            # of the same register belongs to other code (0x70e425: an unrelated `and ecx, 1` gave 2 of 10 cases)
+            dst = ops.split(',', 1)[0].strip()
+            return (mnem not in ('cmp', 'test', 'push') and not mnem.startswith('j') and
+                    dst in REG_ALIASES.get(index_reg, (index_reg,))) or \
+                (mnem == 'call' and index_reg in ('eax', 'ecx', 'edx'))
         # Some compiler CRT tables are indexed by a register masked immediately before dispatch.
         for a in ins:
             _, _, mnem, ops = self.ins[a]
@@ -330,6 +338,8 @@ class Lifter:
                         break
                 except ValueError:
                     pass
+            if writes_index(mnem, ops):
+                break
         # A short-length path can subtract N and branch on borrow, then use the wrapped index to address
         # the preceding N jump-table entries (a common VC CRT memcpy/memmove layout).
         if indices is None:
@@ -352,9 +362,7 @@ class Lifter:
         if indices is None:
             for a in ins:
                 _, _, mnem, ops = self.ins[a]
-                dst = ops.split(',', 1)[0].strip()
-                if (mnem not in ('cmp', 'test', 'push') and not mnem.startswith('j') and dst in REG_ALIASES.get(index_reg, (index_reg,))) or \
-                        (mnem == 'call' and index_reg in ('eax', 'ecx', 'edx')):
+                if writes_index(mnem, ops):
                     break
                 if mnem == 'cmp' and ops.startswith(index_reg + ', '):
                     try:

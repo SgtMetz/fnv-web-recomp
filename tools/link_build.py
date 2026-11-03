@@ -1293,6 +1293,17 @@ def main():
                      # original calls the deleting destructor 0x431920(1).
         0x0057C8D0}  # Ref-set map dtor: the decomp's DtorBase_57c930 puts a clang vptr before an empty base, so clang
                      # calls the base dtor 0x57c930 with this+4 (it then clears a garbage map: null table read).
+    # Compiled bodies that call a synthetic constructor/destructor/specialization nothing defines (tools/trap_refs.py,
+    # generated from the previous link): the soft trap skips the call, e.g. 0x441c50 never constructs its
+    # NiPointer<LoadedFile> (garbage DecRef later), 0x431890/0x4786e0 skip member destructors. The original calls
+    # the real code; lift them. References only from unwind funclets (`[eh]`) and other unbound names are left to
+    # case-by-case fixes (lifting every EH-only user too broke the main menu).
+    trap_refs_p = ROOT / 'out/trap_refs.json'
+    if trap_refs_p.exists() and not os.environ.get('FNV_NO_TRAPLIFT'):
+        ctx['lift_replace'] |= {int(a_, 16) for a_, ns_ in json.loads(trap_refs_p.read_text()).items()
+                                if owner.get(int(a_, 16)) is not None and
+                                any((n_.startswith(('??0', '??1')) or '__fnvspec' in n_) and not n_.endswith('[eh]')
+                                    for n_ in ns_)}
     # bool/char-declared bodies whose original passes a full 32-bit EAX through (see narrow_mismatches)
     if not os.environ.get('FNV_NO_NARROWLIFT'):
         ctx['lift_replace'] |= {a_ for a_ in narrow_mismatches(units) if owner.get(a_) is not None}
