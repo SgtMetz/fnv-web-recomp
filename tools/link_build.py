@@ -1238,7 +1238,8 @@ def main():
         0x006A7AF0,  # Element accessor returns a pointer; selected bool body masks its low byte and corrupts writes.
         0x005E4100,  # Model-name setter was inferred as an alloca helper, causing a false stack overflow.
         0x00406340,  # Effect cleanup's synthetic deleter destructor is unbound; use its original delete path.
-        0x0048A010}  # Model-list delete expressions introduce an unbound synthetic destructor.
+        0x0048A010,  # Model-list delete expressions introduce an unbound synthetic destructor.
+        0x004313C0}  # ExtraMapMarker destructor must call the original MapMarkerData deleting destructor.
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():
