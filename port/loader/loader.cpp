@@ -968,6 +968,11 @@ int main(int argc, char** argv)
     RemoveVectoredExceptionHandler(loadVeh);
     if (!game)
         return fail("cannot load fnv_game.dll");
+    using SetLiftText = void (__cdecl*)(const unsigned char*, DWORD, DWORD);
+    auto setLiftText = (SetLiftText)GetProcAddress(game, "fnv_lift_set_text");
+    if (!setLiftText || text->PointerToRawData + text->SizeOfRawData > pe.file.size())
+        return fail("cannot initialize lifted original text view");
+    setLiftText(pe.file.data() + text->PointerToRawData, g_textStart, text->SizeOfRawData);
     if (!getenv("FNV_KEEP_THREAD_ATTACH"))
         DisableThreadLibraryCalls(game);
     LoadLibraryA("uxtheme.dll");

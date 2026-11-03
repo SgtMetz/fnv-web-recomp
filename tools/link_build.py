@@ -1409,7 +1409,7 @@ def main():
              [str(LINK / obj) for _, obj in COMPAT_SOURCES + LIFTED_OBJS]
     rsp.write_text('\n'.join('"%s"' % x for x in inputs) + '\n')
     cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/dll', '/machine:x86', '/base:0x20000000',
-           '/dynamicbase:no', '/fixed', '/safeseh:no', '/errorlimit:0', '/export:fnv_addr_table,DATA', '/out:' + str(LINK / 'fnv_game.dll'),
+           '/dynamicbase:no', '/fixed', '/safeseh:no', '/errorlimit:0', '/export:fnv_addr_table,DATA', '/export:fnv_lift_set_text', '/out:' + str(LINK / 'fnv_game.dll'),
            '/map:' + str(LINK / 'fnv_game.map'),
            '/libpath:' + str(vs), '/libpath:' + str(sdk / 'ucrt/x86'), '/libpath:' + str(sdk / 'um/x86'),
            'libcmt.lib', 'libvcruntime.lib', 'libucrt.lib', 'libcpmt.lib', 'legacy_stdio_definitions.lib',

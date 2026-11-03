@@ -9,6 +9,7 @@
 extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);
 extern "C" void __cdecl fnv_trap_soft(unsigned int address, const char* name);
 extern "C" uint32_t __cdecl fnv_lift_tls_array(void);
+extern "C" uint8_t __cdecl fnv_lift_code8(uint32_t addr);
 #include <intrin.h>
 #include <xmmintrin.h>
 

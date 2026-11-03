@@ -5,6 +5,25 @@
 #include <windows.h>
 #include "fnv_lift.h"
 
+// Original .text cannot be mapped over the loader; indexed byte tables read this separate view.
+static const uint8_t* fnv_original_text;
+static uint32_t fnv_original_text_base, fnv_original_text_size;
+extern "C" void __cdecl fnv_lift_set_text(const uint8_t* text, uint32_t base, uint32_t size)
+{
+    fnv_original_text = text;
+    fnv_original_text_base = base;
+    fnv_original_text_size = size;
+}
+extern "C" uint8_t __cdecl fnv_lift_code8(uint32_t addr)
+{
+    if (!fnv_original_text || addr < fnv_original_text_base || addr - fnv_original_text_base >= fnv_original_text_size)
+    {
+        fnv_trap(addr, "lifted: original text byte outside image");
+        return 0;
+    }
+    return fnv_original_text[addr - fnv_original_text_base];
+}
+
 static __declspec(thread) FnvLiftArena fnv_lift_tl_arena;
 static const size_t kLiftMainArenaBytes = 96u << 20;      // the first thread that runs lifted code (the game's main thread)
 static const size_t kLiftWorkerArenaBytes = 12u << 20;    // every other thread; address space is scarce in a 32-bit process
