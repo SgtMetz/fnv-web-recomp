@@ -16,6 +16,7 @@
 #include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <malloc.h>
 #include <string.h>
 #include <vector>
 #include <algorithm>
@@ -655,6 +656,12 @@ HRESULT WINAPI wrap_SHGetFolderPathA(HWND hwnd, int csidl, HANDLE tok, DWORD fla
     static Fn real = (Fn)GetProcAddress(LoadLibraryA("shell32.dll"), "SHGetFolderPathA");
     return real(hwnd, csidl, tok, flags, out);
 }
+HINSTANCE WINAPI wrap_ShellExecuteA(HWND, LPCSTR op, LPCSTR file, LPCSTR params, LPCSTR dir, INT show)
+{
+    fprintf(g_log, "[loader] ShellExecuteA(%s, %s, %s) blocked\n", op ? op : "", file ? file : "", params ? params : "");
+    fflush(g_log);
+    return (HINSTANCE)2;   // <= 32: failure, the game carries on
+}
 VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
 BOOL WINAPI wrap_TerminateProcess(HANDLE h, UINT code) { if (h == GetCurrentProcess()) log_exit_stack("TerminateProcess", code); return TerminateProcess(h, code); }
 
@@ -665,7 +672,17 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
     {
         for (const char* q = dc; q && *q;)
         {
-            DWORD addr = (DWORD)strtoul(q, nullptr, 16);
+            // "*hexaddr+hexoff:words" dereferences hexaddr first (follow a pointer that changes between runs)
+            const char* q2 = q;
+            int derefs = 0;
+            while (*q2 == '*') { ++derefs; ++q2; }
+            char* endp = nullptr;
+            DWORD addr = (DWORD)strtoul(q2, &endp, 16);
+            for (int d = 0; d < derefs && !IsBadReadPtr((void*)addr, 4); ++d)
+            {
+                addr = *(DWORD*)addr;
+                if (endp && *endp == '+') addr += (DWORD)strtoul(endp + 1, &endp, 16);
+            }
             const char* c = strchr(q, 0x3a);
             int words = c ? atoi(c + 1) : 8;
             for (int i = 0; i < words; ++i)
@@ -701,7 +718,7 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
     {
         DWORD lo = (DWORD)g_byPtr.front().relinked, hi = (DWORD)g_byPtr.back().relinked + 0x10000;
         int shown = 0;
-        for (int i = 0; i < 4096 && shown < 24 && !IsBadReadPtr(sp + i, 4); ++i)
+        for (int i = 0; i < 8192 && shown < 64 && !IsBadReadPtr(sp + i, 4); ++i)
             if (sp[i] >= lo && sp[i] < hi)
             {
                 fprintf(g_log, "[loader]   stack+%03x %08lx", i * 4, sp[i]);
@@ -785,6 +802,31 @@ static void patch_dll_imports(HMODULE dll)
     fprintf(g_log, "[loader] fnv_game.dll imports wrapped: %d\n", patched);
 }
 
+// FNV_SYSHEAP (default on; FNV_SYSHEAP=0 disables): route the game's MemoryManager (Allocate 0xaa3e40, Deallocate
+// 0xaa4060, Reallocate 0xaa4150, Size 0xaa44c0) to 16-byte-aligned CRT heap blocks, like the community heap
+// replacers do. The relinked pool allocator hands out overlapping small blocks; this takes it out of the picture.
+static void* __fastcall sysheap_alloc(void*, void*, size_t size) { return _aligned_malloc(size ? size : 1, 16); }
+static void __fastcall sysheap_free(void*, void*, void* p) { if (p) _aligned_free(p); }
+static void* __fastcall sysheap_realloc(void*, void*, void* p, size_t size)
+{
+    if (!p) return _aligned_malloc(size ? size : 1, 16);
+    if (!size) { _aligned_free(p); return nullptr; }
+    return _aligned_realloc(p, size, 16);
+}
+static size_t __fastcall sysheap_size(void*, void*, const void* p) { return p ? _aligned_msize((void*)p, 16, 0) : 0; }
+
+static void detour(DWORD original, void* to)
+{
+    unsigned char* f = (unsigned char*)relinked(original);
+    if (!f) { fprintf(g_log, "[loader] detour: 0x%08lx not in the build\n", original); return; }
+    DWORD old;
+    VirtualProtect(f, 5, PAGE_EXECUTE_READWRITE, &old);
+    f[0] = 0xE9;
+    *(LONG*)(f + 1) = (LONG)((unsigned char*)to - (f + 5));
+    VirtualProtect(f, 5, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), f, 5);
+}
+
 int main(int argc, char** argv)
 {
     if (getenv("FNV_STARTUP_WATCHDOG") && *getenv("FNV_STARTUP_WATCHDOG") == '1')
@@ -823,6 +865,7 @@ int main(int argc, char** argv)
             {
                 snprintf(src, sizeof(src), "%s/My Games/FalloutNV/%s", real, name);
                 snprintf(dst, sizeof(dst), "%s/%s", dir, name);
+                if (!getenv("FNV_KEEP_DOCS")) { SetFileAttributesA(dst, FILE_ATTRIBUTE_NORMAL); DeleteFileA(dst); }   // reseed every run
                 if (GetFileAttributesA(dst) == INVALID_FILE_ATTRIBUTES)
                 {
                     CopyFileA(src, dst, TRUE);
@@ -938,6 +981,14 @@ int main(int argc, char** argv)
     std::sort(g_byPtr.begin(), g_byPtr.end(), [](const AddrEntry& a, const AddrEntry& b) { return a.relinked < b.relinked; });
     fprintf(g_log, "[loader] %s at %p, %zu relinked functions\n", dllPath, (void*)game, g_table.size());
     AddVectoredExceptionHandler(1, redirect_original_code);
+    if (!getenv("FNV_SYSHEAP") || strcmp(getenv("FNV_SYSHEAP"), "0"))
+    {
+        detour(0x00AA3E40, (void*)&sysheap_alloc);
+        detour(0x00AA4060, (void*)&sysheap_free);
+        detour(0x00AA4150, (void*)&sysheap_realloc);
+        detour(0x00AA44C0, (void*)&sysheap_size);
+        fprintf(g_log, "[loader] MemoryManager routed to the CRT heap (FNV_SYSHEAP=0 to keep the game's pools)\n");
+    }
     if (const char* bp = getenv("FNV_BP"))
     {
         for (const char* q = bp; q && *q && g_bpCount < 32;)
@@ -1069,6 +1120,7 @@ int main(int argc, char** argv)
                 f = (FARPROC)&ignore_set_filter;     // keep the loader's crash report; the game's filter would hide it
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "ExitProcess")) f = (FARPROC)&wrap_ExitProcess;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "CreateFileA")) f = (FARPROC)&wrap_CreateFileA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "ShellExecuteA") && !getenv("FNV_ALLOW_SHELL")) f = (FARPROC)&wrap_ShellExecuteA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SHGetFolderPathA")) f = (FARPROC)&wrap_SHGetFolderPathA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "MessageBoxA")) f = (FARPROC)&wrap_MessageBoxA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "OutputDebugStringA")) f = (FARPROC)&wrap_OutputDebugStringA;
@@ -1139,7 +1191,11 @@ int main(int argc, char** argv)
             InitResult r = run_initializer((void(__cdecl*)(void))f);
             if (r.code)
                 fprintf(g_log, "[loader] CRT startup: C initializer at 0x%08lx faulted\n", p);
-        }
+    }
+        // keep the original CRT on its x87 / non-SSE2 paths (its SSE2 libm and memset variants use instructions
+        // the lifter does not translate)
+        *(DWORD*)0x01270A64 = 0;
+        *(DWORD*)0x01270A6C = 0;
     }
     size_t ran = 0, skipped = 0, blocked = 0;
     for (DWORD p = kXcA; p < kXcZ; p += 4)

@@ -49,7 +49,7 @@ COMPAT_SOURCES = [
     ('port/compat/fnv_crt_orig.cpp', 'fnv_crt_orig.obj'),
 ]
 XC_TABLE = (0x00FDF4A4, 0x010113C0)     # __xc_a..__xc_z of FalloutNV.exe 1.4.0.525 (see port/loader/loader.cpp)
-LIFT_SHARDS = 24                         # out/link/lifted_NN.cpp, compiled in parallel
+LIFT_SHARDS = 48                         # out/link/lifted_NN.cpp, compiled in parallel (one function's change rebuilds one)
 LIFTED_OBJS = [('out/link/lifted_%02d.cpp' % k, 'lifted_%02d.obj' % k) for k in range(LIFT_SHARDS)]
 # Units left out of the link (their functions become logging traps) until fixed, with the reason.
 EXCLUDE = {
@@ -1051,7 +1051,12 @@ def lift_initializers(exe, img, units, ctx, traps, defined, referenced=()):
     crt_startup = [0x00EDDB6A, 0x00ED1327, 0x00ED7E18, 0x00ED248E]
     crt_startup += [v for v in (img.u32(p_) for p_ in range(0x010113C4, 0x010113E8, 4)) if v]   # __xi_a..__xi_z (C initializers)
     allow.update(crt_startup)
-    lifter.run(entries + gaps + replace + missing + crt_startup + ptr_other)
+    if os.environ.get('FNV_PROFILE_LIFT'):          # cProfile of the lifter -> out/cache/lift.prof
+        import cProfile
+        cProfile.runctx('lifter.run(roots)', globals(), dict(lifter=lifter, roots=entries + gaps + replace + missing + crt_startup + ptr_other),
+                        str(ROOT / 'out/cache/lift.prof'))
+    else:
+        lifter.run(entries + gaps + replace + missing + crt_startup + ptr_other)
     for k, src in enumerate(lifter.shards(LIFT_SHARDS)):
         # OpenAI Phase 1: keep the recovered GetTaskletValue entry behind its null-safe ABI wrapper.
         if 'static void body_00b00a80' in src:
@@ -1069,7 +1074,8 @@ def lift_initializers(exe, img, units, ctx, traps, defined, referenced=()):
         unbound_code_pointers=sorted(lifter.traps))))
     return dict(initializers=len(entries), gap_functions=len(gaps), replaced=len(replace), missing=len(missing),
                 transitive=len(dyn_allow - set(missing)),
-                lifted=len(lifter.lifted), unsupported=len(lifter.unsupported),
+                lifted=len(lifter.lifted), cache_hits=lifter.cache_hits, resynced=getattr(lifter, 'resynced', 0),
+                unsupported=len(lifter.unsupported),
                 unsupported_top=sorted(Counter(re.sub(r'0x[0-9a-f]+', 'N', v) for v in lifter.unsupported.values())
                                        .items(), key=lambda x: -x[1])[:15],
                 unbound_code_pointers=len(lifter.traps))

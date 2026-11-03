@@ -10,6 +10,7 @@ extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);
 extern "C" void __cdecl fnv_trap_soft(unsigned int address, const char* name);
 extern "C" uint32_t __cdecl fnv_lift_tls_array(void);
 #include <intrin.h>
+#include <xmmintrin.h>
 
 extern "C" {
 struct FnvLiftCall
@@ -17,6 +18,8 @@ struct FnvLiftCall
     unsigned int eax, edx, popped;
     int fpush;
     double st0;
+    unsigned int in_edx, in_ebx, in_esi, in_edi;   // register inputs besides ecx (fastcall edx, compiler-internal
+                                                   // conventions that pass values in ebx/esi/edi)
 };
 void __cdecl fnv_lift_call(void* fn, unsigned int ecx, const unsigned int* args, FnvLiftCall* out);
 }
@@ -28,6 +31,7 @@ struct FnvLiftReturn
     int32_t fpush;
     uint32_t pop;
     double st0;
+    uint32_t in_ebx, in_esi, in_edi;   // the caller's ebx/esi/edi at entry (filled by the naked entry)
 };
 
 static const int kLiftArgWords = 32;   // native argument words copied in (return address included)
@@ -72,7 +76,8 @@ struct FnvLiftState
     FnvLiftState(const FnvLiftState&) = delete;
 };
 
-#define LIFT_STATE(c, d, a, o) FnvLiftState s((c), (d), (a)); FnvLiftReturn* lift_out__ = (o)
+#define LIFT_STATE(c, d, a, o) FnvLiftState s((c), (d), (a)); FnvLiftReturn* lift_out__ = (o); \
+    s.ebx = lift_out__->in_ebx; s.esi = lift_out__->in_esi; s.edi = lift_out__->in_edi
 #define RETURN(nbytes) do { lift_out__->eax = s.eax; lift_out__->edx = s.edx; lift_out__->fpush = s.depth > 0; \
     lift_out__->pop = (uint32_t)(nbytes); lift_out__->st0 = s.depth > 0 ? ST(0) : 0.0; return; } while (0)
 
@@ -113,6 +118,10 @@ inline int lift_parity(uint32_t r) { r &= 0xff; r ^= r >> 4; r ^= r >> 2; r ^= r
 inline void fnv_lift_do_call(FnvLiftState& s, void* fn, uint32_t args)
 {
     FnvLiftCall r;
+    r.in_edx = s.edx;
+    r.in_ebx = s.ebx;
+    r.in_esi = s.esi;
+    r.in_edi = s.edi;
     fnv_lift_call(fn, s.ecx, (const unsigned int*)(uintptr_t)args, &r);
     s.eax = r.eax;
     s.edx = r.edx;
@@ -167,6 +176,34 @@ inline void SHUFPS(uint8_t* d, const uint8_t* src, unsigned int imm)
 }
 
 // ---- more SSE / integer helpers ----
+// x87 80-bit extended values in memory (fld/fstp tbyte)
+inline double LIFT_LD80(const uint8_t* p)
+{
+    uint64_t m; uint16_t se;
+    memcpy(&m, p, 8); memcpy(&se, p + 8, 2);
+    int e = se & 0x7fff;
+    double sign = (se & 0x8000) ? -1.0 : 1.0;
+    if (e == 0 && m == 0) return sign * 0.0;
+    if (e == 0x7fff) return (m << 1) ? NAN : sign * INFINITY;
+    return sign * ldexp((double)m, e - 16383 - 63);
+}
+inline void LIFT_ST80(uint8_t* p, double v)
+{
+    uint64_t m = 0; uint16_t se = 0;
+    if (v != v) { m = 0xc000000000000000ull; se = 0x7fff; }
+    else
+    {
+        if (signbit(v)) { se = 0x8000; v = -v; }
+        if (isinf(v)) { m = 0x8000000000000000ull; se |= 0x7fff; }
+        else if (v != 0)
+        {
+            int e; double f = frexp(v, &e);              // v = f * 2^e, f in [0.5, 1)
+            m = (uint64_t)ldexp(f, 64);
+            se |= (uint16_t)(e - 1 + 16383);
+        }
+    }
+    memcpy(p, &m, 8); memcpy(p + 8, &se, 2);
+}
 inline uint32_t& lift_flags_id() { static uint32_t v = 0x200000u; return v; }   // EFLAGS.ID: toggling it is how CRT code probes for CPUID
 inline void SQRTSS(uint8_t* d, const uint8_t* src) { float f; memcpy(&f, src, 4); f = sqrtf(f); memcpy(d, &f, 4); }
 inline void RSQRTSS(uint8_t* d, const uint8_t* src) { float f; memcpy(&f, src, 4); f = 1.0f / sqrtf(f); memcpy(d, &f, 4); }

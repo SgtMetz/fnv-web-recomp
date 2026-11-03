@@ -11,8 +11,9 @@
    "evidence": "cmp ecx,[0x11c16bc]; jne report; ret (__security_check_cookie); port/compat/fnv_crt_orig.cpp"
   },
   "0x00ec43fb": {
-   "symbol": "___RTDynamicCast",
-   "source": "name"
+   "symbol": "_fnv_rtdynamiccast_orig",
+   "source": "disasm",
+   "evidence": "__RTDynamicCast wrapper that logs failed casts; port/compat/fnv_crt_orig.cpp"
   },
   "0x00ec44d0": {
    "symbol": "_memmove",
@@ -336,6 +337,11 @@
    "symbol": "_strtod",
    "source": "disasm",
    "evidence": "calls _strtod_l-style worker (str, endptr, NULL)"
+  },
+  "0x00ec7c30": {
+   "symbol": "_fnv_invalid_parameter_orig",
+   "source": "disasm",
+   "evidence": "_invalid_parameter(expr, func, file, line, reserved): calls the handler or _invoke_watson (0xec7b08); port/compat/fnv_crt_orig.cpp logs and returns so the CRT function fails with EINVAL"
   }
  }
 }

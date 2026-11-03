@@ -27,6 +27,8 @@ REG8 = {'al': ('eax', 0), 'cl': ('ecx', 0), 'dl': ('edx', 0), 'bl': ('ebx', 0),
         'ah': ('eax', 8), 'ch': ('ecx', 8), 'dh': ('edx', 8), 'bh': ('ebx', 8)}
 SIZES = {'byte': 8, 'word': 16, 'dword': 32, 'qword': 64, 'xmmword': 128, 'tbyte': 80}
 LINE = re.compile(r'^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2}\s)+)\s*([a-z][\w.]*)\s*(.*)$')
+SYMBOL = re.compile(r'\s*<[^>]*>\s*$')       # objdump's "<symbol+off>" after a target
+COMMENT = re.compile(r'\s*#.*$')
 COND = {   # condition codes over the emulated flags
     'e': 's.zf', 'z': 's.zf', 'ne': '!s.zf', 'nz': '!s.zf', 's': 's.sf', 'ns': '!s.sf',
     'b': 's.cf', 'c': 's.cf', 'nae': 's.cf', 'ae': '!s.cf', 'nb': '!s.cf', 'nc': '!s.cf',
@@ -81,6 +83,18 @@ class TextCache:
     def covers(self, lo, hi):
         return self.lo <= lo and hi <= self.hi
 
+    def indices(self, lo, hi):
+        """Index range [k0, k1) of the cached instructions in [lo, hi)."""
+        return self.bisect.bisect_left(self.addrs, lo), self.bisect.bisect_left(self.addrs, hi)
+
+    def line_at(self, k):
+        if not hasattr(self, 'map'):
+            import mmap
+            self._f = open(self.dis, 'rb')
+            self.map = mmap.mmap(self._f.fileno(), 0, access=mmap.ACCESS_READ)
+        start = self.offs[k]
+        return self.map[start:self.map.find(b'\n', start)].decode('latin1').rstrip('\r')
+
     def lines(self, lo, hi):
         k = self.bisect.bisect_left(self.addrs, lo)
         if k >= len(self.addrs):
@@ -121,36 +135,48 @@ class Lifter:
         """resolve_code(addr) -> ('sym', decorated) | None for an original code address.
         gap_end(addr) -> end of the gap function at addr (next recipe start); allow(addr) -> may it be lifted."""
         self.exe = exe
-        self.resolve_code = resolve_code
+        self._resolve_cb = resolve_code
         self.text = text_range
         self.gap_end = gap_end or (lambda a: a + 0x400)
-        self.allow = allow or (lambda a: LIFT_REGION[0] <= a < LIFT_REGION[1])
+        self._allow_cb = allow or (lambda a: LIFT_REGION[0] <= a < LIFT_REGION[1])
+        self._log = None          # context queries of the function being lifted (see lift())
+        self.cache, self.cache_new, self.cache_hits = {}, {}, 0
         self.ins = {}
         self.ranges = []
+        self.range_set = set()
         self.externs = {}
         self.traps = set()
         self.unsupported = {}
         self.lifted = {}          # address -> body source
         self.ret_pop = {}         # address -> bytes popped by its ret
         self.queue = []
+        self.queued = set()
         self.disassemble(LIFT_REGION[0], LIFT_REGION[1])
 
     # ---- disassembly ---------------------------------------------------------------------------------------------
     def disassemble(self, lo, hi, force=False):
-        if not force and any(a <= lo and hi <= b for a, b in self.ranges):
+        if not force and (lo, hi) in self.range_set:          # the common case: the same function again
             return
         cache = text_cache(self.exe, self.text)
+        lines = None
         if not force and cache and cache.covers(lo, hi):
-            lines = cache.lines(lo, hi)
-        else:
+            # the whole-.text sweep can be out of step at lo (data or padding before a function); then the cached
+            # lines do not start at lo and the function's first instructions would be missing or wrong
+            k0, k1 = cache.indices(lo, hi)
+            if k0 < k1 and cache.addrs[k0] == lo:
+                # an address decodes the same from any sweep, so each cached instruction is parsed once per run
+                addrs, ins = cache.addrs, self.ins
+                lines = [cache.line_at(k) for k in range(k0, k1) if addrs[k] not in ins]
+        if lines is None:
             lines = subprocess.run([OBJDUMP, '-d', '-M', 'intel', '--start-address=%#x' % lo,
                                     '--stop-address=%#x' % hi, self.exe], capture_output=True, text=True).stdout
             lines = lines.splitlines()
+            self.resynced = getattr(self, 'resynced', 0) + 1
         for l in lines:
             m = LINE.match(l)
             if m:
-                raw = bytes.fromhex(re.sub(r'\s', '', m.group(2)))
-                ops = re.sub(r'\s*#.*$', '', re.sub(r'\s*<[^>]*>\s*$', '', m.group(4))).strip()
+                raw = bytes.fromhex(m.group(2))
+                ops = COMMENT.sub('', SYMBOL.sub('', m.group(4))).strip()
                 mnem = m.group(3)
                 if mnem in ('rep', 'repe', 'repne', 'lock'):
                     part = ops.split(None, 1)
@@ -161,20 +187,59 @@ class Lifter:
                             (part[1] if len(part) > 1 else '')
                 self.ins[int(m.group(1), 16)] = (len(raw), raw, mnem, ops)
         self.ranges.append((lo, hi))
+        self.range_set.add((lo, hi))
+
+    def resync(self, lo, hi):
+        """Disassemble from exactly lo (objdump), for addresses the cached linear sweep did not land on."""
+        key = ('resync', lo)
+        if key in self.range_set:
+            return
+        self.range_set.add(key)
+        self.disassemble(lo, max(hi, lo + 16), force=True)
+
+    # ---- context queries ----------------------------------------------------------------------------------------
+    # A lifted body depends on the exe, this file, its (entry, end) range and the answers to these queries; lift()
+    # logs them so a cached body is reused only while every answer is still the same.
+    def resolve_code(self, addr):
+        r = self._resolve_cb(addr)
+        if self._log is not None:
+            self._log.append(('r', addr, r))
+        return r
+
+    def allow(self, addr):
+        r = bool(self._allow_cb(addr))
+        if self._log is not None:
+            self._log.append(('a', addr, r))
+        return r
+
+    def is_stub(self, addr, entry):
+        r = addr != entry and addr in self.stub_starts
+        if self._log is not None:
+            self._log.append(('s', addr, r))
+        return r
 
     # ---- code pointers ------------------------------------------------------------------------------------------
-    def code_ptr(self, addr):
-        r = self.resolve_code(addr)
+    def code_ptr_kind(self, addr):
+        r = self._resolve_cb(addr)
         if r and r[0] == 'sym':
-            ident = 'X_' + re.sub(r'\W', '_', r[1])[:60] + '_%08x' % addr
-            self.externs[ident] = r[1]
-            return '(void*)&%s' % ident
-        if self.allow(addr):
-            if addr not in self.lifted and addr not in self.queue:
+            return 'X_' + re.sub(r'\W', '_', r[1])[:60] + '_%08x' % addr, r[1]
+        if self._allow_cb(addr):
+            return 'entry_%08x' % addr, None
+        return 'lift_trap_%08x' % addr, None
+
+    def code_ptr(self, addr):
+        ident, sym = self.code_ptr_kind(addr)
+        if self._log is not None:
+            self._log.append(('c', addr, ident))
+        if sym:
+            self.externs[ident] = sym
+        elif ident.startswith('entry_'):
+            if addr not in self.lifted and addr not in self.queued:
                 self.queue.append(addr)
-            return '(void*)&entry_%08x' % addr
-        self.traps.add(addr)
-        return '(void*)&lift_trap_%08x' % addr
+                self.queued.add(addr)
+        else:
+            self.traps.add(addr)
+        return '(void*)&%s' % ident
 
     def is_code(self, v):
         return self.text[0] <= (v & 0xffffffff) < self.text[1]
@@ -216,6 +281,8 @@ class Lifter:
             return ('xmm', 128, op[3:])
         if re.match(r'^st(\(\d\))?$', op):
             return ('st', 80, op)
+        if op in ('cs', 'ds', 'es', 'ss', 'fs', 'gs'):         # segment selectors of a 32-bit Windows process
+            return ('imm', 32, {'cs': 0x23, 'ds': 0x2b, 'es': 0x2b, 'ss': 0x2b, 'fs': 0x53, 'gs': 0x2b}[op])
         if re.match(r'^-?(0x[0-9a-f]+|\d+)$', op):
             return ('imm', 32, num(op))
         raise Unsupported('operand ' + op)
@@ -245,7 +312,7 @@ class Lifter:
         """Read bounded absolute jump-table entries embedded in the original .text section."""
         if not self.is_code(addr):
             return None
-        ins = sorted((a for a in self.ins if entry <= a < jump_addr), reverse=True)
+        ins = [a for a in range(jump_addr - 1, entry - 1, -1) if a in self.ins]
         indices = None
         # Some compiler CRT tables are indexed by a register masked immediately before dispatch.
         for a in ins:
@@ -418,6 +485,61 @@ class Lifter:
             return '{ uint32_t f_ = POP(); s.cf = f_ & 1; s.pf = (f_ >> 2) & 1; s.zf = (f_ >> 6) & 1; s.sf = (f_ >> 7) & 1; s.of = (f_ >> 11) & 1; lift_flags_id() = f_ & 0x200000u; }'
         if mnem == 'cpuid':
             return '{ int r_[4]; __cpuidex(r_, (int)s.eax, (int)s.ecx); s.eax = r_[0]; s.ebx = r_[1]; s.ecx = r_[2]; s.edx = r_[3]; }'
+        if mnem == 'movq' and len(P) == 2 and (P[0][0] == 'xmm' or P[1][0] == 'xmm'):
+            d, s_ = P[0], P[1]
+            if d[0] == 'xmm':
+                src = 'X(%s)' % s_[2] if s_[0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % s_[2]
+                return '{ uint8_t t_[8]; memcpy(t_, %s, 8); memset(X(%s), 0, 16); memcpy(X(%s), t_, 8); }' % (src, d[2], d[2])
+            return 'memcpy((uint8_t*)(uintptr_t)%s, X(%s), 8);' % (d[2], s_[2])
+        if mnem in ('stmxcsr', 'ldmxcsr') and P and P[0][0] == 'mem':
+            return ('M32(%s) = _mm_getcsr();' % P[0][2]) if mnem == 'stmxcsr' else ('_mm_setcsr(M32(%s));' % P[0][2])
+        if mnem in ('fld', 'fstp', 'fst') and P and P[0][0] == 'mem' and P[0][1] == 80:
+            if mnem == 'fld':
+                return 'FPUSH(LIFT_LD80((const uint8_t*)(uintptr_t)%s));' % P[0][2]
+            return 'LIFT_ST80((uint8_t*)(uintptr_t)%s, ST(0));%s' % (P[0][2], ' FPOP();' if mnem == 'fstp' else '')
+        if mnem == 'stosd' and 'xmm' not in ops:
+            return 'M32(s.edi) = s.eax; s.edi += 4;'
+        if mnem == 'stosb':
+            return 'M8(s.edi) = (uint8_t)s.eax; s.edi += 1;'
+        if mnem == 'movsd' and 'xmm' not in ops:
+            return 'M32(s.edi) = M32(s.esi); s.edi += 4; s.esi += 4;'
+        if mnem == 'movsb' and 'xmm' not in ops:
+            return 'M8(s.edi) = M8(s.esi); s.edi += 1; s.esi += 1;'
+        if mnem in ('fnclex', 'fclex', 'cld', 'fninit', 'finit', 'fwait'):
+            return ''
+        if mnem == 'fldl2e':
+            return 'FPUSH(1.4426950408889634);'
+        if mnem == 'fldln2':
+            return 'FPUSH(0.6931471805599453);'
+        if mnem == 'fldlg2':
+            return 'FPUSH(0.3010299956639812);'
+        if mnem == 'fldl2t':
+            return 'FPUSH(3.321928094887362);'
+        if mnem == 'fpatan':
+            return '{ double x_ = ST(0), y_ = ST(1); FPOP(); ST(0) = atan2(y_, x_); }'
+        if mnem == 'fprem' or mnem == 'fprem1':
+            return 'ST(0) = fmod(ST(0), ST(1)); s.c2 = 0;'
+        if mnem == 'fxam':
+            return ('{ double v_ = ST(0); s.c0 = 0; s.c2 = 0; s.c3 = 0; if (s.depth <= 0) { s.c3 = 1; s.c0 = 1; } '
+                    'else if (v_ != v_) { s.c0 = 1; } else if (v_ == 0) { s.c3 = 1; } else if (isinf(v_)) { s.c2 = 1; s.c0 = 1; } '
+                    'else { s.c2 = 1; } }')
+        if mnem == 'f2xm1':
+            return 'ST(0) = exp2(ST(0)) - 1.0;'
+        if mnem == 'fscale':
+            return 'ST(0) = ldexp(ST(0), (int)trunc(ST(1)));'
+        if mnem == 'fyl2x':
+            return '{ double x_ = ST(0), y_ = ST(1); FPOP(); ST(0) = y_ * log2(x_); }'
+        if mnem == 'fptan':
+            return 'ST(0) = tan(ST(0)); FPUSH(1.0);'
+        if mnem == 'lahf':
+            return 's.eax = (s.eax & 0xffff00ffu) | ((((uint32_t)s.sf << 7) | ((uint32_t)s.zf << 6) | ((uint32_t)s.pf << 2) | 2u | (uint32_t)s.cf) << 8);'
+        if mnem in ('bt', 'bts', 'btr', 'btc') and len(P) == 2 and P[0][0] in ('reg', 'mem'):
+            b = '((%s) & 31u)' % self.read(P[1])
+            v = self.read(P[0])
+            op_ = {'bt': '', 'bts': ' %s' % self.write(P[0], '(%s) | (1u << %s)' % (v, b)),
+                   'btr': ' %s' % self.write(P[0], '(%s) & ~(1u << %s)' % (v, b)),
+                   'btc': ' %s' % self.write(P[0], '(%s) ^ (1u << %s)' % (v, b))}[mnem]
+            return '{ s.cf = (int)(((%s) >> %s) & 1u);%s }' % (v, b, op_)
         if mnem == 'rdtsc':
             return '{ uint64_t t_ = __rdtsc(); s.eax = (uint32_t)t_; s.edx = (uint32_t)(t_ >> 32); }'
         if mnem.startswith('prefetch'):
@@ -467,8 +589,10 @@ class Lifter:
             return 'TAILCALL((void*)(uintptr_t)%s);' % self.read(operand)
         if mnem.startswith('j') and (mnem == 'jmp' or mnem[1:] in COND):
             tgt = num(ops.split()[0])
-            if entry <= tgt < end and tgt not in self.stub_starts - {entry}:
+            if entry <= tgt < end and not self.is_stub(tgt, entry):
                 self.disassemble(entry, end)
+                if tgt not in self.ins:
+                    self.resync(tgt, end)          # the linear sweep was out of step at the target
                 if tgt in self.ins:
                     labels.add(tgt)
                     return ('if (%s) goto L_%08x;' % (COND[mnem[1:]], tgt)) if mnem != 'jmp' else 'goto L_%08x;' % tgt
@@ -574,7 +698,7 @@ class Lifter:
             if 0xC8 <= b <= 0xCF:
                 return '{ double v_ = ST(0); ST(0) = ST(%d); ST(%d) = v_; }' % (b & 7, b & 7)
             return {0xE0: 'ST(0) = -ST(0);', 0xE1: 'ST(0) = fabs(ST(0));', 0xE4: 'FCOM(ST(0), 0.0);',
-                    0xE8: 'FPUSH(1.0);', 0xEE: 'FPUSH(0.0);', 0xFA: 'ST(0) = sqrt(ST(0));',
+                    0xE8: 'FPUSH(1.0);', 0xEE: 'FPUSH(0.0);', 0xEB: 'FPUSH(3.14159265358979323846);', 0xEA: 'FPUSH(1.4426950408889634);', 0xED: 'FPUSH(0.6931471805599453);', 0xEC: 'FPUSH(0.3010299956639812);', 0xE9: 'FPUSH(3.321928094887362);', 0xE5: '{ double v_ = ST(0); s.c0 = 0; s.c2 = 0; s.c3 = 0; if (v_ != v_) s.c0 = 1; else if (v_ == 0) s.c3 = 1; else if (isinf(v_)) { s.c2 = 1; s.c0 = 1; } else s.c2 = 1; }', 0xE2: '', 0xF3: '{ double x_ = ST(0), y_ = ST(1); FPOP(); ST(0) = atan2(y_, x_); }', 0xF8: 'ST(0) = fmod(ST(0), ST(1)); s.c2 = 0;', 0xF0: 'ST(0) = exp2(ST(0)) - 1.0;', 0xFD: 'ST(0) = ldexp(ST(0), (int)trunc(ST(1)));', 0xF1: '{ double x_ = ST(0), y_ = ST(1); FPOP(); ST(0) = y_ * log2(x_); }', 0xF2: 'ST(0) = tan(ST(0)); FPUSH(1.0);', 0xFA: 'ST(0) = sqrt(ST(0));',
                     0xFB: '{ double v_ = ST(0); ST(0) = sin(v_); FPUSH(cos(v_)); }', 0xFE: 'ST(0) = sin(ST(0));', 0xFF: 'ST(0) = cos(ST(0));'}.get(b) or self._unsup(mnem, ops)
         if raw[0] == 0xDD and len(raw) == 2 and raw[1] >= 0xC0:
             b = raw[1]
@@ -701,10 +825,49 @@ class Lifter:
     # ---- one function -------------------------------------------------------------------------------------------
     def lift(self, entry):
         end = entry + 0x2000 if LIFT_REGION[0] <= entry < LIFT_REGION[1] else self.gap_end(entry)
+        hit = self.cache.get((entry, end))
+        if hit and self.replay(entry, hit):
+            self.cache_new[(entry, end)] = hit
+            self.cache_hits += 1
+            return
+        self._log = []
+        before = set(self.unsupported)
+        self.lift_uncached(entry, end)
+        unsupported = {a: v for a, v in self.unsupported.items() if a not in before}
+        self.cache_new[(entry, end)] = (self.lifted[entry], self.ret_pop.get(entry), unsupported, self._log)
+        self._log = None
+
+    def replay(self, entry, hit):
+        """Reuse a cached body when every logged query still gets the same answer; then redo its side effects."""
+        body, pop, unsupported, log = hit
+        for kind, addr, r in log:
+            if kind == 'r':
+                ok = self._resolve_cb(addr) == r
+            elif kind == 'a':
+                ok = bool(self._allow_cb(addr)) == r
+            elif kind == 's':
+                ok = (addr != entry and addr in self.stub_starts) == r
+            else:
+                ok = self.code_ptr_kind(addr)[0] == r
+            if not ok:
+                return False
+        for kind, addr, _ in log:
+            if kind == 'c':
+                self.code_ptr(addr)
+        self.lifted[entry] = body
+        if pop is not None:
+            self.ret_pop[entry] = pop
+        self.unsupported.update(unsupported)
+        return True
+
+    def lift_uncached(self, entry, end):
         self.disassemble(entry, end)
         body, labels, todo, seen = {}, set(), [entry], set()
+        queued, queued_n = set(), 0
         while todo:
             a = todo.pop()
+            if a not in self.ins and entry <= a < end:
+                self.resync(a, end)
             while a in self.ins and a not in seen and a < end:
                 seen.add(a)
                 n, raw, mnem, ops = self.ins[a]
@@ -714,12 +877,17 @@ class Lifter:
                     self.unsupported[a] = str(e)
                     st = 'fnv_trap(0x%08xu, "lifted: unsupported instruction"); RETURN(0);' % a
                 body[a] = st
-                for t in labels:
-                    if t not in seen and t not in todo:
-                        todo.append(t)
+                if len(labels) != queued_n:          # only labels added by this instruction
+                    for t in labels - queued:
+                        queued.add(t)
+                        if t not in seen:
+                            todo.append(t)
+                    queued_n = len(labels)
                 if mnem == 'ret' or 'RETURN(' in st:
                     break
                 a += n
+                if a not in self.ins and a < end:
+                    self.resync(a, end)
         lines = ['static void body_%08x(uint32_t in_ecx, uint32_t in_edx, const uint32_t* in_args, FnvLiftReturn* out)'
                  % entry, '{', '    LIFT_STATE(in_ecx, in_edx, in_args, out);']
         for a in sorted(body):
@@ -730,38 +898,65 @@ class Lifter:
         lines.append('}')
         self.lifted[entry] = '\n'.join(lines)
 
-    def run(self, entries):
+    def cache_path(self):
+        """out/cache/lift_<key>.pickle: bodies from the previous run, keyed by this file's text and the exe (derived
+        from the exe: git-ignored)."""
+        import hashlib
+        from pathlib import Path
+        h = hashlib.sha1(open(__file__, 'rb').read())
+        with open(self.exe, 'rb') as f:
+            h.update(hashlib.sha256(f.read()).digest())
+        return Path(__file__).resolve().parent.parent / 'out/cache' / ('lift_%s.pickle' % h.hexdigest()[:16])
+
+    def run(self, entries, use_cache=True):
+        import pickle
+        path = self.cache_path() if use_cache else None
+        if path and path.exists():
+            self.cache = pickle.loads(path.read_bytes())
         self.stub_starts = set(entries)
         self.queue = list(entries)
+        self.queued = set(entries)
         while self.queue:
-            e = self.queue.pop(0)
+            e = self.queue.pop()
             if e not in self.lifted:
                 self.lift(e)
+        if path and self.cache_new != self.cache:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            for old in path.parent.glob('lift_*.pickle'):
+                old.unlink()
+            path.write_bytes(pickle.dumps(self.cache_new, protocol=pickle.HIGHEST_PROTOCOL))
 
     def source(self):
         return self.shards(1)[0]
 
     def shards(self, n):
-        """The lifted code as n translation units (compiled in parallel): each carries every declaration and the
-        static trap helpers, and defines its own share of the functions."""
-        head = ['// Generated by tools/lift_stubs.py from the player\'s FalloutNV.exe: do not commit (rule 1).',
-                '#include "fnv_lift.h"', '']
-        for ident, sym in sorted(self.externs.items()):
-            head.append('extern "C" void %s(void) __asm__("%s");' % (ident, sym))
+        """The lifted code as n translation units (compiled in parallel). A function's shard depends only on its
+        address and each shard declares only what it uses, so a change to one function rebuilds one shard."""
+        import zlib
+        groups = [[] for _ in range(n)]
         for a in sorted(self.lifted):
-            head.append('extern "C" void entry_%08x(void) __asm__("fnv_f_%08x");' % (a, a))
-        for a in sorted(self.traps):
-            head.append('static void lift_trap_%08x(void) { fnv_trap(0x%08xu, "lifted: unbound code pointer"); }'
-                        % (a, a))
-        head.append('')
-        funcs = sorted(self.lifted)
+            groups[zlib.crc32(struct.pack('<I', a)) % n].append(a)
+        ref = re.compile(r'\b(X_\w+|entry_[0-9a-f]{8}|lift_trap_[0-9a-f]{8})\b')
         out = []
-        for k in range(n):
+        for funcs in groups:
             body = []
-            for a in funcs[k::n]:
+            for a in funcs:
                 body.append(self.lifted[a])
                 body.append(LIFT_ENTRY.format(a=a, pop=self.ret_pop.get(a, 0)))
-            out.append('\n'.join(head + body) + '\n')
+            body = '\n'.join(body)
+            used = set(ref.findall(body))
+            head = ['// Generated by tools/lift_stubs.py from the player\'s FalloutNV.exe: do not commit (rule 1).',
+                    '#include "fnv_lift.h"', '']
+            for ident in sorted(used):
+                if ident.startswith('X_'):
+                    head.append('extern "C" void %s(void) __asm__("%s");' % (ident, self.externs[ident]))
+                elif ident.startswith('entry_'):
+                    head.append('extern "C" void %s(void) __asm__("fnv_f_%s");' % (ident, ident[6:]))
+                else:
+                    a = int(ident[10:], 16)
+                    head.append('static void lift_trap_%08x(void) { fnv_trap(0x%08xu, "lifted: unbound code pointer"); }'
+                                % (a, a))
+            out.append('\n'.join(head) + '\n' + body + '\n')
         return out
 
 
@@ -771,8 +966,11 @@ LIFT_ENTRY = '''extern "C" __declspec(naked) void entry_{a:08x}(void)
     __asm {{
         push ebp
         mov ebp, esp
-        sub esp, 24
-        lea eax, [ebp - 24]
+        sub esp, 36
+        lea eax, [ebp - 36]
+        mov [ebp - 12], ebx
+        mov [ebp - 8], esi
+        mov [ebp - 4], edi
         push eax
         lea eax, [ebp + 4]
         push eax
@@ -780,15 +978,15 @@ LIFT_ENTRY = '''extern "C" __declspec(naked) void entry_{a:08x}(void)
         push ecx
         call body_{a:08x}
         add esp, 16
-        cmp dword ptr [ebp - 16], 0
+        cmp dword ptr [ebp - 28], 0
         je no_fpu
-        fld qword ptr [ebp - 8]
+        fld qword ptr [ebp - 20]
     no_fpu:
-        mov ecx, [ebp - 12]
+        mov ecx, [ebp - 24]
         mov eax, [ebp + 4]
         mov [ebp + ecx + 4], eax
-        mov eax, [ebp - 24]
-        mov edx, [ebp - 20]
+        mov eax, [ebp - 36]
+        mov edx, [ebp - 32]
         mov esp, ebp
         pop ebp
         add esp, ecx
