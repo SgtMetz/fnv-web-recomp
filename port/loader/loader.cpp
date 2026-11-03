@@ -659,6 +659,15 @@ DWORD WINAPI wrap_GetFileAttributesA(LPCSTR n)
     SetLastError(e);
     return r;
 }
+HANDLE WINAPI wrap_FindFirstFileA(LPCSTR n, LPWIN32_FIND_DATAA fd)
+{
+    HANDLE h = FindFirstFileA(n, fd);
+    DWORD e = GetLastError();
+    if (g_fileLog < 0) g_fileLog = getenv("FNV_FILE_LOG") ? 1 : 0;
+    if (g_fileLog) { fprintf(g_log, "[file] find %s -> %s\n", n, h == INVALID_HANDLE_VALUE ? "none" : fd->cFileName); fflush(g_log); }
+    SetLastError(e);
+    return h;
+}
 int WINAPI wrap_MessageBoxA(HWND, LPCSTR text, LPCSTR caption, UINT type)
 {
     fprintf(g_log, "[msgbox] %s: %s\n", caption ? caption : "", text ? text : "");
@@ -702,6 +711,246 @@ HINSTANCE WINAPI wrap_ShellExecuteA(HWND, LPCSTR op, LPCSTR file, LPCSTR params,
     fflush(g_log);
     return (HINSTANCE)2;   // <= 32: failure, the game carries on
 }
+// FNV_INPUT=script (or FNV_INPUT_FILE=path): scripted DirectInput for unattended runs, off unless set. The game's
+// DirectInput8Create import is wrapped; CreateDevice, Acquire, GetDeviceState and GetDeviceData of the devices it
+// creates are patched so the script's keys/mouse are merged into what the real devices report, and a lost or
+// unacquired device (window in the background) reads as idle instead of failing. Script: ';'-separated steps
+// "delay_ms:verb:args", delay counted from the previous step (the first from the first poll):
+//   key:<DIK hex>[,hold ms]   move:<dx>,<dy>   click[:hold ms]   log:<text>
+struct FnvDiObj { DWORD ofs, data, time, seq; DWORD app; };    // DIDEVICEOBJECTDATA (callers pass cbObjectData)
+struct InStep { DWORD delay; char verb; int a, b; char text[48]; };
+std::vector<InStep> g_in;
+size_t g_inPos = 0;
+DWORD g_inNext = 0, g_inSeq = 0;
+bool g_inStarted = false;
+void* g_inKbd = nullptr;
+void* g_inMouse = nullptr;
+BYTE g_inKeys[256];
+DWORD g_inKeyUp[256];
+int g_inDx = 0, g_inDy = 0;
+bool g_inBtn = false;
+DWORD g_inBtnUp = 0;
+std::vector<FnvDiObj> g_inKbdEv, g_inMouseEv;
+CRITICAL_SECTION g_inLock;
+typedef HRESULT(WINAPI* DiCreateFn)(HINSTANCE, DWORD, REFIID, void**, void*);
+typedef HRESULT(WINAPI* DiCreateDevFn)(void*, REFGUID, void**, void*);
+typedef HRESULT(WINAPI* DiAcquireFn)(void*);
+typedef HRESULT(WINAPI* DiStateFn)(void*, DWORD, void*);
+typedef HRESULT(WINAPI* DiDataFn)(void*, DWORD, FnvDiObj*, DWORD*, DWORD);
+DiCreateFn g_realDiCreate;
+DiCreateDevFn g_realCreateDev;
+struct DevReal { void** vtbl; DiAcquireFn acquire; DiStateFn state; DiDataFn data; };
+DevReal g_devReal[4];
+int g_devRealN = 0;
+const GUID kSysKeyboard = {0x6F1D2B61, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+const GUID kSysMouse = {0x6F1D2B60, 0xD5A0, 0x11CF, {0xBF, 0xC7, 0x44, 0x45, 0x53, 0x54, 0x00, 0x00}};
+
+void input_parse(const char* s)
+{
+    while (s && *s)
+    {
+        while (*s == ';' || *s == ' ' || *s == 9) ++s;
+        if (!*s) break;
+        if (*s == '#') { s = strchr(s, ';'); continue; }    // comment to the end of the line
+        InStep st = {};
+        char* e;
+        st.delay = strtoul(s, &e, 10);
+        if (*e != ':') break;
+        const char* v = e + 1;
+        const char* arg = strchr(v, ':');
+        const char* end = strchr(v, ';');
+        if (!end) end = v + strlen(v);
+        if (arg && arg > end) arg = nullptr;
+        st.verb = *v;
+        if (st.verb == 'k' && arg) { st.a = (int)strtoul(arg + 1, &e, 16); st.b = *e == 0x2c ? atoi(e + 1) : 100; }
+        else if (st.verb == 'm' && arg) { st.a = (int)strtol(arg + 1, &e, 10); st.b = *e == 0x2c ? atoi(e + 1) : 0; }
+        else if (st.verb == 'c') st.a = arg ? atoi(arg + 1) : 100;
+        else if (st.verb == 'l' && arg) _snprintf_s(st.text, sizeof(st.text), _TRUNCATE, "%.*s", (int)(end - arg - 1), arg + 1);
+        g_in.push_back(st);
+        s = *end ? end + 1 : nullptr;
+    }
+}
+
+void input_event(std::vector<FnvDiObj>& q, DWORD ofs, DWORD data)
+{
+    FnvDiObj o = {ofs, data, GetTickCount(), ++g_inSeq, 0};
+    q.push_back(o);
+}
+
+void input_tick()   // under g_inLock
+{
+    DWORD now = GetTickCount();
+    if (!g_inStarted)
+    {
+        g_inStarted = true;
+        g_inNext = now + (g_in.empty() ? 0 : g_in[0].delay);
+    }
+    while (g_inPos < g_in.size() && (LONG)(now - g_inNext) >= 0)
+    {
+        const InStep& st = g_in[g_inPos];
+        fprintf(g_log, "[input] step %u %c %d %d %s\n", (unsigned)g_inPos, st.verb, st.a, st.b, st.text);
+        fflush(g_log);
+        if (st.verb == 'k' && st.a > 0 && st.a < 256)
+        {
+            g_inKeys[st.a] = 0x80;
+            g_inKeyUp[st.a] = now + st.b;
+            input_event(g_inKbdEv, st.a, 0x80);
+        }
+        else if (st.verb == 'm')
+        {
+            g_inDx += st.a;
+            g_inDy += st.b;
+            if (st.a) input_event(g_inMouseEv, 0, (DWORD)st.a);
+            if (st.b) input_event(g_inMouseEv, 4, (DWORD)st.b);
+        }
+        else if (st.verb == 'c')
+        {
+            g_inBtn = true;
+            g_inBtnUp = now + st.a;
+            input_event(g_inMouseEv, 12, 0x80);
+        }
+        if (++g_inPos < g_in.size()) g_inNext = now + g_in[g_inPos].delay;
+    }
+    for (int k = 1; k < 256; ++k)
+        if (g_inKeys[k] && (LONG)(now - g_inKeyUp[k]) >= 0)
+        {
+            g_inKeys[k] = 0;
+            input_event(g_inKbdEv, k, 0);
+        }
+    if (g_inBtn && (LONG)(now - g_inBtnUp) >= 0)
+    {
+        g_inBtn = false;
+        input_event(g_inMouseEv, 12, 0);
+    }
+}
+
+DevReal* dev_real(void* self)
+{
+    void** vt = *(void***)self;
+    for (int i = 0; i < g_devRealN; ++i)
+        if (g_devReal[i].vtbl == vt) return &g_devReal[i];
+    return nullptr;
+}
+
+HRESULT WINAPI in_acquire(void* self)
+{
+    DevReal* r = dev_real(self);
+    HRESULT hr = r ? r->acquire(self) : 0;
+    return hr < 0 ? 0 : hr;
+}
+
+HRESULT WINAPI in_state(void* self, DWORD cb, void* data)
+{
+    DevReal* r = dev_real(self);
+    HRESULT hr = r ? r->state(self, cb, data) : -1;
+    if (hr < 0) { memset(data, 0, cb); hr = 0; }
+    EnterCriticalSection(&g_inLock);
+    input_tick();
+    if (self == g_inKbd && cb >= 256)
+        for (int k = 0; k < 256; ++k) ((BYTE*)data)[k] |= g_inKeys[k];
+    else if (self == g_inMouse && cb >= 16)
+    {
+        ((LONG*)data)[0] += g_inDx;
+        ((LONG*)data)[1] += g_inDy;
+        g_inDx = g_inDy = 0;
+        if (g_inBtn) ((BYTE*)data)[12] |= 0x80;
+    }
+    LeaveCriticalSection(&g_inLock);
+    return hr;
+}
+
+HRESULT WINAPI in_data(void* self, DWORD cb, FnvDiObj* rg, DWORD* inout, DWORD flags)
+{
+    DevReal* r = dev_real(self);
+    DWORD cap = inout ? *inout : 0;
+    HRESULT hr = r ? r->data(self, cb, rg, inout, flags) : -1;
+    if (hr < 0) { if (inout) *inout = 0; hr = 0; }
+    EnterCriticalSection(&g_inLock);
+    input_tick();
+    std::vector<FnvDiObj>* q = self == g_inKbd ? &g_inKbdEv : self == g_inMouse ? &g_inMouseEv : nullptr;
+    if (q && rg && inout && cb >= 16)
+    {
+        size_t used = 0;
+        while (*inout < cap && used < q->size())
+        {
+            FnvDiObj* o = (FnvDiObj*)((BYTE*)rg + *inout * cb);
+            memset(o, 0, cb);
+            o->ofs = (*q)[used].ofs; o->data = (*q)[used].data; o->time = (*q)[used].time; o->seq = (*q)[used].seq;
+            ++*inout;
+            ++used;
+        }
+        if (!(flags & 1))   // DIGDD_PEEK leaves the events queued
+            q->erase(q->begin(), q->begin() + used);
+    }
+    LeaveCriticalSection(&g_inLock);
+    return hr;
+}
+
+void patch_slot(void** vt, int slot, void* fn)
+{
+    DWORD old;
+    VirtualProtect(&vt[slot], 4, PAGE_READWRITE, &old);
+    vt[slot] = fn;
+    VirtualProtect(&vt[slot], 4, old, &old);
+}
+
+HRESULT WINAPI in_create_device(void* self, REFGUID guid, void** dev, void* outer)
+{
+    HRESULT hr = g_realCreateDev(self, guid, dev, outer);
+    if (hr < 0 || !dev || !*dev) return hr;
+    bool kbd = !memcmp(&guid, &kSysKeyboard, sizeof(GUID)), mouse = !memcmp(&guid, &kSysMouse, sizeof(GUID));
+    if (kbd) g_inKbd = *dev;
+    if (mouse) g_inMouse = *dev;
+    if (!dev_real(*dev) && g_devRealN < 4)
+    {
+        void** vt = *(void***)*dev;
+        DevReal& r = g_devReal[g_devRealN++];
+        r.vtbl = vt;
+        r.acquire = (DiAcquireFn)vt[7];
+        r.state = (DiStateFn)vt[9];
+        r.data = (DiDataFn)vt[10];
+        patch_slot(vt, 7, (void*)&in_acquire);
+        patch_slot(vt, 9, (void*)&in_state);
+        patch_slot(vt, 10, (void*)&in_data);
+    }
+    fprintf(g_log, "[input] device %p created (%s)\n", *dev, kbd ? "keyboard" : mouse ? "mouse" : "other");
+    fflush(g_log);
+    return hr;
+}
+
+HRESULT WINAPI wrap_DirectInput8Create(HINSTANCE inst, DWORD ver, REFIID iid, void** out, void* outer)
+{
+    HRESULT hr = g_realDiCreate(inst, ver, iid, out, outer);
+    if (hr >= 0 && out && *out && !g_realCreateDev)
+    {
+        void** vt = *(void***)*out;
+        g_realCreateDev = (DiCreateDevFn)vt[3];
+        patch_slot(vt, 3, (void*)&in_create_device);
+        fprintf(g_log, "[input] DirectInput8Create wrapped, %u scripted steps\n", (unsigned)g_in.size());
+        fflush(g_log);
+    }
+    return hr;
+}
+
+bool input_init()
+{
+    const char* s = getenv("FNV_INPUT");
+    static std::vector<char> file;
+    if (const char* path = getenv("FNV_INPUT_FILE"))
+        if (FILE* f = fopen(path, "rb"))
+        {
+            int c;
+            while ((c = fgetc(f)) != EOF) file.push_back(c == 10 || c == 13 ? ';' : (char)c);
+            file.push_back(0);
+            fclose(f);
+            s = file.data();
+        }
+    if (!s) return false;
+    InitializeCriticalSection(&g_inLock);
+    input_parse(s);
+    return true;
+}
+
 VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
 BOOL WINAPI wrap_TerminateProcess(HANDLE h, UINT code) { if (h == GetCurrentProcess()) log_exit_stack("TerminateProcess", code); return TerminateProcess(h, code); }
 
@@ -1170,7 +1419,13 @@ int main(int argc, char** argv)
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "MessageBoxA")) f = (FARPROC)&wrap_MessageBoxA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "OutputDebugStringA")) f = (FARPROC)&wrap_OutputDebugStringA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "GetFileAttributesA")) f = (FARPROC)&wrap_GetFileAttributesA;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "FindFirstFileA")) f = (FARPROC)&wrap_FindFirstFileA;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "TerminateProcess")) f = (FARPROC)&wrap_TerminateProcess;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "DirectInput8Create") && input_init())
+            {
+                g_realDiCreate = (DiCreateFn)f;
+                f = (FARPROC)&wrap_DirectInput8Create;
+            }
             if (f)
             {
                 *slot = (DWORD)f;
