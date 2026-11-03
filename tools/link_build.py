@@ -852,6 +852,9 @@ def leak_callers(units, orig_calls, owner):
 # Placeholder virtual methods the decomp declares on a by-value member (so clang calls them directly): dispatch through
 # the object's vtable at the given byte offset instead.
 VDISPATCH = {}      # filled per link: unresolved placeholder virtual names -> vtable byte offset
+VDISPATCH_STACK = set()     # those of them whose `this` is the first stack argument (__stdcall/__cdecl COM methods)
+# a virtual member taking `this` on the stack: public/protected/private virtual, any cv, __cdecl (A) or __stdcall (G)
+STACK_THIS_VIRTUAL = re.compile(r'^\?(\w+)@(\w+)@(?:[\w$?]+@)*@[EFMNUV][AB][AG]')
 # Virtuals of abstract bases that the recipe binds to addresses which are not those functions (the original slots are
 # _purecall): clang calls them directly on by-value members, so they dispatch through the object's vtable instead.
 VSLOTS = {'?Init@BaseFormComponent@@UAEXXZ': 0, '?Free@BaseFormComponent@@UAEXXZ': 4,
@@ -979,6 +982,10 @@ def write_popfix(path, popfix, actual):
             lines.append('extern "C" __declspec(naked) void pf_%08x_%d(void) { %s }' % (addr, d, body))
     for k_, (name_, off_) in enumerate(sorted(VDISPATCH.items())):
         lines.append('extern "C" __declspec(naked) void vd_%d(void) __asm__("%s");' % (k_, name_))
+        if name_ in VDISPATCH_STACK:
+            lines.append('extern "C" __declspec(naked) void vd_%d(void) { __asm { mov eax, [esp + 4] } __asm { mov eax, [eax] } '
+                         '__asm { jmp dword ptr [eax + %d] } }' % (k_, off_))
+            continue
         lines.append('extern "C" __declspec(naked) void vd_%d(void) { __asm { mov eax, [ecx] } __asm { jmp dword ptr [eax + %d] } }' % (k_, off_))
     Path(path).write_text(chr(10).join(lines) + chr(10))
     return len(seen)
@@ -1239,7 +1246,8 @@ def main():
         0x005E4100,  # Model-name setter was inferred as an alloca helper, causing a false stack overflow.
         0x00406340,  # Effect cleanup's synthetic deleter destructor is unbound; use its original delete path.
         0x0048A010,  # Model-list delete expressions introduce an unbound synthetic destructor.
-        0x004313C0}  # ExtraMapMarker destructor must call the original MapMarkerData deleting destructor.
+        0x004313C0,  # ExtraMapMarker destructor must call the original MapMarkerData deleting destructor.
+        0x009FC780}  # DirectShow enumerator must invoke COM AddRef through the actual interface vtable.
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():
@@ -1269,6 +1277,22 @@ def main():
         stats_reg = (len(reg_in), len(reg_callers))
     else:
         stats_reg = (0, 0)
+    # Tail-jumping thunks (adjustor thunks `sub [esp+4],N; jmp T`, COM forwarders `mov [esp+4],x; jmp [vtbl+N]`) whose
+    # declared pop differs from what the original pops through its jump target (tools/tail_pops.py). pop_check.py only
+    # sees `ret N`, and MSVC emits the same jmp for the decomp's __cdecl model, so the overlay matches; clang emits
+    # `call T; add esp,4; ret`, which returns into the argument when T pops it (0x9fdd10, a DirectShow IPin::Release
+    # thunk). Lift the definitions; references under a mismatched name bind to popfix thunks.
+    ctx['tail_actual'] = {}
+    if not os.environ.get('FNV_NO_TAILLIFT'):
+        import tail_pops
+        tail_flagged, tail_refs = cached('tail_pops', exe_key + (ROOT / 'tools/tail_pops.py').read_bytes(), tail_pops.scan)
+        ctx['lift_replace'] |= {x for x in tail_flagged if owner.get(x) is not None}
+        if not os.environ.get('FNV_NO_POPFIX'):
+            for a_, e_ in tail_refs.items():
+                for n_, d_ in e_['declared'].items():
+                    if (d_ - e_['actual']) % 4 == 0 and e_['actual'] % 4 == 0 and d_ % 4 == 0 and d_ >= 0:
+                        ctx['popfix'].setdefault(a_, {})[n_] = d_
+            ctx['tail_actual'] = {a_: e_['actual'] for a_, e_ in tail_refs.items()}
     meta = json.loads((ROOT / 'local/data_image.json').read_text())
     ctx['image'] = (int(meta['base'], 16), (ROOT / 'local/data_image.bin').read_bytes())
     ctx['inferred'], ctx['literal_bind'] = {}, {}
@@ -1360,6 +1384,14 @@ def main():
             if m_ and (m_.group(2), m_.group(1)) in decl_slots:
                 off_ = decl_slots[(m_.group(2), m_.group(1))]
                 stats['virtual-slots-from-declarations'] += 1
+            # COM methods (`this` on the stack) called on a by-value interface member: clang devirtualizes
+            # `pin->m_iPin.AddRef()` to a direct call of the unbound name, and the soft trap skips the AddRef
+            # (0x9fbb50 IEnumPins::Next: the pin's filter is then released once too often -> heap corruption)
+            m_ = STACK_THIS_VIRTUAL.match(n_) if off_ is None else None
+            if m_ and (m_.group(2), m_.group(1)) in decl_slots:
+                off_ = decl_slots[(m_.group(2), m_.group(1))]
+                VDISPATCH_STACK.add(n_)
+                stats['virtual-slots-stack-this'] += 1
             if off_ is not None:
                 VDISPATCH[n_] = off_
     for n_ in VDISPATCH:
@@ -1393,6 +1425,7 @@ def main():
             pops[sym] = n
     write_traps(LINK / 'traps.cpp', traps, pops)
     pf_actual = {int(a, 16): e['actual'] for a, e in json.loads((ROOT / 'out/pop_mismatch.json').read_text()).items()}         if (ROOT / 'out/pop_mismatch.json').exists() else {}
+    pf_actual.update(ctx['tail_actual'])
     pf_needed = {}
     for n in popfix_names:
         m_ = re.match(r'fnv_pf_([0-9a-f]{8})_(\d+)$', n)
