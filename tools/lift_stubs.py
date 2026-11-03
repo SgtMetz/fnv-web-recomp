@@ -25,6 +25,7 @@ REG32 = ['eax', 'ecx', 'edx', 'ebx', 'esp', 'ebp', 'esi', 'edi']
 REG16 = {'ax': 'eax', 'cx': 'ecx', 'dx': 'edx', 'bx': 'ebx', 'si': 'esi', 'di': 'edi', 'bp': 'ebp', 'sp': 'esp'}
 REG8 = {'al': ('eax', 0), 'cl': ('ecx', 0), 'dl': ('edx', 0), 'bl': ('ebx', 0),
         'ah': ('eax', 8), 'ch': ('ecx', 8), 'dh': ('edx', 8), 'bh': ('ebx', 8)}
+REG_ALIASES = {r: {r} | {k for k, v in REG16.items() if v == r} | {k for k, v in REG8.items() if v[0] == r} for r in REG32}
 SIZES = {'byte': 8, 'word': 16, 'dword': 32, 'qword': 64, 'xmmword': 128, 'tbyte': 80}
 LINE = re.compile(r'^\s*([0-9a-f]+):\s+((?:[0-9a-f]{2}\s)+)\s*([a-z][\w.]*)\s*(.*)$')
 SYMBOL = re.compile(r'\s*<[^>]*>\s*$')       # objdump's "<symbol+off>" after a target
@@ -345,10 +346,16 @@ class Lifter:
                         pass
                     if indices is not None:
                         break
-        # Otherwise use a nearby compare against the same index register.
+        # Otherwise use a nearby compare against the same index register, but only one that bounds the value the
+        # jump uses: stop at the instruction that loads the index (a byte-table `movzx eax, [edx+T]` must not
+        # pick up an unrelated earlier `cmp eax, 4`; 0x70ca8e has 12 targets, not 5) or at a call clobbering it.
         if indices is None:
             for a in ins:
                 _, _, mnem, ops = self.ins[a]
+                dst = ops.split(',', 1)[0].strip()
+                if (mnem not in ('cmp', 'test', 'push') and not mnem.startswith('j') and dst in REG_ALIASES.get(index_reg, (index_reg,))) or \
+                        (mnem == 'call' and index_reg in ('eax', 'ecx', 'edx')):
+                    break
                 if mnem == 'cmp' and ops.startswith(index_reg + ', '):
                     try:
                         limit = num(ops.split(',', 1)[1])
