@@ -1288,7 +1288,9 @@ def main():
         0x0048A010,  # Model-list delete expressions introduce an unbound synthetic destructor.
         0x004313C0,  # ExtraMapMarker destructor must call the original MapMarkerData deleting destructor.
         0x009FC780,  # DirectShow enumerator must invoke COM AddRef through the actual interface vtable.
-        0x004786E0}  # Destructible-data copy: `delete stage` uses the unbound synthetic ??1CopyStage; original deletes.
+        0x004786E0,  # Destructible-data copy: `delete stage` uses the unbound synthetic ??1CopyStage; original deletes.
+        0x0057C8D0}  # Ref-set map dtor: the decomp's DtorBase_57c930 puts a clang vptr before an empty base, so clang
+                     # calls the base dtor 0x57c930 with this+4 (it then clears a garbage map: null table read).
     # bool/char-declared bodies whose original passes a full 32-bit EAX through (see narrow_mismatches)
     if not os.environ.get('FNV_NO_NARROWLIFT'):
         ctx['lift_replace'] |= {a_ for a_ in narrow_mismatches(units) if owner.get(a_) is not None}
