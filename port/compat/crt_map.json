@@ -19,6 +19,11 @@
    "symbol": "_memmove",
    "source": "name"
   },
+  "0x00ec7230": {
+   "symbol": "_memmove",
+   "source": "disasm",
+   "evidence": "cdecl destination/source/byte-count arguments; returns destination and copies backward for overlapping ranges"
+  },
   "0x00ec4835": {
    "symbol": "_memcmp",
    "source": "name"
