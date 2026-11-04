@@ -10,6 +10,12 @@ extern "C" void __cdecl fnv_trap(unsigned int address, const char* name);
 extern "C" void __cdecl fnv_trap_soft(unsigned int address, const char* name);
 extern "C" uint32_t __cdecl fnv_lift_tls_array(void);
 extern "C" uint8_t __cdecl fnv_lift_code8(uint32_t addr);
+// FNV_FPU_CHECK=1 (fnv_lift_runtime.cpp): the naked entries of lifted functions call these (lifted address pushed,
+// all registers and the x87 stack preserved) to check that the native x87 stack is empty on entry and to note what
+// the function leaves on it at exit; a stack that grew in between is logged with the last checkpoints.
+extern "C" int fnv_fpu_check_on;   // nonzero until the first hook finds FNV_FPU_CHECK unset
+extern "C" void fnv_fpu_entry_hook(void);
+extern "C" void fnv_fpu_exit_hook(void);
 #include <intrin.h>
 #include <xmmintrin.h>
 

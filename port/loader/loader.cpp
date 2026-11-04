@@ -457,6 +457,9 @@ LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
                     }
                     fprintf(g_log, "[bp] %08lx hit %d thread %lu eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ret=%08lx args %08lx %08lx %08lx %08lx\n", b.original, b.hits,
                             GetCurrentThreadId(), c->Eax, c->Ecx, c->Edx, c->Esp, sp[0], sp[1], sp[2], sp[3], sp[4]);
+                    // x87 state: TOP (status bits 11-13) and the tag word (2 bits per register, 3 = empty; FFFF = clean)
+                    fprintf(g_log, "[bp]     fpu status %04lx (top %lu) tags %04lx\n", c->FloatSave.StatusWord & 0xffff,
+                            (c->FloatSave.StatusWord >> 11) & 7, c->FloatSave.TagWord & 0xffff);
                     if (c->Ecx > 0x10000 && !IsBadReadPtr((void*)c->Ecx, 4))   // object chain: ecx -> *ecx -> vtable entries
                     {
                         DWORD o1 = *(DWORD*)c->Ecx;
@@ -748,6 +751,8 @@ DWORD g_inKeyUp[256];
 int g_inDx = 0, g_inDy = 0;
 bool g_inBtn = false;
 DWORD g_inBtnUp = 0;
+static const char* g_dumpTag;          // FNV_D3D_DUMP=<non-numeric tag>: set by the D3D hook
+static volatile LONG g_dumpTagHit;
 std::vector<FnvDiObj> g_inKbdEv, g_inMouseEv;
 CRITICAL_SECTION g_inLock;
 typedef HRESULT(WINAPI* DiCreateFn)(HINSTANCE, DWORD, REFIID, void**, void*);
@@ -846,6 +851,8 @@ void input_tick()   // under g_inLock
         const InStep& st = g_in[g_inPos];
         fprintf(g_log, "[input] step %u %c %d %d %s\n", (unsigned)g_inPos, st.verb, st.a, st.b, st.text);
         fflush(g_log);
+        if (st.verb == 'l' && g_dumpTag && *g_dumpTag && !strncmp(st.text, g_dumpTag, strlen(g_dumpTag)))
+            g_dumpTagHit = 1;   // FNV_D3D_DUMP=<tag>: arms the D3D pass dump (see ds_dump_*)
         if (st.verb == 'k' && st.a > 0 && st.a < 256)
         {
             g_inKeys[st.a] = 0x80;
@@ -1135,6 +1142,813 @@ LPVOID WINAPI wrap_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD prot
     return VirtualAlloc(addr, size, type, protect);
 }
 
+// FNV_D3D_STATS=1: count what the game asks Direct3D 9 to do and log it every 120 frames (draw calls, primitives,
+// draws with no vertex/pixel shader bound, shaders created, BeginScene count, Clear calls). With HDR off the world
+// view is black, with HDR on white (tone mapping of an empty scene): this says whether the world issues draws at all.
+typedef HRESULT(WINAPI* D3DFn)(void*);
+typedef void*(WINAPI* D3DCreate9Fn)(UINT);
+typedef HRESULT(WINAPI* D3DCreateDevFn)(void*, UINT, DWORD, HWND, DWORD, void*, void**);
+typedef HRESULT(WINAPI* D3DPresentFn)(void*, const RECT*, const RECT*, HWND, const void*);
+typedef HRESULT(WINAPI* D3DDrawFn)(void*, DWORD, DWORD, DWORD);
+typedef HRESULT(WINAPI* D3DDrawIdxFn)(void*, DWORD, INT, UINT, UINT, UINT, UINT);
+typedef HRESULT(WINAPI* D3DDrawUPFn)(void*, DWORD, UINT, const void*, UINT);
+typedef HRESULT(WINAPI* D3DDrawIdxUPFn)(void*, DWORD, UINT, UINT, UINT, const void*, DWORD, const void*, UINT);
+typedef HRESULT(WINAPI* D3DSetShFn)(void*, void*);
+typedef HRESULT(WINAPI* D3DCreateShFn)(void*, const DWORD*, void**);
+typedef HRESULT(WINAPI* D3DClearFn)(void*, DWORD, const void*, DWORD, DWORD, float, DWORD);
+static D3DCreate9Fn g_realD3DCreate9;
+static D3DCreateDevFn g_realCreateDevice;
+static D3DPresentFn g_realPresent;
+static D3DFn g_realBeginScene;
+static D3DDrawFn g_realDraw;
+static D3DDrawIdxFn g_realDrawIdx;
+static D3DDrawUPFn g_realDrawUP;
+static D3DDrawIdxUPFn g_realDrawIdxUP;
+static D3DSetShFn g_realSetVS, g_realSetPS;
+static D3DCreateShFn g_realCreateVS, g_realCreatePS;
+static D3DClearFn g_realClear;
+typedef HRESULT(WINAPI* D3DSetConstFn)(void*, UINT, const float*, UINT);
+static D3DSetConstFn g_realSetVSConst;
+typedef HRESULT(WINAPI* D3DSetTexFn)(void*, DWORD, void*);
+typedef HRESULT(WINAPI* D3DSetRTFn)(void*, DWORD, void*);
+static D3DSetTexFn g_realSetTexture;
+static D3DSetRTFn g_realSetRT;
+static void* g_dsTex0;
+static void* g_dsTex[8];
+static void* g_dsVS;
+static void* g_dsPS;
+static void fpu_trap_where(const char* what, DWORD a);
+static volatile LONG g_dsNoTex0, g_dsRTsets, g_dsRTnull;
+static HRESULT WINAPI ds_SetTexture(void* d, DWORD st, void* t)
+{
+    if (st == 0) g_dsTex0 = t;
+    if (st < 8) g_dsTex[st] = t;
+    return g_realSetTexture(d, st, t);
+}
+
+// FNV_D3D_DUMP=<frame number> or =<input log tag> (e.g. OK3; then the 20th frame with >= 200 draws after the tag,
+// FNV_D3D_DUMP_SKIP=n changes 20): during that one frame every SetRenderTarget / SetDepthStencilSurface / Clear /
+// StretchRect is logged ([dump] lines, with the game caller), the first draws after each colour-target switch log
+// the key render states, viewport, scissor, shaders and textures, and each colour target is read back when the
+// frame switches away from it (and at Present, and StretchRect destinations) to out/d3d_dump/NN_<w>x<h>_<fmt>.bmp
+// with per-channel mean/min/max.
+struct DsDesc { DWORD Format, Type, Usage, Pool, MultiSampleType, MultiSampleQuality; UINT Width, Height; };
+struct DsLocked { INT Pitch; void* pBits; };
+struct DsViewport { DWORD X, Y, Width, Height; float MinZ, MaxZ; };
+template <class R, class... A> static R ds_vcall(void* o, int slot, A... a)
+{
+    typedef R(WINAPI * F)(void*, A...);
+    return ((F)(*(void***)o)[slot])(o, a...);
+}
+typedef HRESULT(WINAPI* D3DStretchFn)(void*, void*, const RECT*, void*, const RECT*, DWORD);
+typedef HRESULT(WINAPI* D3DSetDSFn)(void*, void*);
+typedef HRESULT(WINAPI* D3DSetRSFn)(void*, DWORD, DWORD);
+typedef HRESULT(WINAPI* D3DSetVPFn)(void*, const DsViewport*);
+typedef HRESULT(WINAPI* D3DSetScFn)(void*, const RECT*);
+static D3DStretchFn g_realStretch;
+static D3DSetDSFn g_realSetDS;
+static D3DSetRSFn g_realSetRS;
+static D3DSetVPFn g_realSetVP;
+static D3DSetScFn g_realSetSc;
+static D3DFn g_realEndScene;
+static DWORD g_rsShadow[256];
+static DsViewport g_vpShadow;
+static RECT g_scShadow;
+static int g_dumpState;              // 0 off, 1 armed, 2 dumping this frame, 3 done
+static LONG g_dumpFrame = -1, g_dumpHeavy, g_dumpSkip = 20, g_frameDraws;
+static int g_dumpSeg, g_dumpSegDraws, g_dumpDetail, g_dumpFileN;
+static void* g_dumpRT;               // colour target 0 of the current segment (not referenced)
+static char g_dumpDir[MAX_PATH];
+static void ds_rs_defaults()
+{
+    g_rsShadow[7] = 1; g_rsShadow[14] = 1; g_rsShadow[19] = 2; g_rsShadow[20] = 1; g_rsShadow[22] = 3;
+    g_rsShadow[23] = 4; g_rsShadow[25] = 8; g_rsShadow[56] = 8; g_rsShadow[168] = 0xf; g_rsShadow[171] = 1;
+}
+static const char* ds_fmt(DWORD f)
+{
+    static char buf[16];
+    switch (f)
+    {
+    case 21: return "A8R8G8B8";
+    case 22: return "X8R8G8B8";
+    case 23: return "R5G6B5";
+    case 31: return "A2B10G10R10";
+    case 35: return "A2R10G10B10";
+    case 36: return "A16B16G16R16";
+    case 75: return "D24S8";
+    case 77: return "D24X8";
+    case 80: return "D16";
+    case 111: return "R16F";
+    case 112: return "G16R16F";
+    case 113: return "A16B16G16R16F";
+    case 114: return "R32F";
+    case 115: return "G32R32F";
+    case 116: return "A32B32G32R32F";
+    }
+    if (f > 0xffff)
+    {
+        memcpy(buf, &f, 4);
+        buf[4] = 0;
+        return buf;
+    }
+    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "fmt%lu", f);
+    return buf;
+}
+static float g_psC[32][4];          // pixel shader constants c0-c31 as last set, and who set them
+static void* g_psCaller[32];
+static void ds_where(DWORD a)   // a return address: relinked function (original address) or raw
+{
+    DWORD lo = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.front().relinked;
+    DWORD hi = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.back().relinked + 0x10000;
+    if (a >= lo && a < hi) fpu_trap_where("caller", a);
+    else fprintf(g_log, " caller %08lx", a);
+}
+static bool ds_desc(void* s, DsDesc* d)
+{
+    memset(d, 0, sizeof(*d));
+    return s && ds_vcall<HRESULT>(s, 12, d) >= 0;
+}
+static void ds_log_surf(const char* what, void* s)
+{
+    DsDesc d;
+    if (!s) fprintf(g_log, " %s null", what);
+    else if (ds_desc(s, &d))
+        fprintf(g_log, " %s %p %ux%u %s usage %lx pool %lu ms %lu", what, s, d.Width, d.Height, ds_fmt(d.Format), d.Usage,
+                d.Pool, d.MultiSampleType);
+    else fprintf(g_log, " %s %p (no desc)", what, s);
+}
+static float ds_h2f(WORD h)
+{
+    DWORD s = (h & 0x8000u) << 16, e = (h >> 10) & 0x1f, m = h & 0x3ff, f;
+    if (e == 0)
+    {
+        if (!m) f = s;
+        else
+        {
+            e = 113;
+            while (!(m & 0x400)) { m <<= 1; --e; }
+            f = s | (e << 23) | ((m & 0x3ff) << 13);
+        }
+    }
+    else if (e == 31) f = s | 0x7f800000u | (m << 13);
+    else f = s | ((e + 112) << 23) | (m << 13);
+    float r;
+    memcpy(&r, &f, 4);
+    return r;
+}
+static bool ds_pixel(DWORD fmt, const BYTE* p, float* c, int* nch)   // -> RGBA floats
+{
+    c[0] = c[1] = c[2] = 0; c[3] = 1;
+    switch (fmt)
+    {
+    case 21: case 22:
+        c[2] = p[0] / 255.f; c[1] = p[1] / 255.f; c[0] = p[2] / 255.f; c[3] = fmt == 21 ? p[3] / 255.f : 1; *nch = 4; return true;
+    case 35: { DWORD v = *(const DWORD*)p; c[2] = (v & 1023) / 1023.f; c[1] = ((v >> 10) & 1023) / 1023.f;
+               c[0] = ((v >> 20) & 1023) / 1023.f; c[3] = (v >> 30) / 3.f; *nch = 4; return true; }
+    case 23: { WORD v = *(const WORD*)p; c[2] = (v & 31) / 31.f; c[1] = ((v >> 5) & 63) / 63.f; c[0] = (v >> 11) / 31.f; *nch = 3; return true; }
+    case 111: c[0] = ds_h2f(*(const WORD*)p); *nch = 1; return true;
+    case 112: c[0] = ds_h2f(((const WORD*)p)[0]); c[1] = ds_h2f(((const WORD*)p)[1]); *nch = 2; return true;
+    case 113: for (int i = 0; i < 4; ++i) c[i] = ds_h2f(((const WORD*)p)[i]); *nch = 4; return true;
+    case 114: c[0] = *(const float*)p; *nch = 1; return true;
+    case 115: c[0] = ((const float*)p)[0]; c[1] = ((const float*)p)[1]; *nch = 2; return true;
+    case 116: for (int i = 0; i < 4; ++i) c[i] = ((const float*)p)[i]; *nch = 4; return true;
+    }
+    return false;
+}
+static int ds_bpp(DWORD fmt)
+{
+    switch (fmt)
+    {
+    case 21: case 22: case 35: case 112: case 114: return 4;
+    case 23: case 111: return 2;
+    case 113: case 115: return 8;
+    case 116: return 16;
+    }
+    return 0;
+}
+static void ds_dump_surface(void* dev, void* src, const char* why)
+{
+    if (!src || g_dumpFileN >= 120) return;
+    DsDesc d;
+    if (!ds_desc(src, &d)) return;
+    int n = ++g_dumpFileN;
+    fprintf(g_log, "[dump]   readback #%02d (%s) of %p %ux%u %s:", n, why, src, d.Width, d.Height, ds_fmt(d.Format));
+    if (!ds_bpp(d.Format)) { fprintf(g_log, " format not handled\n"); return; }
+    void* rd = src;
+    void* tmp = nullptr;
+    void* sys = nullptr;
+    HRESULT hr;
+    if (d.MultiSampleType)
+    {
+        hr = ds_vcall<HRESULT>(dev, 28, d.Width, d.Height, d.Format, (DWORD)0, (DWORD)0, (BOOL)FALSE, &tmp, (HANDLE*)nullptr);
+        if (hr < 0 || (hr = g_realStretch(dev, src, nullptr, tmp, nullptr, 0)) < 0)
+        {
+            fprintf(g_log, " MSAA resolve failed %08lx\n", hr);
+            if (tmp) ds_vcall<ULONG>(tmp, 2);
+            return;
+        }
+        rd = tmp;
+    }
+    hr = ds_vcall<HRESULT>(dev, 36, d.Width, d.Height, d.Format, (DWORD)2 /* SYSTEMMEM */, &sys, (HANDLE*)nullptr);
+    if (hr >= 0) hr = ds_vcall<HRESULT>(dev, 32, rd, sys);
+    DsLocked lr = {};
+    if (hr >= 0) hr = ds_vcall<HRESULT>(sys, 13, &lr, (const RECT*)nullptr, (DWORD)0x10 /* READONLY */);
+    if (hr < 0)
+    {
+        fprintf(g_log, " readback failed %08lx\n", hr);
+        if (sys) ds_vcall<ULONG>(sys, 2);
+        if (tmp) ds_vcall<ULONG>(tmp, 2);
+        return;
+    }
+    UINT w = d.Width, h = d.Height, rowb = (w * 3 + 3) & ~3u;
+    std::vector<BYTE> bmp(54 + rowb * h);
+    BYTE* hd = bmp.data();
+    hd[0] = 'B'; hd[1] = 'M';
+    *(DWORD*)(hd + 2) = (DWORD)bmp.size(); *(DWORD*)(hd + 10) = 54; *(DWORD*)(hd + 14) = 40;
+    *(LONG*)(hd + 18) = (LONG)w; *(LONG*)(hd + 22) = (LONG)h; *(WORD*)(hd + 26) = 1; *(WORD*)(hd + 28) = 24;
+    *(DWORD*)(hd + 34) = rowb * h;
+    double sum[4] = {}, mn[4], mx[4];
+    for (int i = 0; i < 4; ++i) { mn[i] = 1e30; mx[i] = -1e30; }
+    unsigned long nonfinite = 0;
+    int nch = 4, bpp = ds_bpp(d.Format);
+    for (UINT y = 0; y < h; ++y)
+    {
+        const BYTE* row = (const BYTE*)lr.pBits + (size_t)y * lr.Pitch;
+        BYTE* out = hd + 54 + (size_t)(h - 1 - y) * rowb;
+        for (UINT x = 0; x < w; ++x)
+        {
+            float c[4];
+            ds_pixel(d.Format, row + x * bpp, c, &nch);
+            for (int i = 0; i < 4; ++i)
+            {
+                if (!(c[i] == c[i]) || c[i] > 1e30f || c[i] < -1e30f) { ++nonfinite; c[i] = 0; }
+                sum[i] += c[i];
+                if (c[i] < mn[i]) mn[i] = c[i];
+                if (c[i] > mx[i]) mx[i] = c[i];
+            }
+            float r = c[0], g = nch >= 2 ? c[1] : c[0], b = nch >= 3 ? c[2] : nch == 1 ? c[0] : 0;
+            out[x * 3 + 0] = (BYTE)(b <= 0 ? 0 : b >= 1 ? 255 : b * 255 + 0.5f);
+            out[x * 3 + 1] = (BYTE)(g <= 0 ? 0 : g >= 1 ? 255 : g * 255 + 0.5f);
+            out[x * 3 + 2] = (BYTE)(r <= 0 ? 0 : r >= 1 ? 255 : r * 255 + 0.5f);
+        }
+    }
+    ds_vcall<HRESULT>(sys, 14);
+    ds_vcall<ULONG>(sys, 2);
+    if (tmp) ds_vcall<ULONG>(tmp, 2);
+    double np = (double)w * h;
+    static const char* ch = "RGBA";
+    for (int i = 0; i < nch; ++i)
+        fprintf(g_log, " %c mean %.4g min %.4g max %.4g", ch[i], sum[i] / np, mn[i], mx[i]);
+    if (nonfinite) fprintf(g_log, " nonfinite %lu", nonfinite);
+    char path[MAX_PATH];
+    _snprintf_s(path, sizeof(path), _TRUNCATE, "%s\\%02d_%ux%u_%s.bmp", g_dumpDir, n, w, h, ds_fmt(d.Format));
+    if (FILE* f = fopen(path, "wb"))
+    {
+        fwrite(bmp.data(), 1, bmp.size(), f);
+        fclose(f);
+        fprintf(g_log, " -> %s\n", path);
+    }
+    else fprintf(g_log, " (cannot write %s)\n", path);
+    fflush(g_log);
+}
+static void* ds_cur_rt(void* dev)
+{
+    void* s = nullptr;
+    if (ds_vcall<HRESULT>(dev, 38, (DWORD)0, &s) < 0) return nullptr;
+    if (s) ds_vcall<ULONG>(s, 2);   // the device keeps its own reference
+    return s;
+}
+static void ds_seg_begin(void* dev)
+{
+    g_dumpRT = ds_cur_rt(dev);
+    ++g_dumpSeg;
+    g_dumpSegDraws = g_dumpDetail = 0;
+    void* ds = nullptr;
+    if (ds_vcall<HRESULT>(dev, 40, &ds) >= 0 && ds) ds_vcall<ULONG>(ds, 2);
+    fprintf(g_log, "[dump] segment %d:", g_dumpSeg);
+    ds_log_surf("RT0", g_dumpRT);
+    ds_log_surf("DS", ds);
+    fputc('\n', g_log);
+}
+static void ds_seg_end(void* dev, const char* why)
+{
+    fprintf(g_log, "[dump] segment %d ends (%s): %d draws\n", g_dumpSeg, why, g_dumpSegDraws);
+    if (g_dumpRT) ds_dump_surface(dev, g_dumpRT, why);
+}
+static DWORD ds_rs(void* dev, DWORD s)
+{
+    DWORD v;
+    if (ds_vcall<HRESULT>(dev, 58, s, &v) >= 0) return v;
+    return g_rsShadow[s & 255];
+}
+static void ds_dump_draw(void* dev, const char* kind, UINT prims, void* ret)
+{
+    ++g_dumpSegDraws;
+    if (g_dumpDetail >= 4) return;
+    ++g_dumpDetail;
+    DsViewport vp = g_vpShadow;
+    ds_vcall<HRESULT>(dev, 48, &vp);
+    RECT sc = g_scShadow;
+    ds_vcall<HRESULT>(dev, 76, &sc);
+    fprintf(g_log, "[dump]   %s #%d prims %u: Z %lu func %lu write %lu | blend %lu src %lu dst %lu op %lu sepA %lu | atest %lu "
+                   "ref %lu func %lu | cwrite %lx cull %lu stencil %lu srgb %lu | scissor %lu (%ld,%ld)-(%ld,%ld) | vp %lu,%lu %lux%lu z %g..%g"
+                   " | VS %p PS %p tex %p %p %p %p",
+            kind, g_dumpSegDraws, prims, ds_rs(dev, 7), ds_rs(dev, 23), ds_rs(dev, 14), ds_rs(dev, 27), ds_rs(dev, 19),
+            ds_rs(dev, 20), ds_rs(dev, 171), ds_rs(dev, 206), ds_rs(dev, 15), ds_rs(dev, 24), ds_rs(dev, 25),
+            ds_rs(dev, 168), ds_rs(dev, 22), ds_rs(dev, 52), ds_rs(dev, 194), ds_rs(dev, 174), sc.left, sc.top, sc.right,
+            sc.bottom, vp.X, vp.Y, vp.Width, vp.Height, vp.MinZ, vp.MaxZ, g_dsVS, g_dsPS, g_dsTex[0], g_dsTex[1],
+            g_dsTex[2], g_dsTex[3]);
+    for (int i = 0; i < 4; ++i)   // a texture's level-0 surface: matches an RT0 / StretchRect destination above
+    {
+        void* t = g_dsTex[i];
+        void* s = nullptr;
+        if (t && ds_vcall<DWORD>(t, 10) == 3 /* D3DRTYPE_TEXTURE */ && ds_vcall<HRESULT>(t, 18, (UINT)0, &s) >= 0 && s)
+        {
+            fprintf(g_log, " [t%d surf %p]", i, s);
+            ds_vcall<ULONG>(s, 2);
+        }
+    }
+    ds_where((DWORD)ret);
+    fputc('\n', g_log);
+    for (int r = 0; r < 32; ++r)
+        if (g_psCaller[r])
+        {
+            fprintf(g_log, "[dump]     PS c%d = %g %g %g %g", r, g_psC[r][0], g_psC[r][1], g_psC[r][2], g_psC[r][3]);
+            ds_where((DWORD)g_psCaller[r]);
+            fputc('\n', g_log);
+        }
+}
+// Image space state behind the final HDR / cinematic pass: the ImageSpaceManager singleton ([0x011f91ac]) as floats
+// (blended parameters +0x14, multiplicative/additive modifier sets +0xb4/+0x14c, tint/fade accumulators +0x214..+0x25c)
+// and the active image space modifier instances (TES [0x011dea10] +0x6c, a BSSimpleList of instance pointers).
+// The intro quests that own the white/black image space modifiers (VCG00 stage 0 applies WhiteISFX and
+// MQ08AllBlackedOutISFX, its quest script timer walks 90 -> 95 -> 100, stage 100 removes the blackout and starts
+// VCG01, whose stage 0 removes WhiteISFX): flags, delay, current stage and the quest script variables.
+static void ds_dump_quests()
+{
+    typedef void*(__cdecl * LookupFn)(DWORD);
+    static LookupFn lookup = (LookupFn)relinked(0x004839c0);
+    if (!lookup) return;
+    static const DWORD ids[] = {0x102037, 0x104c1c};
+    for (DWORD id : ids)
+    {
+        BYTE* q = (BYTE*)lookup(id);
+        if (!q || IsBadReadPtr(q, 0x70)) { fprintf(g_log, "[quest] %06lx not found\n", id); continue; }
+        fprintf(g_log, "[quest] %06lx %p type %02x flags %02x delay %g stage %u script %08lx evlist %08lx |",
+                id, q, q[4], q[0x3c], *(float*)(q + 0x40), q[0x60], *(DWORD*)(q + 0x1c), *(DWORD*)(q + 0x5c));
+        DWORD ev = *(DWORD*)(q + 0x5c);
+        if (ev && !IsBadReadPtr((void*)ev, 0x14))
+        {
+            DWORD node = ((DWORD*)ev)[3];   // tList<ScriptVar>: {var, next}; ScriptVar {id, next, double}
+            for (int k = 0; node && k < 12 && !IsBadReadPtr((void*)node, 8); ++k, node = ((DWORD*)node)[1])
+            {
+                DWORD v = ((DWORD*)node)[0];
+                if (v && !IsBadReadPtr((void*)v, 16)) fprintf(g_log, " v%lu=%g", ((DWORD*)v)[0], *(double*)(v + 8));
+            }
+        }
+        fputc('\n', g_log);
+    }
+}
+static void ds_dump_ism(const char* when)
+{
+    ds_dump_quests();
+    fprintf(g_log, "[dump] image space state (%s): modifier time %g\n", when, *(volatile float*)0x011c96fc);
+    DWORD ism = *(DWORD*)0x011f91ac;
+    if (ism && !IsBadReadPtr((void*)ism, 0x280))
+        for (DWORD o = 0; o < 0x280; o += 0x20)
+        {
+            fprintf(g_log, "[dump]   ism+%03lx:", o);
+            for (DWORD k = 0; k < 0x20; k += 4)
+            {
+                DWORD v = *(DWORD*)(ism + o + k);
+                float f;
+                memcpy(&f, &v, 4);
+                if (v && (v >> 23 & 0xff) > 0x60 && (v >> 23 & 0xff) < 0x98) fprintf(g_log, " %g", f);
+                else fprintf(g_log, " %lx", v);
+            }
+            fputc('\n', g_log);
+        }
+    DWORD tes = *(DWORD*)0x011dea10;
+    if (!tes || IsBadReadPtr((void*)(tes + 0x6c), 8)) return;
+    DWORD node = tes + 0x6c;
+    for (int k = 0; node && k < 32 && !IsBadReadPtr((void*)node, 8); ++k, node = ((DWORD*)node)[1])
+    {
+        DWORD inst = ((DWORD*)node)[0];
+        if (!inst || IsBadReadPtr((void*)inst, 0x40)) { fprintf(g_log, "[dump]   imod #%d %08lx\n", k, inst); continue; }
+        fprintf(g_log, "[dump]   imod #%d %08lx:", k, inst);
+        for (int w = 0; w < 16; ++w)
+        {
+            DWORD v = ((DWORD*)inst)[w];
+            float f;
+            memcpy(&f, &v, 4);
+            if (v && (v >> 23 & 0xff) > 0x60 && (v >> 23 & 0xff) < 0x98) fprintf(g_log, " %g", f);
+            else fprintf(g_log, " %lx", v);
+        }
+        for (int w = 1; w < 16; ++w)   // form pointers in the instance: their form ids
+        {
+            DWORD p = ((DWORD*)inst)[w];
+            if (p > 0x10000 && !IsBadReadPtr((void*)p, 0x10) && *(DWORD*)p >= 0x01000000 && *(DWORD*)p < 0x01100000)
+                fprintf(g_log, " [w%d vt %08lx id %08lx type %02x]", w, *(DWORD*)p, ((DWORD*)p)[3], ((BYTE*)p)[4]);
+        }
+        fputc('\n', g_log);
+    }
+    fflush(g_log);
+}
+static HRESULT WINAPI ds_SetRT(void* d, DWORD i, void* s)
+{
+    InterlockedIncrement(&g_dsRTsets);
+    if (!s && i == 0) InterlockedIncrement(&g_dsRTnull);
+    if (g_dumpState != 2) return g_realSetRT(d, i, s);
+    fprintf(g_log, "[dump] SetRenderTarget(%lu)", i);
+    ds_log_surf("->", s);
+    ds_where((DWORD)_ReturnAddress());
+    fputc('\n', g_log);
+    if (i == 0 && s != g_dumpRT) ds_seg_end(d, "target switch");
+    HRESULT hr = g_realSetRT(d, i, s);
+    if (i == 0 && s != g_dumpRT) ds_seg_begin(d);
+    return hr;
+}
+static HRESULT WINAPI ds_SetDS(void* d, void* s)
+{
+    if (g_dumpState == 2)
+    {
+        fprintf(g_log, "[dump] SetDepthStencilSurface");
+        ds_log_surf("->", s);
+        ds_where((DWORD)_ReturnAddress());
+        fputc('\n', g_log);
+    }
+    return g_realSetDS(d, s);
+}
+static HRESULT WINAPI ds_Stretch(void* d, void* src, const RECT* sr, void* dst, const RECT* dr, DWORD filt)
+{
+    if (g_dumpState != 2) return g_realStretch(d, src, sr, dst, dr, filt);
+    fprintf(g_log, "[dump] StretchRect");
+    ds_log_surf("src", src);
+    if (sr) fprintf(g_log, " (%ld,%ld)-(%ld,%ld)", sr->left, sr->top, sr->right, sr->bottom);
+    ds_log_surf("dst", dst);
+    if (dr) fprintf(g_log, " (%ld,%ld)-(%ld,%ld)", dr->left, dr->top, dr->right, dr->bottom);
+    fprintf(g_log, " filter %lu", filt);
+    ds_where((DWORD)_ReturnAddress());
+    HRESULT hr = g_realStretch(d, src, sr, dst, dr, filt);
+    fprintf(g_log, " -> %08lx\n", hr);
+    DsDesc dd;
+    if (hr >= 0 && ds_desc(dst, &dd) && (dd.Usage & 1)) ds_dump_surface(d, dst, "StretchRect dst");
+    return hr;
+}
+static HRESULT WINAPI ds_SetRS(void* d, DWORD s, DWORD v) { g_rsShadow[s & 255] = v; return g_realSetRS(d, s, v); }
+static HRESULT WINAPI ds_SetVP(void* d, const DsViewport* v) { if (v) g_vpShadow = *v; return g_realSetVP(d, v); }
+static HRESULT WINAPI ds_SetSc(void* d, const RECT* r) { if (r) g_scShadow = *r; return g_realSetSc(d, r); }
+static HRESULT WINAPI ds_EndScene(void* d)
+{
+    if (g_dumpState == 2) fprintf(g_log, "[dump] EndScene (segment %d, %d draws so far)\n", g_dumpSeg, g_dumpSegDraws);
+    return g_realEndScene(d);
+}
+static volatile LONG g_dsConstNaN, g_dsConstSets, g_dsConstZeroWVP;
+static float g_dsC0[16];
+static volatile LONG g_dsC0Taken;
+static volatile LONG g_dsPSNaN, g_dsNaNLogged;
+// FNV_FPU_TRAP=1 (with FNV_D3D_STATS=1): x87 invalid-operation exceptions are unmasked on the render thread while
+// game code runs (re-armed when each hooked D3D call returns, masked again while D3D itself runs). A stack fault (a
+// pop of an empty register: a caller storing an st0 result its callee never pushed, or a push onto a full stack)
+// then traps; the handler logs the faulting instruction (FPU last-instruction pointer) once per site with the
+// relinked code pointers on the stack, masks the exception and lets the game continue.
+static int g_fpuTrap = -1;
+static DWORD g_fpuTrapSeen[256];
+static volatile LONG g_fpuTrapN, g_fpuTrapLock;
+static void fpu_trap_where(const char* what, DWORD a)
+{
+    auto it = std::upper_bound(g_byPtr.begin(), g_byPtr.end(), (void*)a,
+                               [](void* p, const AddrEntry& e) { return p < e.relinked; });
+    if (it != g_byPtr.begin())
+    {
+        --it;
+        fprintf(g_log, " %s %08lx (fnv_f_%08lx+0x%lx)", what, a, it->original, a - (DWORD)it->relinked);
+    }
+    else
+        fprintf(g_log, " %s %08lx", what, a);
+}
+static LONG CALLBACK fpu_trap_handler(EXCEPTION_POINTERS* ep)
+{
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != STATUS_FLOAT_STACK_CHECK && code != STATUS_FLOAT_INVALID_OPERATION)
+        return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    BYTE* fx = (c->ContextFlags & CONTEXT_EXTENDED_REGISTERS) == CONTEXT_EXTENDED_REGISTERS ? c->ExtendedRegisters : nullptr;
+    DWORD fip = fx ? *(DWORD*)(fx + 8) : c->FloatSave.ErrorOffset;
+    DWORD sw = fx ? *(WORD*)(fx + 2) : c->FloatSave.StatusWord;
+    DWORD op = fx ? *(WORD*)(fx + 6) : (c->FloatSave.ErrorSelector >> 16) & 0x7ff;
+    while (InterlockedCompareExchange(&g_fpuTrapLock, 1, 0)) {}
+    bool fresh = true;
+    for (LONG i = 0; i < g_fpuTrapN && fresh; ++i)
+        fresh = g_fpuTrapSeen[i] != fip;
+    if (fresh && g_fpuTrapN < 256)
+        g_fpuTrapSeen[g_fpuTrapN++] = fip;
+    if (fresh && g_fpuTrapN <= 64)
+    {
+        fprintf(g_log, "[fputrap] %s (%s) thread %lu sw %04lx tags %04lx opcode %03lx:",
+                code == STATUS_FLOAT_STACK_CHECK ? "x87 stack fault" : "x87 invalid operation",
+                code == STATUS_FLOAT_STACK_CHECK ? ((sw & 0x200) ? "overflow" : "underflow") : "operand",
+                GetCurrentThreadId(), sw, (DWORD)c->FloatSave.TagWord & 0xffff, op);
+        fpu_trap_where("fip", fip);
+        fpu_trap_where("trapped at", c->Eip);
+        fputc('\n', g_log);
+        DWORD* sp = (DWORD*)c->Esp;
+        DWORD lo = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.front().relinked;
+        DWORD hi = g_byPtr.empty() ? 0 : (DWORD)g_byPtr.back().relinked + 0x10000;
+        int shown = 0;
+        fprintf(g_log, "[fputrap]   stack:");
+        for (int i = 0; i < 512 && shown < 8 && !IsBadReadPtr(sp + i, 4); ++i)
+            if (sp[i] >= lo && sp[i] < hi)
+            {
+                fpu_trap_where("", sp[i]);
+                ++shown;
+            }
+        fputc('\n', g_log);
+        fflush(g_log);
+    }
+    InterlockedExchange(&g_fpuTrapLock, 0);
+    // mask IM and drop the pending exception: the trapping instruction then runs normally (the faulting one was
+    // suppressed, as an unmasked invalid operation leaves its destination and TOP unchanged)
+    c->FloatSave.ControlWord |= 1;
+    c->FloatSave.StatusWord &= ~0x80ffu;
+    if (fx)
+    {
+        *(WORD*)fx |= 1;
+        *(WORD*)(fx + 2) &= ~0x80ff;
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+static bool fpu_trap_on()
+{
+    if (g_fpuTrap < 0)
+    {
+        g_fpuTrap = getenv("FNV_FPU_TRAP") && *getenv("FNV_FPU_TRAP") == '1';
+        if (g_fpuTrap)
+        {
+            AddVectoredExceptionHandler(1, fpu_trap_handler);
+            fprintf(g_log, "[fputrap] FNV_FPU_TRAP=1: x87 invalid-operation exceptions unmasked on the render thread\n");
+        }
+    }
+    return g_fpuTrap > 0;
+}
+static void fpu_mask()     // entering a hooked D3D call (fldcw raises any pending unmasked exception first)
+{
+    if (!fpu_trap_on()) return;
+    unsigned short cw;
+    __asm { fnstcw cw }
+    if (!(cw & 1)) { cw |= 1; __asm { fldcw cw } }
+}
+static void fpu_unmask()   // back to game code
+{
+    if (!fpu_trap_on()) return;
+    unsigned short cw;
+    __asm { fnstcw cw }
+    if (cw & 1) { cw &= ~1; __asm { fnclex } __asm { fldcw cw } }
+}
+static void ds_nan_note(const char* kind, UINT reg, const float* v, UINT n)
+{
+    if (InterlockedIncrement(&g_dsNaNLogged) > 12) return;
+    unsigned short env[14];   // fnstenv: control, status, tag words first (x87 stack depth at the bad upload)
+    __asm { fnstenv env }
+    __asm { fldcw env }
+    char buf[400];
+    int k = _snprintf_s(buf, sizeof(buf), _TRUNCATE, "[d3d]   NaN/inf %s constants c%u (x%u), caller %p, fpu status %04x top %u tags %04x:",
+                        kind, reg, n, _ReturnAddress(), env[2], (env[2] >> 11) & 7, env[4]);
+    for (UINT i = 0; i < n * 4 && i < 16 && k > 0 && k < 360; ++i) k += _snprintf_s(buf + k, sizeof(buf) - k, _TRUNCATE, " %g", v[i]);
+    fprintf(g_log, "%s\n", buf);
+}
+static bool ds_bad(const float* v, UINT n)
+{
+    for (UINT i = 0; i < n * 4; ++i)
+        if (v[i] != v[i] || v[i] > 1e30f || v[i] < -1e30f) return true;
+    return false;
+}
+static D3DSetConstFn g_realSetPSConst;
+static HRESULT WINAPI ds_SetPSConst(void* d, UINT reg, const float* v, UINT n)
+{
+    fpu_mask();
+    if (ds_bad(v, n)) { InterlockedIncrement(&g_dsPSNaN); ds_nan_note("PS", reg, v, n); }
+    for (UINT i = 0; i < n && reg + i < 32; ++i)
+    {
+        memcpy(g_psC[reg + i], v + 4 * i, 16);
+        g_psCaller[reg + i] = _ReturnAddress();
+    }
+    HRESULT hr = g_realSetPSConst(d, reg, v, n);
+    fpu_unmask();
+    return hr;
+}
+static HRESULT WINAPI ds_SetVSConst(void* d, UINT reg, const float* v, UINT n)
+{
+    fpu_mask();
+    InterlockedIncrement(&g_dsConstSets);
+    if (ds_bad(v, n)) { InterlockedIncrement(&g_dsConstNaN); ds_nan_note("VS", reg, v, n); }
+    if (reg == 0 && n >= 4)
+    {
+        bool zero = true;
+        for (int i = 0; i < 16; ++i) zero = zero && v[i] == 0.0f;
+        if (zero) InterlockedIncrement(&g_dsConstZeroWVP);
+        if (!InterlockedExchange(&g_dsC0Taken, 1)) memcpy(g_dsC0, v, sizeof(g_dsC0));
+    }
+    HRESULT hr = g_realSetVSConst(d, reg, v, n);
+    fpu_unmask();
+    return hr;
+}
+static volatile LONG g_dsDraws, g_dsPrims, g_dsNoVS, g_dsNoPS, g_dsScenes, g_dsVSmade, g_dsPSmade, g_dsVSfail, g_dsPSfail,
+    g_dsClears, g_dsFrames;
+static void ds_draw(void* d, const char* kind, UINT prims, void* ret)
+{
+    ++g_frameDraws;
+    if (g_dumpState == 2) ds_dump_draw(d, kind, prims, ret);
+    InterlockedIncrement(&g_dsDraws);
+    InterlockedExchangeAdd(&g_dsPrims, (LONG)prims);
+    if (!g_dsVS) InterlockedIncrement(&g_dsNoVS);
+    if (!g_dsPS) InterlockedIncrement(&g_dsNoPS);
+    if (!g_dsTex0) InterlockedIncrement(&g_dsNoTex0);
+}
+static HRESULT WINAPI ds_Present(void* d, const RECT* a, const RECT* b, HWND w, const void* r)
+{
+    fpu_mask();
+    LONG f = InterlockedIncrement(&g_dsFrames);
+    if (g_dumpState == 2)
+    {
+        fprintf(g_log, "[dump] Present (frame %ld, %ld draws)\n", f, g_frameDraws);
+        ds_seg_end(d, "Present");
+        ds_dump_ism("Present");
+        fprintf(g_log, "[dump] frame %ld done: %d segments, %d readbacks\n", f, g_dumpSeg, g_dumpFileN);
+        fflush(g_log);
+        g_dumpState = 3;
+    }
+    else if (g_dumpState == 1)
+    {
+        bool go = false;
+        if (g_dumpFrame >= 0) go = f + 1 == g_dumpFrame;
+        else if (g_dumpTagHit && g_frameDraws >= 200) go = ++g_dumpHeavy >= g_dumpSkip;
+        if (go)
+        {
+            g_dumpState = 2;
+            fprintf(g_log, "[dump] FNV_D3D_DUMP: dumping frame %ld (previous frame had %ld draws) to %s\n", f + 1, g_frameDraws, g_dumpDir);
+            ds_dump_ism("frame start");
+            ds_seg_begin(d);
+        }
+    }
+    g_frameDraws = 0;
+    if (f % 120 == 0)
+    {
+        unsigned short env[14];   // x87 stack at Present: compiled callers keep it empty across calls
+        __asm { fnstenv env }
+        __asm { fldenv env }
+        fprintf(g_log, "[d3d] x87 at Present: status %04x top %u tags %04x; image space modifier time (0x011c96fc) %g\n",
+                env[2], (env[2] >> 11) & 7, env[4], *(volatile float*)0x011c96fc);
+        if (g_dumpState) ds_dump_quests();
+        fprintf(g_log, "[d3d] frames %ld: last 120 -> scenes %ld draws %ld prims %ld (no VS %ld, no PS %ld) clears %ld; "
+                       "shaders made VS %ld (fail %ld) PS %ld (fail %ld)\n",
+                f, InterlockedExchange(&g_dsScenes, 0), InterlockedExchange(&g_dsDraws, 0), InterlockedExchange(&g_dsPrims, 0),
+                InterlockedExchange(&g_dsNoVS, 0), InterlockedExchange(&g_dsNoPS, 0), InterlockedExchange(&g_dsClears, 0),
+                g_dsVSmade, g_dsVSfail, g_dsPSmade, g_dsPSfail);
+        fprintf(g_log, "[d3d]   VS constants: %ld sets, %ld with NaN/inf, %ld all-zero c0-c3; sample c0-c3 %g %g %g %g | %g %g %g %g | %g %g %g %g | %g %g %g %g\n",
+                InterlockedExchange(&g_dsConstSets, 0), InterlockedExchange(&g_dsConstNaN, 0),
+                InterlockedExchange(&g_dsConstZeroWVP, 0), g_dsC0[0], g_dsC0[1], g_dsC0[2], g_dsC0[3], g_dsC0[4], g_dsC0[5],
+                g_dsC0[6], g_dsC0[7], g_dsC0[8], g_dsC0[9], g_dsC0[10], g_dsC0[11], g_dsC0[12], g_dsC0[13], g_dsC0[14],
+                g_dsC0[15]);
+        InterlockedExchange(&g_dsC0Taken, 0);
+        fprintf(g_log, "[d3d]   draws with no texture on stage 0: %ld; SetRenderTarget calls %ld (null RT0 %ld); PS consts with NaN/inf %ld\n",
+                InterlockedExchange(&g_dsNoTex0, 0), InterlockedExchange(&g_dsRTsets, 0), InterlockedExchange(&g_dsRTnull, 0),
+                InterlockedExchange(&g_dsPSNaN, 0));
+        fflush(g_log);
+    }
+    HRESULT hr = g_realPresent(d, a, b, w, r);
+    fpu_unmask();
+    return hr;
+}
+static HRESULT WINAPI ds_BeginScene(void* d)
+{
+    InterlockedIncrement(&g_dsScenes);
+    if (g_dumpState == 2)
+    {
+        fprintf(g_log, "[dump] BeginScene");
+        ds_where((DWORD)_ReturnAddress());
+        fputc('\n', g_log);
+    }
+    return g_realBeginScene(d);
+}
+static HRESULT WINAPI ds_Draw(void* d, DWORD t, DWORD s, DWORD n) { ds_draw(d, "Draw", n, _ReturnAddress()); return g_realDraw(d, t, s, n); }
+static HRESULT WINAPI ds_DrawIdx(void* d, DWORD t, INT b, UINT mi, UINT nv, UINT si, UINT n)
+{
+    ds_draw(d, "DrawIdx", n, _ReturnAddress());
+    return g_realDrawIdx(d, t, b, mi, nv, si, n);
+}
+static HRESULT WINAPI ds_DrawUP(void* d, DWORD t, UINT n, const void* v, UINT s) { ds_draw(d, "DrawUP", n, _ReturnAddress()); return g_realDrawUP(d, t, n, v, s); }
+static HRESULT WINAPI ds_DrawIdxUP(void* d, DWORD t, UINT mi, UINT nv, UINT n, const void* i, DWORD f, const void* v, UINT s)
+{
+    ds_draw(d, "DrawIdxUP", n, _ReturnAddress());
+    return g_realDrawIdxUP(d, t, mi, nv, n, i, f, v, s);
+}
+static HRESULT WINAPI ds_SetVS(void* d, void* s) { g_dsVS = s; return g_realSetVS(d, s); }
+static HRESULT WINAPI ds_SetPS(void* d, void* s) { g_dsPS = s; return g_realSetPS(d, s); }
+static HRESULT WINAPI ds_CreateVS(void* d, const DWORD* f, void** o)
+{
+    HRESULT hr = g_realCreateVS(d, f, o);
+    InterlockedIncrement(hr < 0 ? &g_dsVSfail : &g_dsVSmade);
+    return hr;
+}
+static HRESULT WINAPI ds_CreatePS(void* d, const DWORD* f, void** o)
+{
+    HRESULT hr = g_realCreatePS(d, f, o);
+    InterlockedIncrement(hr < 0 ? &g_dsPSfail : &g_dsPSmade);
+    return hr;
+}
+static HRESULT WINAPI ds_Clear(void* d, DWORD n, const void* r, DWORD fl, DWORD c, float z, DWORD s)
+{
+    InterlockedIncrement(&g_dsClears);
+    if (g_dumpState == 2)
+    {
+        fprintf(g_log, "[dump] Clear(rects %lu, flags%s%s%s, color %08lx, z %g, stencil %lu) in segment %d after %d draws",
+                n, (fl & 1) ? " TARGET" : "", (fl & 2) ? " ZBUFFER" : "", (fl & 4) ? " STENCIL" : "", c, z, s, g_dumpSeg,
+                g_dumpSegDraws);
+        if (n && r) { const RECT* q = (const RECT*)r; fprintf(g_log, " rect0 (%ld,%ld)-(%ld,%ld)", q->left, q->top, q->right, q->bottom); }
+        ds_where((DWORD)_ReturnAddress());
+        fputc('\n', g_log);
+    }
+    return g_realClear(d, n, r, fl, c, z, s);
+}
+template <class F> static void ds_patch(void** vt, int slot, F& real, void* fn)
+{
+    real = (F)vt[slot];
+    DWORD old;
+    VirtualProtect(&vt[slot], 4, PAGE_READWRITE, &old);
+    vt[slot] = fn;
+    VirtualProtect(&vt[slot], 4, old, &old);
+}
+static HRESULT WINAPI ds_CreateDevice(void* d3d, UINT ad, DWORD type, HWND w, DWORD fl, void* pp, void** out)
+{
+    HRESULT hr = g_realCreateDevice(d3d, ad, type, w, fl, pp, out);
+    if (hr >= 0 && out && *out && !g_realPresent)
+    {
+        void** vt = *(void***)*out;
+        ds_patch(vt, 17, g_realPresent, (void*)&ds_Present);
+        ds_patch(vt, 41, g_realBeginScene, (void*)&ds_BeginScene);
+        ds_patch(vt, 43, g_realClear, (void*)&ds_Clear);
+        ds_patch(vt, 81, g_realDraw, (void*)&ds_Draw);
+        ds_patch(vt, 82, g_realDrawIdx, (void*)&ds_DrawIdx);
+        ds_patch(vt, 83, g_realDrawUP, (void*)&ds_DrawUP);
+        ds_patch(vt, 84, g_realDrawIdxUP, (void*)&ds_DrawIdxUP);
+        ds_patch(vt, 91, g_realCreateVS, (void*)&ds_CreateVS);
+        ds_patch(vt, 92, g_realSetVS, (void*)&ds_SetVS);
+        ds_patch(vt, 94, g_realSetVSConst, (void*)&ds_SetVSConst);
+        ds_patch(vt, 65, g_realSetTexture, (void*)&ds_SetTexture);
+        ds_patch(vt, 109, g_realSetPSConst, (void*)&ds_SetPSConst);
+        ds_patch(vt, 37, g_realSetRT, (void*)&ds_SetRT);
+        ds_patch(vt, 106, g_realCreatePS, (void*)&ds_CreatePS);
+        ds_patch(vt, 107, g_realSetPS, (void*)&ds_SetPS);
+        ds_patch(vt, 34, g_realStretch, (void*)&ds_Stretch);
+        ds_patch(vt, 39, g_realSetDS, (void*)&ds_SetDS);
+        ds_patch(vt, 42, g_realEndScene, (void*)&ds_EndScene);
+        ds_patch(vt, 47, g_realSetVP, (void*)&ds_SetVP);
+        ds_patch(vt, 57, g_realSetRS, (void*)&ds_SetRS);
+        ds_patch(vt, 75, g_realSetSc, (void*)&ds_SetSc);
+        ds_rs_defaults();
+        if (const char* e = getenv("FNV_D3D_DUMP"))
+        {
+            if (*e >= '0' && *e <= '9') g_dumpFrame = atol(e);
+            else g_dumpTag = e;
+            if (const char* k = getenv("FNV_D3D_DUMP_SKIP")) g_dumpSkip = atol(k);
+            if (const char* dir = getenv("FNV_D3D_DUMP_DIR")) _snprintf_s(g_dumpDir, sizeof(g_dumpDir), _TRUNCATE, "%s", dir);
+            else
+            {
+                GetModuleFileNameA(nullptr, g_dumpDir, MAX_PATH);   // out/link/FalloutNV_relinked.exe -> out/d3d_dump
+                if (char* sl = strrchr(g_dumpDir, '\\')) *sl = 0;
+                if (char* sl = strrchr(g_dumpDir, '\\')) *sl = 0;
+                strcat_s(g_dumpDir, "\\d3d_dump");
+            }
+            CreateDirectoryA(g_dumpDir, nullptr);
+            g_dumpState = 1;
+            fprintf(g_log, "[d3d] FNV_D3D_DUMP=%s armed (dir %s)\n", e, g_dumpDir);
+        }
+        fprintf(g_log, "[d3d] FNV_D3D_STATS: device %p wrapped\n", *out);
+        fflush(g_log);
+    }
+    return hr;
+}
+static void* WINAPI wrap_Direct3DCreate9(UINT sdk);
+// Gamebryo's NiDX9Renderer loads d3d9.dll and looks up Direct3DCreate9 itself
+FARPROC WINAPI wrap_GetProcAddress(HMODULE m, LPCSTR name)
+{
+    FARPROC f = GetProcAddress(m, name);
+    if (f && (ULONG_PTR)name > 0xffff && !strcmp(name, "Direct3DCreate9") && getenv("FNV_D3D_STATS"))
+    {
+        g_realD3DCreate9 = (D3DCreate9Fn)f;
+        return (FARPROC)&wrap_Direct3DCreate9;
+    }
+    return f;
+}
+static void* WINAPI wrap_Direct3DCreate9(UINT sdk)
+{
+    void* d3d = g_realD3DCreate9(sdk);
+    if (d3d && !g_realCreateDevice)
+        ds_patch(*(void***)d3d, 16, g_realCreateDevice, (void*)&ds_CreateDevice);
+    return d3d;
+}
+
 VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
 BOOL WINAPI wrap_TerminateProcess(HANDLE h, UINT code) { if (h == GetCurrentProcess()) log_exit_stack("TerminateProcess", code); return TerminateProcess(h, code); }
 
@@ -1258,7 +2072,7 @@ static void patch_dll_imports(HMODULE dll)
                        {"MessageBoxA", (void*)&wrap_MessageBoxA}, {"OutputDebugStringA", (void*)&wrap_OutputDebugStringA},
                        {"ExitProcess", (void*)&wrap_ExitProcess}, {"TerminateProcess", (void*)&wrap_TerminateProcess},
                        {"SHGetFolderPathA", (void*)&wrap_SHGetFolderPathA}, {"SetUnhandledExceptionFilter", (void*)&ignore_set_filter},
-                       {"VirtualAlloc", (void*)&wrap_VirtualAlloc}};
+                       {"VirtualAlloc", (void*)&wrap_VirtualAlloc}, {"GetProcAddress", (void*)&wrap_GetProcAddress}};
     auto base = (unsigned char*)dll;
     auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -1271,6 +2085,15 @@ static void patch_dll_imports(HMODULE dll)
         {
             if (names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32) continue;
             const char* nm = (const char*)(base + names[k].u1.AddressOfData) + 2;
+            if (!strcmp(nm, "Direct3DCreate9") && getenv("FNV_D3D_STATS"))   // the renderer is compiled code
+            {
+                if (!g_realD3DCreate9) g_realD3DCreate9 = (D3DCreate9Fn)slots[k].u1.Function;
+                DWORD old;
+                VirtualProtect(&slots[k], 4, PAGE_READWRITE, &old);
+                slots[k].u1.Function = (DWORD)&wrap_Direct3DCreate9;
+                VirtualProtect(&slots[k], 4, old, &old);
+                ++patched;
+            }
             for (const W& w : wraps)
                 if (!strcmp(nm, w.name))
                 {
@@ -1288,7 +2111,14 @@ static void patch_dll_imports(HMODULE dll)
 // FNV_SYSHEAP (default on; FNV_SYSHEAP=0 disables): route the game's MemoryManager (Allocate 0xaa3e40, Deallocate
 // 0xaa4060, Reallocate 0xaa4150, Size 0xaa44c0) to 16-byte-aligned CRT heap blocks, like the community heap
 // replacers do. The relinked pool allocator hands out overlapping small blocks; this takes it out of the picture.
-static void* __fastcall sysheap_alloc(void*, void*, size_t size) { return _aligned_malloc(size ? size : 1, 16); }
+static int g_heapZero = -1;   // FNV_HEAP_ZERO=1: zero-fill new blocks (A/B for reads of uninitialized heap)
+static void* __fastcall sysheap_alloc(void*, void*, size_t size)
+{
+    void* p = _aligned_malloc(size ? size : 1, 16);
+    if (g_heapZero < 0) g_heapZero = getenv("FNV_HEAP_ZERO") && *getenv("FNV_HEAP_ZERO") == '1';
+    if (g_heapZero && p) memset(p, 0, size ? size : 1);
+    return p;
+}
 static void __fastcall sysheap_free(void*, void*, void* p) { if (p) _aligned_free(p); }
 static void* __fastcall sysheap_realloc(void*, void*, void* p, size_t size)
 {
@@ -1564,6 +2394,8 @@ int main(int argc, char** argv)
                 }
                 if (g_bg)
                     WritePrivateProfileStringA("General", "bAlwaysActive", "1", dst);   // keep running unfocused
+                if (getenv("FNV_NO_HDR") && *getenv("FNV_NO_HDR") == '1')   // A/B test for the all-white world view
+                    WritePrivateProfileStringA("BlurShaderHDR", "bDoHighDynamicRange", "0", dst);
             }
     }
     const char* exe = getenv("FNV_EXE") ? getenv("FNV_EXE") : "E:\\Games\\Fallout New Vegas\\FalloutNV.exe";
@@ -1864,6 +2696,13 @@ int main(int argc, char** argv)
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetForegroundWindow")) f = (FARPROC)&wrap_SetForegroundWindow;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetWindowPos")) f = (FARPROC)&wrap_SetWindowPos;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "VirtualAlloc")) f = (FARPROC)&wrap_VirtualAlloc;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "GetProcAddress")) f = (FARPROC)&wrap_GetProcAddress;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "Direct3DCreate9") &&
+                getenv("FNV_D3D_STATS"))
+            {
+                g_realD3DCreate9 = (D3DCreate9Fn)f;
+                f = (FARPROC)&wrap_Direct3DCreate9;
+            }
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "DirectInput8Create") && input_init())
             {
                 g_realDiCreate = (DiCreateFn)f;

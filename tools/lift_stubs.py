@@ -1060,6 +1060,11 @@ LIFT_ENTRY = '''extern "C" __declspec(naked) void entry_{a:08x}(void)
         mov [ebp - 16], ebx
         mov [ebp - 12], esi
         mov [ebp - 8], edi
+        cmp dword ptr [fnv_fpu_check_on], 0
+        je no_check_in
+        push 0x{a:08x}
+        call fnv_fpu_entry_hook
+    no_check_in:
         lea eax, [ebp - 40]
         push eax
         lea eax, [ebp + 4]
@@ -1072,6 +1077,11 @@ LIFT_ENTRY = '''extern "C" __declspec(naked) void entry_{a:08x}(void)
         je no_fpu
         fld qword ptr [ebp - 24]
     no_fpu:
+        cmp dword ptr [fnv_fpu_check_on], 0
+        je no_check_out
+        push 0x{a:08x}
+        call fnv_fpu_exit_hook
+    no_check_out:
         mov ecx, [ebp - 28]
         mov eax, [ebp + 4]
         mov [ebp + ecx + 4], eax

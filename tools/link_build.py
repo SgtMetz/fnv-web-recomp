@@ -1388,8 +1388,13 @@ def main():
         print('   narrow-param lifts: %d' % sum(1 for a_ in np_ if owner.get(a_) is not None))
     # 0x4f1540 returns a raw type byte, but a chosen source declaration says bool. Both its
     # compiled body and callers mask AL to one bit, corrupting extra-data presence flags.
-    ctx['lift_replace'] |= {0x004F1540} | {f for f, calls in ctx['orig_calls'].items()
-                                           if 0x004F1540 in calls and owner.get(f) is not None}
+    # 0x9373f0 likewise (`mov al, [ecx]`, folded with ~100 byte getters): the chosen interface.cpp declaration is
+    # bool, so QuestStage::GetIndex came back as index & 1 and TESQuest::SetStage (0x60d510) never found stage 90
+    # or 5: the New Game intro quest VCG00 stalled at stage 0 with WhiteISFX + MQ08AllBlackedOutISFX applied (white
+    # world with HDR, black without).
+    raw_byte = {0x004F1540, 0x009373F0}
+    ctx['lift_replace'] |= raw_byte | {f for f, calls in ctx['orig_calls'].items()
+                                       if calls & raw_byte and owner.get(f) is not None}
     ctx['orig_data_refs'] = cached('orig_data_refs', exe_key, lambda: original_data_refs(img, units))
     # Functions that call a target through a declaration whose stack pop disagrees with the original callee: the
     # original relies on the difference (leaked pushes become later arguments), clang code cannot. Lift them.
