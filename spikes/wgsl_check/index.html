@@ -1,0 +1,31 @@
+<!doctype html><meta charset="utf-8"><title>WGSL browser check</title>
+<pre id="out">running…</pre>
+<script type="module">
+// Compiles every translated shader with the browser's own WGSL compiler (createShaderModule) and reports errors.
+// ?pkg=shaderpackage013 limits to one package (default: all that exist). Results: window.__result.
+const out = document.getElementById('out');
+const adapter = await navigator.gpu?.requestAdapter();
+if (!adapter) { out.textContent = 'no WebGPU adapter'; window.__result = { error: 'no adapter' }; throw 0; }
+const device = await adapter.requestDevice();
+const list = await (await fetch('/list')).json();
+const only = new URLSearchParams(location.search).get('pkg');
+const res = { adapter: adapter.info?.description || adapter.info?.vendor || '', total: 0, ok: 0, warnings: 0, failed: [] , perPkg: {} };
+for (const [pkg, files] of Object.entries(list)) {
+  if (only && pkg !== only) continue;
+  const p = res.perPkg[pkg] = { total: 0, ok: 0 };
+  for (let i = 0; i < files.length; i += 32) {
+    await Promise.all(files.slice(i, i + 32).map(async f => {
+      const code = await (await fetch(`/f/${pkg}/${encodeURIComponent(f)}`)).text();
+      const mod = device.createShaderModule({ code });
+      const info = await mod.getCompilationInfo();
+      const errs = info.messages.filter(m => m.type === 'error');
+      res.total++; p.total++;
+      res.warnings += info.messages.filter(m => m.type === 'warning').length;
+      if (errs.length) res.failed.push([pkg, f, errs[0].message.slice(0, 200)]); else { res.ok++; p.ok++; }
+    }));
+  }
+  out.textContent = JSON.stringify({ ...res, failed: res.failed.length }, null, 1);
+}
+window.__result = res;
+out.textContent = JSON.stringify({ ...res, failed: res.failed.slice(0, 20), failed_count: res.failed.length }, null, 1);
+</script>

@@ -51,9 +51,14 @@ repo root with `--directory`. `.gitattributes` has `*.patch -text` so patches ke
 - vFace arrives as `@builtin(front_facing)` bool, converted to +/-1 float in the body.
 - Package choice: the port should report NVIDIA SM3 + FP16 caps so the game selects package 013 (see PHASE0_REPORT.md).
 
+## Browser compile check (done)
+`spikes/wgsl_check/` (launch config `wgsl-check`, port 8660) fetches every `out/shaders/*/*.wgsl.gen` from a local-only
+server and calls `createShaderModule` + `getCompilationInfo`. Result in the built-in browser (Chromium WebGPU, AMD
+adapter): 15,791 / 15,791 compile, 0 errors, 0 warnings. `?pkg=shaderpackage013` limits it to one package;
+results are in `window.__result`. Tint also re-parses all of package 013 as WGSL input.
+
 ## Not verified / next steps
-- No GPU run: the WGSL has not been through a browser's WGSL validator or rendered. A cheap next step is feeding all
-  `*.wgsl.gen` to Dawn/Chrome `createShaderModule` and checking messages.
+- Nothing has been rendered with these shaders yet (compiling is not the same as drawing correctly).
 - A numeric check of `lit` against a reference (read only against the D3D9 formula so far).
 - Cache plan: translated shaders go in OPFS under `fnv/cache/` (web track); translation itself is offline (Python/zig +
   tint here), so the browser would ship pre-translated WGSL generated from the user's own files at import time or on first run.
