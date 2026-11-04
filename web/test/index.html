@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FNV Runtime Tests</title>
+<style>
+  :root { --bg: #fff; --fg: #1d1d1d; --ok: #2f7a3a; --fail: #b3261e; --muted: #666; color-scheme: light; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #181818; --fg: #e8e8e8; --ok: #6cc07a; --fail: #f2766b; --muted: #9a9a9a; color-scheme: dark; } }
+  :root[data-theme="dark"] { --bg: #181818; --fg: #e8e8e8; --ok: #6cc07a; --fail: #f2766b; --muted: #9a9a9a; color-scheme: dark; }
+  body { background: var(--bg); color: var(--fg); font: 13px/1.45 ui-monospace, Consolas, monospace; margin: 0; padding: 16px; }
+  ol { padding-left: 0; list-style: none; } li { white-space: pre-wrap; overflow-wrap: anywhere; }
+  .ok { color: var(--ok); } .fail { color: var(--fail); font-weight: bold; } .note { color: var(--muted); }
+  h1 { font-size: 16px; }
+</style>
+</head>
+<body>
+<h1>Importer and file layer tests — <span id="summary">running…</span></h1>
+<ol id="out"></ol>
+<pre id="perf"></pre>
+<script type="module" src="tests.js"></script>
+</body>
+</html>

@@ -1,0 +1,69 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FNV Web Runtime</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header>
+  <h1>New Vegas web runtime</h1>
+  <p class="sub">Imports your own install into this browser's private storage. Nothing is uploaded.</p>
+</header>
+<main>
+  <section id="caps" aria-labelledby="caps-h">
+    <h2 id="caps-h">Browser support</h2>
+    <ul id="cap-list" class="caps"></ul>
+  </section>
+
+  <section id="import" aria-labelledby="import-h">
+    <h2 id="import-h">Game files</h2>
+    <p id="import-status" class="muted">Checking storage…</p>
+    <div class="row">
+      <button id="pick" type="button">Choose install folder…</button>
+      <label class="button secondary" id="pick-fallback-label">Choose folder (fallback)
+        <input id="pick-fallback" type="file" webkitdirectory multiple hidden>
+      </label>
+      <button id="pick-dev" type="button" class="secondary" hidden>Use dev install</button>
+    </div>
+    <div id="plan" hidden>
+      <h3>What to import</h3>
+      <table class="groups"><thead><tr><th></th><th>Part</th><th class="num">Size</th><th>State</th></tr></thead><tbody id="group-rows"></tbody></table>
+      <ul id="messages" class="messages"></ul>
+      <div class="row">
+        <label>Quality preset
+          <select id="preset"><option>low</option><option>medium</option><option selected>high</option><option>VeryHigh</option></select>
+        </label>
+        <span id="storage" class="muted"></span>
+      </div>
+      <div class="row">
+        <button id="start" type="button">Import</button>
+        <button id="cancel" type="button" class="secondary" hidden>Cancel</button>
+      </div>
+      <div id="progress" hidden>
+        <progress id="bar" max="1" value="0"></progress>
+        <p id="progress-text" class="muted"></p>
+      </div>
+      <details><summary>Copy log</summary><ol id="log" class="log"></ol></details>
+    </div>
+  </section>
+
+  <section id="saves" aria-labelledby="saves-h">
+    <h2 id="saves-h">Saves</h2>
+    <p class="muted">Saves stay in the PC format (.fos), so you can move them to and from a PC install.</p>
+    <div class="row">
+      <label class="button secondary">Import saves…<input id="save-import" type="file" accept=".fos" multiple hidden></label>
+    </div>
+    <ul id="save-list" class="saves"></ul>
+  </section>
+
+  <section id="storage-section" aria-labelledby="storage-h">
+    <h2 id="storage-h">Storage</h2>
+    <p id="storage-detail" class="muted"></p>
+    <button id="wipe" type="button" class="danger">Remove imported game files…</button>
+  </section>
+</main>
+<script type="module" src="app.js"></script>
+</body>
+</html>
