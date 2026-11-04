@@ -1,0 +1,16 @@
+# newgame.txt, then after the world loads: Enter on each DLC notice ("... items added to inventory"), 15 s apart
+80000:key:d0
+1500:key:d0
+1500:key:1c
+0:log:NEW
+2500:key:1c
+0:log:YES
+110000:log:WORLD
+15000:key:1c
+0:log:OK1
+15000:key:1c
+0:log:OK2
+15000:key:1c
+0:log:OK3
+15000:key:1c
+0:log:OK4

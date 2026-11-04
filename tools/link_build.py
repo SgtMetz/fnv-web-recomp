@@ -1316,6 +1316,15 @@ def main():
         0x004BC320,  # BSRenderedTexture::GetTexture: `(this ? m_textures[i] : GO(0))` copies the NiPointer bitwise
                      # (GO has a dtor, no copy ctor) and releases the copy: one lost reference per call, the render
                      # target was freed and reused (call through a 2-slot vtable into "ANIM" text). Lifted: gone.
+        0x00663050,  # FaceGenNode update: its local parameter block (0x20 bytes, filled by 0x662e90) differs from the
+                     # decomp's; param+0x10 stayed garbage and 0x662110 read through it (this = 0xbb5a2b32).
+        0x00E7A200,  # NiDX9 ConvertGeometryData: compiled frame overrun (/GS cookie fails on a render worker).
+        0x00D20A70,  # hkpTriangleShape ray cast: Havok worker read through index -1 right after player placement.
+        0x00E95550,  # NiDynamicGeometryGroup::GetOrCreateChip: the decomp's group layout puts the chip map at +0x1c,
+                     # the original's is at +0xc; GetAt hashed through a null vtable slot (call 0) in the world.
+        0x00C7D900,  # bhkRagdollController dtor and its deleting wrapper: the compiled body frees a wrong field
+        0x00C7DE30,  # through Havok's thread allocator (0xd2c600 read 0xfdb34fd4) when an actor unloads.
+        0x00C7F060,  # its constructor (compiled, decomp layout): with only the dtor lifted the free still failed.
         0x00B5AC90}  # shadow scene frustum update: the decomp's local is 0x30 bytes, the original's ~0x90; lifted
                      # 0xa694a0 writes past it over the saved `this` (-1.0f, read of 0xbf8001e0). Lifted: gone.
     # Compiled bodies that call a synthetic constructor/destructor/specialization nothing defines (tools/trap_refs.py,
@@ -1337,6 +1346,22 @@ def main():
     if ctor_refs_p.exists() and not os.environ.get('FNV_NO_CTORLIFT'):
         ctx['lift_replace'] |= {int(a_, 16) for a_ in json.loads(ctor_refs_p.read_text())
                                 if owner.get(int(a_, 16)) is not None}
+    # Bitwise copies of decomp types with a user-declared destructor (tools/copy_dtor_scan.py, clang
+    # -Wdeprecated-copy-with-dtor): `p ? p->m_ptr : GO(0)` copies a smart pointer without AddRef and releases the
+    # copy, so each call drops a reference (0x4bc320 render target, 0x41bb10 cell MOPP freed while in use).
+    copy_dtor_p = ROOT / 'out/copy_dtor.json'
+    if copy_dtor_p.exists() and not os.environ.get('FNV_NO_COPYDTORLIFT'):
+        ctx['lift_replace'] |= {int(a_, 16) for a_ in json.loads(copy_dtor_p.read_text())['functions']
+                                if owner.get(int(a_, 16)) is not None}
+    # Whole source trees lifted from the original: Havok collision. Compiled bodies there use the decomp's own layouts
+    # for caches and shapes that lifted GJK/agent code fills (0xdaf1e0, 0xd12040 handle ids, 0xd20a70, 0xd20370,
+    # 0xd22370: physics workers reading through vertex id -1 one shape type after another once in the world).
+    # NiDynamicGeometryGroup: the decomp's layout puts the chip map 0x10 bytes late (ctor 0xe957b0 and
+    # GetOrCreateChip 0xe95550 disagree with the original; GetAt hashed through a null vtable slot).
+    LIFT_UNITS = ('src/havok/physics/collide/', 'src/havok/physics/internal/collide/',
+                  'src/gamebryo2.2/corelibs/niconsolerenderer/nidynamicgeometrygroup.cpp')
+    ctx['lift_replace'] |= {int(f_['address'], 16) for u_ in units if any(u_['source'].startswith(k_) for k_ in LIFT_UNITS)
+                            for f_ in u_['functions'] if owner.get(int(f_['address'], 16)) is not None}
     # Compiled callers of a function the decomp declares noreturn although the original returns (tools/
     # noreturn_scan.py, from the previous link): clang puts int3 after the call (0xa9b4a0 -> 0xaa0dc0).
     noret_p = ROOT / 'out/noreturn_callers.json'

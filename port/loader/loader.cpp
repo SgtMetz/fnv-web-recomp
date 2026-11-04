@@ -796,6 +796,32 @@ void input_parse(const char* s)
         else if (st.verb == 'm' && arg) { st.a = (int)strtol(arg + 1, &e, 10); st.b = *e == 0x2c ? atoi(e + 1) : 0; }
         else if (st.verb == 'c') st.a = arg ? atoi(arg + 1) : 100;
         else if (st.verb == 'l' && arg) _snprintf_s(st.text, sizeof(st.text), _TRUNCATE, "%.*s", (int)(end - arg - 1), arg + 1);
+        if (st.verb == 't' && arg)   // type:<text> -> one key per character, 150 ms apart (console commands)
+        {
+            static const char* row1 = "qwertyuiop", *row2 = "asdfghjkl", *row3 = "zxcvbnm";
+            DWORD delay = st.delay;
+            for (const char* c = arg + 1; c < end; ++c)
+            {
+                char ch = (char)tolower((unsigned char)*c);
+                int dik = 0;
+                if (const char* p = strchr(row1, ch); p && ch) dik = 0x10 + (int)(p - row1);
+                else if (const char* p2 = strchr(row2, ch); p2 && ch) dik = 0x1E + (int)(p2 - row2);
+                else if (const char* p3 = strchr(row3, ch); p3 && ch) dik = 0x2C + (int)(p3 - row3);
+                else if (ch >= '1' && ch <= '9') dik = 0x02 + (ch - '1');
+                else if (ch == '0') dik = 0x0B;
+                else if (ch == ' ') dik = 0x39;
+                else if (ch == '-') dik = 0x0C;
+                else if (ch == '.') dik = 0x34;
+                else if (ch == '`') dik = 0x29;   // console key
+                if (!dik) continue;
+                InStep k = {};
+                k.delay = delay; k.verb = 'k'; k.a = dik; k.b = 60;
+                g_in.push_back(k);
+                delay = 150;
+            }
+            s = *end ? end + 1 : nullptr;
+            continue;
+        }
         g_in.push_back(st);
         s = *end ? end + 1 : nullptr;
     }
@@ -1088,6 +1114,27 @@ BOOL WINAPI wrap_SetWindowPos(HWND h, HWND after, int x, int y, int cx, int cy, 
     return SetWindowPos(h, after, x, y, cx, cy, flags);
 }
 
+// With the game's MemoryManager routed to the CRT heap (FNV_SYSHEAP, default), the memory heaps still reserved
+// their pools at startup (0xaa65b0 probes base addresses 16 MB apart for four 514-577 MB pools, never committed).
+// They took 2.1 GB of the 4 GB address space, and a 5.6 MB texture allocation failed in the world (a null memset).
+// Reserve-only requests of 256 MB or more are capped at 16 MB while the system heap is on (logged once).
+bool g_sysheap = true;
+LPVOID WINAPI wrap_VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type, DWORD protect)
+{
+    if (g_sysheap && type == MEM_RESERVE && size >= (256u << 20))
+    {
+        static volatile LONG logged = 0;
+        if (!InterlockedExchange(&logged, 1))
+        {
+            fprintf(g_log, "[loader] VirtualAlloc reserves of %lu MB from %p capped at 16 MB (FNV_SYSHEAP)\n",
+                    (unsigned long)(size >> 20), _ReturnAddress());
+            fflush(g_log);
+        }
+        size = 16u << 20;
+    }
+    return VirtualAlloc(addr, size, type, protect);
+}
+
 VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
 BOOL WINAPI wrap_TerminateProcess(HANDLE h, UINT code) { if (h == GetCurrentProcess()) log_exit_stack("TerminateProcess", code); return TerminateProcess(h, code); }
 
@@ -1210,7 +1257,8 @@ static void patch_dll_imports(HMODULE dll)
     const W wraps[] = {{"CreateFileA", (void*)&wrap_CreateFileA}, {"GetFileAttributesA", (void*)&wrap_GetFileAttributesA},
                        {"MessageBoxA", (void*)&wrap_MessageBoxA}, {"OutputDebugStringA", (void*)&wrap_OutputDebugStringA},
                        {"ExitProcess", (void*)&wrap_ExitProcess}, {"TerminateProcess", (void*)&wrap_TerminateProcess},
-                       {"SHGetFolderPathA", (void*)&wrap_SHGetFolderPathA}, {"SetUnhandledExceptionFilter", (void*)&ignore_set_filter}};
+                       {"SHGetFolderPathA", (void*)&wrap_SHGetFolderPathA}, {"SetUnhandledExceptionFilter", (void*)&ignore_set_filter},
+                       {"VirtualAlloc", (void*)&wrap_VirtualAlloc}};
     auto base = (unsigned char*)dll;
     auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -1464,6 +1512,7 @@ static void* detour_keep(DWORD original, void* to)
 
 int main(int argc, char** argv)
 {
+    g_sysheap = !(getenv("FNV_SYSHEAP") && !strcmp(getenv("FNV_SYSHEAP"), "0"));
     g_bg = getenv("FNV_BACKGROUND") && *getenv("FNV_BACKGROUND") && strcmp(getenv("FNV_BACKGROUND"), "0");   // 1 or offscreen
     if (getenv("FNV_STARTUP_WATCHDOG") && *getenv("FNV_STARTUP_WATCHDOG") == '1')
     {
@@ -1814,6 +1863,7 @@ int main(int argc, char** argv)
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "ShowWindow")) f = (FARPROC)&wrap_ShowWindow;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetForegroundWindow")) f = (FARPROC)&wrap_SetForegroundWindow;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetWindowPos")) f = (FARPROC)&wrap_SetWindowPos;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "VirtualAlloc")) f = (FARPROC)&wrap_VirtualAlloc;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "DirectInput8Create") && input_init())
             {
                 g_realDiCreate = (DiCreateFn)f;

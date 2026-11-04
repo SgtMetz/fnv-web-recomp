@@ -1,6 +1,6 @@
 # Save a PNG of the relinked game's main window (PrintWindow, so it works when the window is covered).
 # usage: powershell -File tools/screenshot.ps1 [-Out out/shot.png]
-param([string]$Out = "E:\Games\Claude fnv\out\shot.png")
+param([string]$Out = "E:\Games\Claude fnv\out\shot.png", [switch]$Stats)
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System; using System.Text; using System.Runtime.InteropServices;
@@ -37,3 +37,11 @@ $dc = $g.GetHdc()
 $g.ReleaseHdc($dc); $g.Dispose()
 $bmp.Save($Out, [System.Drawing.Imaging.ImageFormat]::Png)
 "saved $Out ($w x $hh)"
+if ($Stats) {   # client area only (skip the 31-px title bar): mean/stddev of luminance, white and black fractions
+  $n = 0; $sum = 0.0; $sq = 0.0; $white = 0; $black = 0
+  for ($y = 40; $y -lt $hh - 8; $y += 12) { for ($x = 8; $x -lt $w - 8; $x += 12) {
+    $c = $bmp.GetPixel($x, $y); $l = 0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B
+    $n++; $sum += $l; $sq += $l * $l; if ($l -gt 235) { $white++ }; if ($l -lt 12) { $black++ } } }
+  $mean = $sum / $n; $sd = [math]::Sqrt([math]::Max(0, $sq / $n - $mean * $mean))
+  "stats mean={0:N1} sd={1:N1} white={2:P0} black={3:P0}" -f $mean, $sd, ($white / $n), ($black / $n)
+}

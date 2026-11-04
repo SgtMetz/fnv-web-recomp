@@ -1,0 +1,8 @@
+# Quick world test: at the main menu open the console and jump straight into the Mojave (no New Game, no
+# character creation): cow wastelandnv 0 0. The menu appears ~60 s after the first DirectInput poll.
+72000:type:`
+1500:type:cow wastelandnv 0 0
+400:key:1c
+0:log:COW
+2000:type:`
+0:log:INWORLD

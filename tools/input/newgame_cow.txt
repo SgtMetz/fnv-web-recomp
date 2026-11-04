@@ -1,0 +1,19 @@
+# newgame_dlc.txt, then the console: teleport to an exterior (cow wastelandnv 0 0) to test whether the world renders
+80000:key:d0
+1500:key:d0
+1500:key:1c
+0:log:NEW
+2500:key:1c
+0:log:YES
+110000:log:WORLD
+15000:key:1c
+15000:key:1c
+15000:key:1c
+15000:key:1c
+0:log:DLCDONE
+10000:type:`
+1500:type:cow wastelandnv 0 0
+500:key:1c
+0:log:COW
+3000:type:`
+0:log:CONSOLECLOSED
