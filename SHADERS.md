@@ -40,6 +40,14 @@ data is committed).
 Gotchas: `git apply` inside `local/` silently applies nothing (the outer repo ignores it); `build_vkd3d.py` applies from the
 repo root with `--directory`. `.gitattributes` has `*.patch -text` so patches keep LF.
 
+## Interface manifest
+`python tools/shader_manifest.py [out/shaders/<pkg> ...]` writes `out/shader_manifest/<pkg>.json` (git-ignored), one entry per
+shader: stage, profile, sha1, wgsl file name, `inputs` / `outputs` (name, `location` or `builtin`, type, interpolation;
+vertex inputs also carry the D3D semantic from the `dcl`, e.g. `position0`, `texcoord0`), and `bindings` (samplers with
+texture/sampler `@binding` numbers and dim `2d`/`cube`, and the constant array's binding and vec4 count). Built for the D3D9
+shim so it can create bind group / pipeline layouts and match vertex outputs to pixel inputs (same `location` = same D3D
+register: oT4 -> location 4, colors 8+) without parsing WGSL. All 15,791 entries have outputs and complete sampler pairs.
+
 ## Facts about the generated WGSL (relevant for the renderer)
 - Constants: one uniform array per shader, `cb0_0.tint_symbol[N]` (vec4), `@group(0) @binding(K)`, K after the texture/
   sampler pairs. Array length = highest non-`def` constant index read + 1. `def` constants are inlined; `defi`/`defb` only
