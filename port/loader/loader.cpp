@@ -11,6 +11,7 @@
 //   6. calls the relinked WinMain.
 // Nothing from the exe is written to disk.
 #include <windows.h>
+#include <d3d9.h>
 #include <shlobj.h>
 #include <intrin.h>
 #include <tlhelp32.h>
@@ -1931,9 +1932,16 @@ static HRESULT WINAPI ds_CreateDevice(void* d3d, UINT ad, DWORD type, HWND w, DW
 }
 static void* WINAPI wrap_Direct3DCreate9(UINT sdk);
 // Gamebryo's NiDX9Renderer loads d3d9.dll and looks up Direct3DCreate9 itself
+#include "d3d9_model.h"
 FARPROC WINAPI wrap_GetProcAddress(HMODULE m, LPCSTR name)
 {
     FARPROC f = GetProcAddress(m, name);
+    if (f && (ULONG_PTR)name > 0xffff && !strcmp(name, "Direct3DCreate9") && getenv("FNV_D3D9_MODEL") &&
+        *getenv("FNV_D3D9_MODEL") == '1')
+    {   // the game gets the Direct3D 9 model (d3d9_model.h), which forwards to the real runtime
+        g_modelRealCreate9 = (D3DCreate9Real)f;
+        return (FARPROC)&model_Direct3DCreate9;
+    }
     if (f && (ULONG_PTR)name > 0xffff && !strcmp(name, "Direct3DCreate9") && getenv("FNV_D3D_STATS"))
     {
         g_realD3DCreate9 = (D3DCreate9Fn)f;

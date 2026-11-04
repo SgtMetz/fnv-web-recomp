@@ -130,7 +130,11 @@ inline int lift_parity(uint32_t r) { r &= 0xff; r ^= r >> 4; r ^= r >> 2; r ^= r
 // with `call` and that address the parent's frame (0xecaf0c, the finally block of __ehvec_copy_ctor 0xecaebb, reads
 // [ebp-0x20]). The lifter loads s.ebp from here only in those bodies (LIFT_EBP_IN).
 extern thread_local uint32_t fnv_lift_ebp_in;
-#define LIFT_EBP_IN() (s.ebp = fnv_lift_ebp_in)
+// Called from lifted code (through fnv_lift_call, recognised by the return address) the parent frame is the
+// lifted caller's emulated ebp; called from native code (the CRT unwinder runs __finally funclets such as 0xecf7ac
+// with ebp = the parent's frame) it is the native caller's ebp, which the naked entry saved just below in_args.
+extern "C" uint32_t __cdecl fnv_lift_call_return(void);
+#define LIFT_EBP_IN() (s.ebp = in_args[0] == fnv_lift_call_return() ? fnv_lift_ebp_in : in_args[-1])
 
 // Thread host time slice (port/loader/loader.cpp, FNV_THREAD_HOST): the loader's watchdog sets the flag when the
 // running game thread has held the baton too long while others wait; lifted code hands it over at its next call

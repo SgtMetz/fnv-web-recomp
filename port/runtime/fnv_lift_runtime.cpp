@@ -82,6 +82,21 @@ extern "C" uint32_t __cdecl fnv_lift_tls_array(void)
 
 thread_local uint32_t fnv_lift_ebp_in;   // see fnv_lift.h
 
+// the return address of fnv_lift_call's `call dword ptr [ebp+8]` (ff 55 08): a callee whose return address is this
+// was called by lifted code (LIFT_EBP_IN)
+extern "C" void __cdecl fnv_lift_call(void* fn, unsigned int ecx, const unsigned int* args, FnvLiftCall* out);
+extern "C" uint32_t __cdecl fnv_lift_call_return(void)
+{
+    static uint32_t ret = 0;
+    if (!ret)
+    {
+        const uint8_t* p = (const uint8_t*)&fnv_lift_call;
+        for (int i = 0; i < 256; ++i)
+            if (p[i] == 0xff && p[i + 1] == 0x55 && p[i + 2] == 0x08) { ret = (uint32_t)(uintptr_t)(p + i + 3); break; }
+    }
+    return ret;
+}
+
 // ---- FNV_FPU_CHECK=1: native x87 stack balance checks (see fnv_lift.h) ----
 // Lifted bodies keep their own x87 stack, so the native one is touched only by compiled code, by each naked entry's
 // `fld` of an st0 result and by fnv_lift_call's `fstp` of a native callee's result. Every lifted entry/exit and every

@@ -980,7 +980,7 @@ class Lifter:
                 return False
             if re.match(r'^(mov|lea|pop)$', mnem) and re.match(r'^ebp\b', ops.strip()):
                 return False
-            if mnem.startswith(('j', 'call', 'ret')):
+            if mnem.startswith(('j', 'ret')):     # calls preserve ebp: keep scanning (0xecf7ac reads [ebp-0x1c] after one)
                 return False
             if re.search(r'\bebp\b', ops):
                 return True
