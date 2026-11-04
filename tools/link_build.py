@@ -742,7 +742,7 @@ def build_loader(vs, sdk):
     cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/machine:x86', '/subsystem:console', '/base:0x400000', '/fixed',
            '/dynamicbase:no', '/largeaddressaware', '/out:' + str(LINK / 'FalloutNV_relinked.exe'), '/map:' + str(LINK / 'loader.map'),
            '/libpath:' + str(vs), '/libpath:' + str(sdk / 'ucrt/x86'), '/libpath:' + str(sdk / 'um/x86'),
-           str(LINK / 'loader.obj'), 'libcmt.lib', 'kernel32.lib', 'user32.lib']
+           str(LINK / 'loader.obj'), 'libcmt.lib', 'kernel32.lib', 'user32.lib', 'synchronization.lib']
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
     return dict(exit=r.returncode, log=(r.stdout + r.stderr)[-2000:])
 

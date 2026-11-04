@@ -1949,6 +1949,107 @@ static void* WINAPI wrap_Direct3DCreate9(UINT sdk)
     return d3d;
 }
 
+// ---- FNV_THREAD_HOST=1: game threads run one at a time (docs/PHASE2_PLAN.md, idea from nv-rs's thread host) ----
+// Every thread the game creates and the main thread hold a baton while running game code. The baton is a fair
+// ticket lock (arrival order). Switch points are the blocking calls: waits with a timeout, Sleep (also Sleep(0),
+// the game's spin-lock yield), a contended EnterCriticalSection, thread exit. The real kernel objects keep their
+// meaning: a thread gives the baton back, blocks in the real call, then queues for the baton again. Each game
+// thread keeps its OS thread, so TLS (lift arenas, Havok thread memory, the original's __tls slots) is unchanged.
+bool g_th = false;
+static volatile LONG g_thNext = 0, g_thServing = 0, g_thThreads = 0, g_thSwitches = 0;
+static __declspec(thread) int t_thGame = 0, t_thHold = 0;
+static volatile ULONGLONG g_thSince = 0;   // when the current holder took the baton
+static volatile long* g_thYieldFlag = nullptr;   // fnv_game.dll's fnv_lift_yield_flag
+static void th_acquire()
+{
+    LONG my = InterlockedIncrement(&g_thNext) - 1;
+    for (;;)
+    {
+        LONG cur = g_thServing;
+        if (cur == my) break;
+        WaitOnAddress(&g_thServing, &cur, sizeof(cur), INFINITE);
+    }
+    t_thHold = 1;
+    g_thSince = GetTickCount64();
+}
+static void th_release()
+{
+    t_thHold = 0;
+    InterlockedIncrement(&g_thSwitches);
+    InterlockedIncrement(&g_thServing);
+    WakeByAddressAll((PVOID)&g_thServing);
+}
+// release around a blocking call, only on a game thread that holds the baton
+struct ThBlock
+{
+    bool held;
+    ThBlock() : held(g_th && t_thGame && t_thHold) { if (held) th_release(); }
+    ~ThBlock() { if (held) th_acquire(); }
+};
+// time slice: lifted code calls this at its next call once the watchdog set the flag (fnv_lift.h)
+static void __cdecl th_yield()
+{
+    if (g_thYieldFlag) *g_thYieldFlag = 0;
+    if (!(g_th && t_thGame && t_thHold) || g_thNext - g_thServing <= 1) return;
+    th_release();
+    th_acquire();
+}
+static DWORD WINAPI th_watchdog(LPVOID)
+{
+    for (;;)
+    {
+        Sleep(2);
+        if (g_thYieldFlag && g_thNext - g_thServing > 1 && GetTickCount64() - g_thSince > 20)
+            *g_thYieldFlag = 1;
+    }
+}
+struct ThStart { LPTHREAD_START_ROUTINE fn; LPVOID arg; };
+static DWORD WINAPI th_trampoline(LPVOID p)
+{
+    ThStart s = *(ThStart*)p;
+    HeapFree(GetProcessHeap(), 0, p);
+    t_thGame = 1;
+    InterlockedIncrement(&g_thThreads);
+    th_acquire();
+    DWORD r = s.fn(s.arg);
+    if (t_thHold) th_release();
+    return r;
+}
+HANDLE WINAPI wrap_CreateThread(LPSECURITY_ATTRIBUTES sa, SIZE_T stack, LPTHREAD_START_ROUTINE fn, LPVOID arg, DWORD flags,
+                                LPDWORD id)
+{
+    if (!g_th) return CreateThread(sa, stack, fn, arg, flags, id);
+    ThStart* s = (ThStart*)HeapAlloc(GetProcessHeap(), 0, sizeof(ThStart));
+    s->fn = fn;
+    s->arg = arg;
+    return CreateThread(sa, stack, th_trampoline, s, flags, id);
+}
+VOID WINAPI wrap_ExitThread(DWORD code)
+{
+    if (g_th && t_thGame && t_thHold) th_release();
+    ExitThread(code);
+}
+VOID WINAPI wrap_Sleep(DWORD ms) { ThBlock b; Sleep(ms); }
+DWORD WINAPI wrap_WaitForSingleObject(HANDLE h, DWORD ms)
+{
+    if (!ms) return WaitForSingleObject(h, 0);
+    ThBlock b;
+    return WaitForSingleObject(h, ms);
+}
+DWORD WINAPI wrap_WaitForMultipleObjects(DWORD n, const HANDLE* hs, BOOL all, DWORD ms)
+{
+    if (!ms) return WaitForMultipleObjects(n, hs, all, 0);
+    ThBlock b;
+    return WaitForMultipleObjects(n, hs, all, ms);
+}
+VOID WINAPI wrap_EnterCriticalSection(LPCRITICAL_SECTION cs)
+{
+    if (!(g_th && t_thGame && t_thHold)) { EnterCriticalSection(cs); return; }
+    if (TryEnterCriticalSection(cs)) return;
+    ThBlock b;   // owned by another game thread: let it run until it leaves the section
+    EnterCriticalSection(cs);
+}
+
 VOID WINAPI wrap_ExitProcess(UINT code) { log_exit_stack("ExitProcess", code); ExitProcess(code); }
 BOOL WINAPI wrap_TerminateProcess(HANDLE h, UINT code) { if (h == GetCurrentProcess()) log_exit_stack("TerminateProcess", code); return TerminateProcess(h, code); }
 
@@ -2072,7 +2173,11 @@ static void patch_dll_imports(HMODULE dll)
                        {"MessageBoxA", (void*)&wrap_MessageBoxA}, {"OutputDebugStringA", (void*)&wrap_OutputDebugStringA},
                        {"ExitProcess", (void*)&wrap_ExitProcess}, {"TerminateProcess", (void*)&wrap_TerminateProcess},
                        {"SHGetFolderPathA", (void*)&wrap_SHGetFolderPathA}, {"SetUnhandledExceptionFilter", (void*)&ignore_set_filter},
-                       {"VirtualAlloc", (void*)&wrap_VirtualAlloc}, {"GetProcAddress", (void*)&wrap_GetProcAddress}};
+                       {"VirtualAlloc", (void*)&wrap_VirtualAlloc}, {"GetProcAddress", (void*)&wrap_GetProcAddress},
+                       {"CreateThread", (void*)&wrap_CreateThread}, {"ExitThread", (void*)&wrap_ExitThread},
+                       {"Sleep", (void*)&wrap_Sleep}, {"WaitForSingleObject", (void*)&wrap_WaitForSingleObject},
+                       {"WaitForMultipleObjects", (void*)&wrap_WaitForMultipleObjects},
+                       {"EnterCriticalSection", (void*)&wrap_EnterCriticalSection}};
     auto base = (unsigned char*)dll;
     auto nt = (IMAGE_NT_HEADERS*)(base + ((IMAGE_DOS_HEADER*)base)->e_lfanew);
     auto& dir = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
@@ -2343,6 +2448,12 @@ static void* detour_keep(DWORD original, void* to)
 int main(int argc, char** argv)
 {
     g_sysheap = !(getenv("FNV_SYSHEAP") && !strcmp(getenv("FNV_SYSHEAP"), "0"));
+    if (getenv("FNV_THREAD_HOST") && *getenv("FNV_THREAD_HOST") == '1')
+    {   // the main thread holds the baton from the start: game threads created during init wait for it
+        g_th = true;
+        t_thGame = 1;
+        th_acquire();
+    }
     g_bg = getenv("FNV_BACKGROUND") && *getenv("FNV_BACKGROUND") && strcmp(getenv("FNV_BACKGROUND"), "0");   // 1 or offscreen
     if (getenv("FNV_STARTUP_WATCHDOG") && *getenv("FNV_STARTUP_WATCHDOG") == '1')
     {
@@ -2509,6 +2620,16 @@ int main(int argc, char** argv)
     RemoveVectoredExceptionHandler(loadVeh);
     if (!game)
         return fail("cannot load fnv_game.dll");
+    if (g_th)
+    {   // time slice for the thread host: the DLL's lifted calls check a flag the watchdog sets
+        using SetYield = volatile long* (__cdecl*)(void (__cdecl*)(void));
+        if (auto sy = (SetYield)GetProcAddress(game, "fnv_lift_set_yield"))
+        {
+            g_thYieldFlag = sy(&th_yield);
+            CloseHandle(CreateThread(nullptr, 0, th_watchdog, nullptr, 0, nullptr));
+            fprintf(g_log, "[loader] FNV_THREAD_HOST=1: game threads run one at a time (20 ms time slice)\n");
+        }
+    }
     using SetLiftText = void (__cdecl*)(const unsigned char*, DWORD, DWORD);
     auto setLiftText = (SetLiftText)GetProcAddress(game, "fnv_lift_set_text");
     if (!setLiftText || text->PointerToRawData + text->SizeOfRawData > pe.file.size())
@@ -2697,6 +2818,16 @@ int main(int argc, char** argv)
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "SetWindowPos")) f = (FARPROC)&wrap_SetWindowPos;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "VirtualAlloc")) f = (FARPROC)&wrap_VirtualAlloc;
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "GetProcAddress")) f = (FARPROC)&wrap_GetProcAddress;
+            if (f && !(names[k] & IMAGE_ORDINAL_FLAG32))   // thread host (no-ops unless FNV_THREAD_HOST=1)
+            {
+                const char* nm2 = (const char*)pe.at(names[k]) + 2;
+                if (!strcmp(nm2, "CreateThread")) f = (FARPROC)&wrap_CreateThread;
+                else if (!strcmp(nm2, "ExitThread")) f = (FARPROC)&wrap_ExitThread;
+                else if (!strcmp(nm2, "Sleep")) f = (FARPROC)&wrap_Sleep;
+                else if (!strcmp(nm2, "WaitForSingleObject")) f = (FARPROC)&wrap_WaitForSingleObject;
+                else if (!strcmp(nm2, "WaitForMultipleObjects")) f = (FARPROC)&wrap_WaitForMultipleObjects;
+                else if (!strcmp(nm2, "EnterCriticalSection")) f = (FARPROC)&wrap_EnterCriticalSection;
+            }
             if (f && !(names[k] & IMAGE_ORDINAL_FLAG32) && !strcmp((const char*)pe.at(names[k]) + 2, "Direct3DCreate9") &&
                 getenv("FNV_D3D_STATS"))
             {

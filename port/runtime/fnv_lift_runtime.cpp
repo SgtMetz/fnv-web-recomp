@@ -8,6 +8,16 @@
 // Original .text cannot be mapped over the loader; indexed byte tables read this separate view.
 static const uint8_t* fnv_original_text;
 static uint32_t fnv_original_text_base, fnv_original_text_size;
+extern "C" volatile long fnv_lift_yield_flag = 0;
+static void __cdecl fnv_lift_no_yield(void) { fnv_lift_yield_flag = 0; }
+extern "C" void (__cdecl* fnv_lift_yield_cb)(void) = fnv_lift_no_yield;
+// the loader installs its thread-host yield (FNV_THREAD_HOST) and gets the flag's address to set
+extern "C" __declspec(dllexport) volatile long* __cdecl fnv_lift_set_yield(void (__cdecl* cb)(void))
+{
+    if (cb) fnv_lift_yield_cb = cb;
+    return &fnv_lift_yield_flag;
+}
+
 extern "C" void __cdecl fnv_lift_set_text(const uint8_t* text, uint32_t base, uint32_t size)
 {
     fnv_original_text = text;

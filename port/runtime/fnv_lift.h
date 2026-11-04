@@ -132,8 +132,16 @@ inline int lift_parity(uint32_t r) { r &= 0xff; r ^= r >> 4; r ^= r >> 2; r ^= r
 extern thread_local uint32_t fnv_lift_ebp_in;
 #define LIFT_EBP_IN() (s.ebp = fnv_lift_ebp_in)
 
+// Thread host time slice (port/loader/loader.cpp, FNV_THREAD_HOST): the loader's watchdog sets the flag when the
+// running game thread has held the baton too long while others wait; lifted code hands it over at its next call
+// (a spin loop that waits for another game thread would otherwise never let that thread run).
+extern "C" volatile long fnv_lift_yield_flag;
+extern "C" void (__cdecl* fnv_lift_yield_cb)(void);
+
 inline void fnv_lift_do_call(FnvLiftState& s, void* fn, uint32_t args)
 {
+    if (fnv_lift_yield_flag)
+        fnv_lift_yield_cb();
     FnvLiftCall r;
     fnv_lift_ebp_in = s.ebp;
     r.in_edx = s.edx;
