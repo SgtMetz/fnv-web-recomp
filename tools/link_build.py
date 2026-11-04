@@ -740,7 +740,7 @@ def build_loader(vs, sdk):
     original data range (see port/loader/loader.cpp)."""
     cl(ROOT / 'port/loader/loader.cpp', LINK / 'loader.obj')
     cmd = [str(LLVM / 'lld-link.exe'), '/nologo', '/machine:x86', '/subsystem:console', '/base:0x400000', '/fixed',
-           '/dynamicbase:no', '/largeaddressaware', '/out:' + str(LINK / 'FalloutNV_relinked.exe'),
+           '/dynamicbase:no', '/largeaddressaware', '/out:' + str(LINK / 'FalloutNV_relinked.exe'), '/map:' + str(LINK / 'loader.map'),
            '/libpath:' + str(vs), '/libpath:' + str(sdk / 'ucrt/x86'), '/libpath:' + str(sdk / 'um/x86'),
            str(LINK / 'loader.obj'), 'libcmt.lib', 'kernel32.lib', 'user32.lib']
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
@@ -1337,6 +1337,11 @@ def main():
     if ctor_refs_p.exists() and not os.environ.get('FNV_NO_CTORLIFT'):
         ctx['lift_replace'] |= {int(a_, 16) for a_ in json.loads(ctor_refs_p.read_text())
                                 if owner.get(int(a_, 16)) is not None}
+    # Compiled callers of a function the decomp declares noreturn although the original returns (tools/
+    # noreturn_scan.py, from the previous link): clang puts int3 after the call (0xa9b4a0 -> 0xaa0dc0).
+    noret_p = ROOT / 'out/noreturn_callers.json'
+    if noret_p.exists() and not os.environ.get('FNV_NO_NORETLIFT'):
+        ctx['lift_replace'] |= {int(a_, 16) for a_ in json.loads(noret_p.read_text()) if owner.get(int(a_, 16)) is not None}
     # bool/char-declared bodies whose original passes a full 32-bit EAX through (see narrow_mismatches)
     if not os.environ.get('FNV_NO_NARROWLIFT'):
         ctx['lift_replace'] |= {a_ for a_ in narrow_mismatches(units) if owner.get(a_) is not None}

@@ -1045,22 +1045,33 @@ BOOL WINAPI wrap_DestroyWindow(HWND h)
     return DestroyWindow(h);
 }
 
-// FNV_BACKGROUND=1: the window is created to the right of every monitor, without a taskbar button, and never
-// activated, so a run does not cover or take focus from what the user is doing. tools/screenshot.ps1 still captures it
-// (PrintWindow). The game keeps running unfocused through bAlwaysActive=1 in the private INI.
+// FNV_BACKGROUND=1: the window has no taskbar button and is never activated, so a run does not take focus from what
+// the user is doing. It stays on-screen but fully transparent and click-through (a layered window at alpha 1/255):
+// an off-screen window is not composited and PrintWindow (tools/screenshot.ps1) then captured only black frames.
+// FNV_BACKGROUND=offscreen restores the old placement right of every monitor. The game keeps running unfocused
+// through bAlwaysActive=1 in the private INI.
 HWND WINAPI wrap_CreateWindowExA(DWORD ex, LPCSTR cls, LPCSTR title, DWORD style, int x, int y, int w, int h, HWND parent,
                                  HMENU menu, HINSTANCE inst, LPVOID param)
 {
+    const char* bg = getenv("FNV_BACKGROUND");
+    bool offscreen = bg && !strcmp(bg, "offscreen");
     if (g_bg && !parent)
     {
-        x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64;
-        y = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW;
+        if (offscreen)
+        {
+            x = GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN) + 64;
+            y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        }
+        ex = (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | (offscreen ? 0 : WS_EX_LAYERED | WS_EX_TRANSPARENT)) &
+             ~WS_EX_APPWINDOW;
     }
     HWND hw = CreateWindowExA(ex, cls, title, style, x, y, w, h, parent, menu, inst, param);
     if (g_bg && !parent)
     {
-        fprintf(g_log, "[loader] FNV_BACKGROUND: window %p created off-screen at %d,%d\n", (void*)hw, x, y);
+        if (!offscreen && hw)
+            SetLayeredWindowAttributes(hw, 0, 1, LWA_ALPHA);
+        fprintf(g_log, "[loader] FNV_BACKGROUND: window %p %s at %d,%d\n", (void*)hw,
+                offscreen ? "created off-screen" : "transparent and click-through", x, y);
         fflush(g_log);
     }
     return hw;
@@ -1157,7 +1168,11 @@ LONG WINAPI on_crash(EXCEPTION_POINTERS* ep)
 // they are never rebound. With DEP, jumping there raises an execute fault; when the address is a relinked function,
 // continue there instead (the return address is already on the stack). Each address is logged once, to be fixed at
 // the source (the wasm build has no such safety net).
-std::vector<DWORD> g_redirected;
+// Logged-once set of redirected targets. Lock-free and heap-free: this handler runs on whichever thread faults, and
+// several AI worker threads start in original code at once after New Game; an unsynchronised std::vector here
+// corrupted the process heap (c0000374, and a memcpy past a reallocated buffer in push_back).
+volatile LONG g_redirected[1024];
+volatile LONG g_redirectedN = 0;
 
 LONG CALLBACK redirect_original_code(EXCEPTION_POINTERS* ep)
 {
@@ -1168,9 +1183,13 @@ LONG CALLBACK redirect_original_code(EXCEPTION_POINTERS* ep)
     void* f = relinked(target);
     if (!f)
         return EXCEPTION_CONTINUE_SEARCH;
-    if (std::find(g_redirected.begin(), g_redirected.end(), target) == g_redirected.end())
+    bool seen = false;
+    for (LONG i = 0, n = g_redirectedN; i < n && i < 1024 && !seen; ++i)
+        seen = (DWORD)g_redirected[i] == target;
+    if (!seen)
     {
-        g_redirected.push_back(target);
+        LONG k = InterlockedIncrement(&g_redirectedN) - 1;
+        if (k < 1024) InterlockedExchange(&g_redirected[k], (LONG)target);
         fprintf(g_log, "[loader] redirected a call to original code 0x%08lx -> relinked\n", target);
     }
     ep->ContextRecord->Eip = (DWORD)f;
@@ -1230,6 +1249,153 @@ static void* __fastcall sysheap_realloc(void*, void*, void* p, size_t size)
     return _aligned_realloc(p, size, 16);
 }
 static size_t __fastcall sysheap_size(void*, void*, const void* p) { return p ? _aligned_msize((void*)p, 16, 0) : 0; }
+
+// FNV_HEAPCHECK=1 (with the system heap): each block gets a 16-byte header {magic, size, allocating caller} and 16
+// guard bytes after it. A free checks both and logs overflows (with the bytes written past the end), double frees and
+// frees of foreign pointers, naming the allocating and freeing callers (relinked DLL addresses: tools/addr2fn.py).
+struct HcHead { DWORD magic, size, caller, caller2; };
+// the first two game-DLL return addresses above `sp`: lifted callers reach the allocator through fnv_lift_call, so
+// the second one is usually the lifted body that asked
+static void hc_callers(DWORD* sp, DWORD* c1, DWORD* c2)
+{
+    *c1 = *c2 = 0;
+    for (int i = 0; i < 96 && !IsBadReadPtr(sp + i, 4); ++i)
+        if (sp[i] >= 0x20001000 && sp[i] < 0x24000000)
+        {
+            if (!*c1) *c1 = sp[i];
+            else if (sp[i] != *c1) { *c2 = sp[i]; return; }
+        }
+}
+const DWORD kHcLive = 0x4C4C4548u, kHcFreed = 0x44454546u;
+static volatile LONG g_hcReports = 0;
+static void hc_report(const char* what, const HcHead* h, const void* p, DWORD freer)
+{
+    if (InterlockedIncrement(&g_hcReports) > 40) return;
+    char buf[400];
+    int n = wsprintfA(buf, "[heapcheck] %s block %08lx size %lu alloc-callers %08lx %08lx free-caller %08lx thread %lu",
+                      what, (DWORD)p, h ? h->size : 0, h ? h->caller : 0, h ? h->caller2 : 0, freer, GetCurrentThreadId());
+    if (h && h->magic == kHcLive)
+    {
+        const unsigned char* t = (const unsigned char*)p + h->size;
+        n += wsprintfA(buf + n, " tail:");
+        for (int i = 0; i < 16; ++i) n += wsprintfA(buf + n, " %02x", t[i]);
+        n += wsprintfA(buf + n, " \"");
+        for (int i = 0; i < 16; ++i) buf[n++] = (t[i] >= 0x20 && t[i] < 0x7f) ? (char)t[i] : '.';
+        buf[n++] = '"';
+    }
+    buf[n++] = '\r'; buf[n++] = '\n';
+    DWORD w; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
+}
+// FNV_HEAPCHECK_EVERY=N (default 2048): validate the whole process heap every N allocator calls; at the first
+// failure, walk it and print the last entries before the broken one (a guarded block's header names its allocator)
+static volatile LONG g_hcCalls = 0, g_hcBroken = 0;
+static void hc_walk_report(LONG call, DWORD* sp)
+{
+    DWORD c1, c2;
+    hc_callers(sp, &c1, &c2);
+    fprintf(g_log, "[heapcheck] process heap invalid at allocator call %ld (current callers %08lx %08lx, thread %lu)\n",
+            call, c1, c2, GetCurrentThreadId());
+    PROCESS_HEAP_ENTRY e = {}, prev[4] = {};
+    int n = 0, steps = 0;
+    HANDLE heap = GetProcessHeap();
+    HeapLock(heap);
+    __try
+    {
+        while (HeapWalk(heap, &e) && steps < 50000000)
+        {
+            ++steps;
+            if ((e.wFlags & PROCESS_HEAP_ENTRY_BUSY) && !HeapValidate(heap, 0, e.lpData))
+            {
+                fprintf(g_log, "[heapcheck] first invalid busy entry %p size %lu\n", e.lpData, e.cbData);
+                break;
+            }
+            prev[n++ & 3] = e;
+        }
+        fprintf(g_log, "[heapcheck] walk ended after %d entries (error %lu)\n", steps, GetLastError());
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        fprintf(g_log, "[heapcheck] walk faulted after %d entries\n", steps);
+    }
+    HeapUnlock(heap);
+    for (int k = 0; k < 4 && k < n; ++k)
+    {
+        const PROCESS_HEAP_ENTRY& p = prev[(n - 1 - k) & 3];
+        const HcHead* h = (const HcHead*)p.lpData;   // _aligned_malloc puts its own word first: probe a few offsets
+        fprintf(g_log, "[heapcheck]   entry -%d: %p size %lu flags %x", k, p.lpData, p.cbData, p.wFlags);
+        for (int o = 0; o <= 32 && p.cbData > 32; o += 4)
+        {
+            const HcHead* hh = (const HcHead*)((const unsigned char*)p.lpData + o);
+            if (hh->magic == kHcLive || hh->magic == kHcFreed)
+            {
+                fprintf(g_log, " guarded size %lu alloc-callers %08lx %08lx%s", hh->size, hh->caller, hh->caller2,
+                        hh->magic == kHcFreed ? " (freed)" : "");
+                break;
+            }
+        }
+        const unsigned char* t = (const unsigned char*)p.lpData + (p.cbData > 32 ? p.cbData - 32 : 0);
+        fprintf(g_log, " end:");
+        for (int i = 0; i < 32 && i < (int)p.cbData; ++i) fprintf(g_log, "%02x", t[i]);
+        fprintf(g_log, "\n");
+        (void)h;
+    }
+    fflush(g_log);
+}
+static void hc_tick(DWORD* sp)
+{
+    static const LONG every = getenv("FNV_HEAPCHECK_EVERY") ? atol(getenv("FNV_HEAPCHECK_EVERY")) : 2048;
+    LONG c = InterlockedIncrement(&g_hcCalls);
+    if (g_hcBroken || every <= 0 || c % every) return;
+    if (!HeapValidate(GetProcessHeap(), 0, nullptr) && !InterlockedExchange(&g_hcBroken, 1))
+        hc_walk_report(c, sp);
+}
+static void* hc_alloc(size_t size, DWORD* sp)
+{
+    hc_tick(sp);
+    DWORD caller, caller2;
+    hc_callers(sp, &caller, &caller2);
+    unsigned char* b = (unsigned char*)_aligned_malloc(size + 32, 16);
+    if (!b) return nullptr;
+    HcHead* h = (HcHead*)b;
+    h->magic = kHcLive; h->size = (DWORD)size; h->caller = caller; h->caller2 = caller2;
+    memset(b + 16 + size, 0xFD, 16);
+    return b + 16;
+}
+static bool hc_check_free(void* p, DWORD freer)
+{
+    HcHead* h = (HcHead*)((unsigned char*)p - 16);
+    if (IsBadReadPtr(h, 16)) { hc_report("free of a foreign pointer", nullptr, p, freer); return false; }
+    if (h->magic == kHcFreed) { hc_report("double free", h, p, freer); return false; }
+    if (h->magic != kHcLive) { hc_report("free with a damaged header (underrun or foreign)", h, p, freer); return false; }
+    const unsigned char* t = (const unsigned char*)p + h->size;
+    for (int i = 0; i < 16; ++i)
+        if (t[i] != 0xFD) { hc_report("overflow past the end", h, p, freer); break; }
+    h->magic = kHcFreed;
+    _aligned_free(h);
+    return true;
+}
+static void* __fastcall hc_sys_alloc(void*, void*, size_t size) { return hc_alloc(size ? size : 1, (DWORD*)_AddressOfReturnAddress()); }
+static void __fastcall hc_sys_free(void*, void*, void* p)
+{
+    hc_tick((DWORD*)_AddressOfReturnAddress());
+    if (p) hc_check_free(p, (DWORD)_ReturnAddress());
+}
+static void* __fastcall hc_sys_realloc(void*, void*, void* p, size_t size)
+{
+    DWORD caller = (DWORD)_ReturnAddress();
+    DWORD* sp = (DWORD*)_AddressOfReturnAddress();
+    if (!p) return hc_alloc(size ? size : 1, sp);
+    if (!size) { hc_check_free(p, caller); return nullptr; }
+    HcHead* h = (HcHead*)((unsigned char*)p - 16);
+    void* n = hc_alloc(size, sp);
+    if (n) memcpy(n, p, h->magic == kHcLive && h->size < size ? h->size : size);
+    hc_check_free(p, caller);
+    return n;
+}
+static size_t __fastcall hc_sys_size(void*, void*, const void* p)
+{
+    return p ? ((const HcHead*)((const unsigned char*)p - 16))->size : 0;
+}
 
 // FNV_SKIP_INTRO=1: the New Game intro is played by the script command PlayBink (0x005d15d0) through
 // BSMovieThread 0x00ec2320 -> BSPlaybackFile::Play 0x00ec0e00 (thiscall: name, 7 bools, float; ret 0x24), which blocks
@@ -1298,7 +1464,7 @@ static void* detour_keep(DWORD original, void* to)
 
 int main(int argc, char** argv)
 {
-    g_bg = getenv("FNV_BACKGROUND") && *getenv("FNV_BACKGROUND") == '1';
+    g_bg = getenv("FNV_BACKGROUND") && *getenv("FNV_BACKGROUND") && strcmp(getenv("FNV_BACKGROUND"), "0");   // 1 or offscreen
     if (getenv("FNV_STARTUP_WATCHDOG") && *getenv("FNV_STARTUP_WATCHDOG") == '1')
     {
         g_watchdogStart = CreateEventA(nullptr, TRUE, FALSE, nullptr);
@@ -1347,7 +1513,7 @@ int main(int argc, char** argv)
                         WritePrivateProfileStringA("Display", "iSize H", "720", dst);
                     }
                 }
-                if (getenv("FNV_BACKGROUND") && *getenv("FNV_BACKGROUND") == '1')
+                if (g_bg)
                     WritePrivateProfileStringA("General", "bAlwaysActive", "1", dst);   // keep running unfocused
             }
     }
@@ -1384,6 +1550,27 @@ int main(int argc, char** argv)
                         WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
                         ++shown;
                     }
+                if (code == 0xC0000374)   // a native thread: name the module of each code-looking stack word
+                {
+                    int named = 0;
+                    for (int i = 0; i < 1500 && named < 30 && !IsBadReadPtr(sp + i, 4); ++i)
+                    {
+                        HMODULE m = nullptr;
+                        MEMORY_BASIC_INFORMATION mbi;
+                        if (sp[i] < 0x10000 || !VirtualQuery((void*)sp[i], &mbi, sizeof(mbi)) ||
+                            !(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
+                            continue;
+                        char name[MAX_PATH] = "?";
+                        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                               (LPCSTR)sp[i], &m))
+                            GetModuleFileNameA(m, name, sizeof(name));
+                        const char* base = strrchr(name, 0x5c);
+                        n = wsprintfA(buf, "[veh]   code +%x = %08lx %s+%lx\r\n", i * 4, sp[i], base ? base + 1 : name,
+                                      sp[i] - (DWORD)m);
+                        WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
+                        ++named;
+                    }
+                }
             }
             return EXCEPTION_CONTINUE_SEARCH;
         });
@@ -1461,10 +1648,12 @@ int main(int argc, char** argv)
     AddVectoredExceptionHandler(1, redirect_original_code);
     if (!getenv("FNV_SYSHEAP") || strcmp(getenv("FNV_SYSHEAP"), "0"))
     {
-        detour(0x00AA3E40, (void*)&sysheap_alloc);
-        detour(0x00AA4060, (void*)&sysheap_free);
-        detour(0x00AA4150, (void*)&sysheap_realloc);
-        detour(0x00AA44C0, (void*)&sysheap_size);
+        bool hc = getenv("FNV_HEAPCHECK") && *getenv("FNV_HEAPCHECK") == '1';
+        detour(0x00AA3E40, hc ? (void*)&hc_sys_alloc : (void*)&sysheap_alloc);
+        detour(0x00AA4060, hc ? (void*)&hc_sys_free : (void*)&sysheap_free);
+        detour(0x00AA4150, hc ? (void*)&hc_sys_realloc : (void*)&sysheap_realloc);
+        detour(0x00AA44C0, hc ? (void*)&hc_sys_size : (void*)&sysheap_size);
+        if (hc) fprintf(g_log, "[loader] FNV_HEAPCHECK=1: guarded blocks, checked on free\n");
         fprintf(g_log, "[loader] MemoryManager routed to the CRT heap (FNV_SYSHEAP=0 to keep the game's pools)\n");
     }
     if (const char* si = getenv("FNV_SKIP_INTRO"); si && *si == '1')

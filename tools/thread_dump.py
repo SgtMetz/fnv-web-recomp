@@ -107,7 +107,7 @@ def main():
         shown = 0
         for w in range(n.value // 4):
             v = buf[w]
-            if lo <= v < hi and shown < 40:
+            if lo <= v < hi and shown < 70:
                 print('  sp+%04x %08x  %s' % (4 * w, v, name(v)))
                 shown += 1
         k32.CloseHandle(h)
