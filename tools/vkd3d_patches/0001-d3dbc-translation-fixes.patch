@@ -1,0 +1,272 @@
+diff --git a/libs/vkd3d-shader/d3dbc.c b/libs/vkd3d-shader/d3dbc.c
+index 8784ea6..278b3f4 100644
+--- a/libs/vkd3d-shader/d3dbc.c
++++ b/libs/vkd3d-shader/d3dbc.c
+@@ -818,6 +818,7 @@ static bool add_signature_element_from_register(struct vkd3d_shader_sm1_parser *
+                     VKD3D_SHADER_SV_TARGET, register_index, is_dcl, mask, dst_modifiers);
+ 
+         case VKD3DSPR_DEPTHOUT:
++            bitmap_set(sm1->program->io_dcls, VKD3DSPR_DEPTHOUT);
+             return add_signature_element(sm1, true, "DEPTH", 0,
+                     VKD3D_SHADER_SV_DEPTH, register_index, is_dcl, 0x1, dst_modifiers);
+ 
+diff --git a/libs/vkd3d-shader/ir.c b/libs/vkd3d-shader/ir.c
+index 3c5167c..d032e18 100644
+--- a/libs/vkd3d-shader/ir.c
++++ b/libs/vkd3d-shader/ir.c
+@@ -1401,6 +1401,166 @@ static enum vkd3d_result vsir_program_lower_ifc(struct vsir_program *program,
+     return VKD3D_OK;
+ }
+ 
++static enum vkd3d_result vsir_program_lower_breakc(struct vsir_program *program,
++        struct vsir_program_iterator *brk, struct vkd3d_shader_message_context *message_context)
++{
++    struct vkd3d_shader_instruction *ins = vsir_program_iterator_current(brk);
++    const struct vkd3d_shader_location location = ins->location;
++    const struct vsir_src_operand src[2] = {ins->src[0], ins->src[1]};
++    enum vkd3d_shader_rel_op rel_op = ins->flags;
++    struct vsir_program_iterator it;
++    enum vkd3d_shader_opcode opcode;
++    unsigned int cmp_id;
++    bool swap;
++
++    /* breakc_<cmp> SRC0, SRC1
++     *      ->
++     * <cmp> srCMP, SRC0, SRC1
++     * if srCMP
++     *   break
++     * endif */
++
++    if (!get_opcode_from_rel_op(rel_op, src[0].reg.data_type, &opcode, &swap))
++    {
++        vkd3d_shader_error(message_context, &location, VKD3D_SHADER_ERROR_VSIR_NOT_IMPLEMENTED,
++                "Aborting due to not yet implemented feature: opcode for rel_op %u and data type %u.",
++                rel_op, src[0].reg.data_type);
++        return VKD3D_ERROR_NOT_IMPLEMENTED;
++    }
++
++    if (!(ins = vsir_program_iterator_insert_before(brk, &it, 3)))
++        return VKD3D_ERROR_OUT_OF_MEMORY;
++    if (!vsir_instruction_init_with_params(program, ins, &location, opcode, 1, 2))
++        goto fail;
++    cmp_id = program->ssa_count++;
++    vsir_dst_operand_init_ssa_bool(&ins->dst[0], cmp_id);
++    ins->src[0] = src[swap];
++    ins->src[1] = src[!swap];
++
++    ins = vsir_program_iterator_next(&it);
++    if (!vsir_instruction_init_with_params(program, ins, &location, VSIR_OP_IF, 0, 1))
++        goto fail;
++    ins->flags = VKD3D_SHADER_CONDITIONAL_OP_NZ;
++    vsir_src_operand_init_ssa_bool(&ins->src[0], cmp_id);
++
++    ins = vsir_program_iterator_next(&it);
++    if (!vsir_instruction_init_with_params(program, ins, &location, VSIR_OP_BREAK, 0, 0))
++        goto fail;
++
++    ins = vsir_program_iterator_next(&it);
++    if (!vsir_instruction_init_with_params(program, ins, &location, VSIR_OP_ENDIF, 0, 0))
++        goto fail;
++
++    return VKD3D_OK;
++
++fail:
++    vsir_program_iterator_nop_range(&it, brk, &location);
++    return VKD3D_ERROR_OUT_OF_MEMORY;
++}
++
++static struct vkd3d_shader_instruction *lit_emit(struct vsir_program *program, struct vsir_program_iterator *it,
++        const struct vkd3d_shader_location *location, enum vkd3d_shader_opcode opcode,
++        unsigned int dst_count, unsigned int src_count, bool first)
++{
++    struct vkd3d_shader_instruction *ins = first ? vsir_program_iterator_current(it) : vsir_program_iterator_next(it);
++
++    if (!ins || !vsir_instruction_init_with_params(program, ins, location, opcode, dst_count, src_count))
++        return NULL;
++    return ins;
++}
++
++static uint32_t lit_splat(uint32_t swizzle, unsigned int comp)
++{
++    unsigned int c = vsir_swizzle_get_component(swizzle, comp);
++
++    return vkd3d_shader_create_swizzle(c, c, c, c);
++}
++
++static enum vkd3d_result vsir_program_lower_lit(struct vsir_program *program, struct vsir_program_iterator *lit)
++{
++    struct vkd3d_shader_instruction *ins = vsir_program_iterator_current(lit);
++    const struct vkd3d_shader_location location = ins->location;
++    const struct vsir_src_operand src = ins->src[0];
++    const struct vsir_dst_operand dst = ins->dst[0];
++    unsigned int mx, my, mw, cw, lg, ne, mv, ml, ex, gt, z, i;
++    struct vsir_src_operand sx, sy, sw;
++    struct vsir_program_iterator it;
++
++    /* lit DST, SRC  (D3D9 semantics)
++     *      ->
++     * DST.x = 1; DST.y = max(SRC.x, 0); DST.w = 1;
++     * DST.z = SRC.x > 0 ? pow(max(SRC.y, 0), clamp(SRC.w, -127.99, 127.99)) : 0
++     * with pow(a, b) expanded as in vsir_program_lower_pow() (so that 0^0 == 1). */
++
++    sx = sy = sw = src;
++    sx.swizzle = lit_splat(src.swizzle, 0);
++    sy.swizzle = lit_splat(src.swizzle, 1);
++    sw.swizzle = lit_splat(src.swizzle, 3);
++
++    if (!(ins = vsir_program_iterator_insert_before(lit, &it, 14)))
++        return VKD3D_ERROR_OUT_OF_MEMORY;
++    mx = program->ssa_count++; my = program->ssa_count++; mw = program->ssa_count++;
++    cw = program->ssa_count++; lg = program->ssa_count++; ne = program->ssa_count++;
++    mv = program->ssa_count++; ml = program->ssa_count++; ex = program->ssa_count++;
++    gt = program->ssa_count++; z = program->ssa_count++;
++
++#define LIT_OP(op, nd, ns, first) \
++    do { if (!(ins = lit_emit(program, &it, &location, op, nd, ns, first))) goto fail; } while (0)
++#define SSAF(id) vsir_dst_operand_init_ssa_f32(&ins->dst[0], id)
++#define SRCF(n, id) vsir_src_operand_init_ssa_f32(&ins->src[n], id)
++
++    LIT_OP(VSIR_OP_MAX, 1, 2, true);
++    SSAF(mx); ins->src[0] = sx; vsir_src_operand_init_const_f32(&ins->src[1], 0.0f);
++    LIT_OP(VSIR_OP_MAX, 1, 2, false);
++    SSAF(my); ins->src[0] = sy; vsir_src_operand_init_const_f32(&ins->src[1], 0.0f);
++    LIT_OP(VSIR_OP_MAX, 1, 2, false);
++    SSAF(mw); ins->src[0] = sw; vsir_src_operand_init_const_f32(&ins->src[1], -127.99f);
++    LIT_OP(VSIR_OP_MIN, 1, 2, false);
++    SSAF(cw); SRCF(0, mw); vsir_src_operand_init_const_f32(&ins->src[1], 127.99f);
++    LIT_OP(VSIR_OP_LOG, 1, 1, false);
++    SSAF(lg); SRCF(0, my);
++    LIT_OP(VSIR_OP_NEU, 1, 2, false);
++    vsir_dst_operand_init_ssa_bool(&ins->dst[0], ne); SRCF(0, cw); vsir_src_operand_init_const_f32(&ins->src[1], 0.0f);
++    LIT_OP(VSIR_OP_MOVC, 1, 3, false);
++    SSAF(mv); vsir_src_operand_init_ssa_bool(&ins->src[0], ne); SRCF(1, lg); SRCF(2, my);
++    LIT_OP(VSIR_OP_MUL, 1, 2, false);
++    SSAF(ml); SRCF(0, mv); SRCF(1, cw);
++    LIT_OP(VSIR_OP_EXP, 1, 1, false);
++    SSAF(ex); SRCF(0, ml);
++    LIT_OP(VSIR_OP_LTO, 1, 2, false);
++    vsir_dst_operand_init_ssa_bool(&ins->dst[0], gt); vsir_src_operand_init_const_f32(&ins->src[0], 0.0f);
++    ins->src[1] = sx;
++    LIT_OP(VSIR_OP_MOVC, 1, 3, false);
++    SSAF(z); vsir_src_operand_init_ssa_bool(&ins->src[0], gt); SRCF(1, ex);
++    vsir_src_operand_init_const_f32(&ins->src[2], 0.0f);
++
++    /* The last of these four writes lands in the slot of the original instruction. */
++    for (i = 0; i < 4; ++i)
++    {
++        unsigned int mask = dst.write_mask & (1u << i);
++
++        LIT_OP(VSIR_OP_MOV, 1, 1, false);
++        ins->dst[0] = dst;
++        ins->dst[0].write_mask = mask;
++        if (i == 0 || i == 3)
++            vsir_src_operand_init_const_f32(&ins->src[0], 1.0f);
++        else if (i == 1)
++            SRCF(0, mx);
++        else
++            SRCF(0, z);
++        if (!mask)
++            vkd3d_shader_instruction_make_nop(ins);
++    }
++#undef LIT_OP
++#undef SSAF
++#undef SRCF
++    return VKD3D_OK;
++
++fail:
++    vsir_program_iterator_nop_range(&it, lit, &location);
++    return VKD3D_ERROR_OUT_OF_MEMORY;
++}
++
+ static enum vkd3d_result vsir_program_lower_lrp(struct vsir_program *program, struct vsir_program_iterator *lrp)
+ {
+     struct vkd3d_shader_instruction *ins = vsir_program_iterator_current(lrp);
+@@ -2923,6 +3083,14 @@ static enum vkd3d_result vsir_program_lower_d3dbc_instructions(struct vsir_progr
+                 ret = vsir_program_lower_ifc(program, &it, &tmp_idx, message_context);
+                 break;
+ 
++            case VSIR_OP_LIT:
++                ret = vsir_program_lower_lit(program, &it);
++                break;
++
++            case VSIR_OP_BREAKC:
++                ret = vsir_program_lower_breakc(program, &it, message_context);
++                break;
++
+             case VSIR_OP_LRP:
+                 ret = vsir_program_lower_lrp(program, &it);
+                 break;
+@@ -4767,6 +4935,32 @@ static void vsir_src_operand_io_normalise(struct vsir_src_operand *src,
+             signature = normaliser->input_signature;
+             break;
+ 
++        case VKD3DSPR_MISCTYPE:
++        {
++            /* ps_3_0 vPos (0) and vFace (1): bind to the sysval signature elements built by the d3dbc parser. */
++            enum vkd3d_shader_sysval_semantic sv = reg->idx[0].offset == 1
++                    ? VKD3D_SHADER_SV_IS_FRONT_FACE : VKD3D_SHADER_SV_POSITION;
++
++            signature = normaliser->input_signature;
++            for (element_idx = 0; element_idx < signature->element_count; ++element_idx)
++            {
++                if (signature->elements[element_idx].sysval_semantic == sv)
++                    break;
++            }
++            if (element_idx == signature->element_count)
++            {
++                vkd3d_shader_error(normaliser->message_context, &ins->location,
++                        VKD3D_SHADER_ERROR_VSIR_INVALID_SIGNATURE,
++                        "Unable to resolve MISCTYPE register %u to a signature element.", reg->idx[0].offset);
++                normaliser->result = VKD3D_ERROR_INVALID_SHADER;
++                return;
++            }
++            reg->type = VKD3DSPR_INPUT;
++            reg->idx[0].offset = element_idx;
++            reg->idx_count = 1;
++            return;
++        }
++
+         default:
+             return;
+     }
+diff --git a/libs/vkd3d-shader/spirv.c b/libs/vkd3d-shader/spirv.c
+index 952ed87..8aa64b2 100644
+--- a/libs/vkd3d-shader/spirv.c
++++ b/libs/vkd3d-shader/spirv.c
+@@ -5595,6 +5595,20 @@ static const struct vkd3d_symbol *spirv_compiler_emit_io_register(struct spirv_c
+     return spirv_compiler_put_symbol(compiler, &reg_symbol);
+ }
+ 
++/* Tint rejects the SPIR-V Component decoration, so widen signature masks that do not start at x (e.g. v0.zw
++ * becomes v0.xyzw). The variable then always starts at component 0. */
++static void spirv_widen_signature_mask(const struct signature_element *element)
++{
++    struct signature_element *e = (struct signature_element *)element;
++    unsigned int hi;
++
++    if (!e->mask || (e->mask & 1))
++        return;
++    for (hi = 3; hi > 0 && !(e->mask & (1u << hi)); --hi)
++        ;
++    e->mask = (2u << hi) - 1;
++}
++
+ static void spirv_compiler_emit_input(struct spirv_compiler *compiler,
+         enum vkd3d_shader_register_type reg_type, unsigned int element_idx)
+ {
+@@ -5618,6 +5632,7 @@ static void spirv_compiler_emit_input(struct spirv_compiler *compiler,
+             ? &compiler->program->patch_constant_signature : &compiler->program->input_signature;
+ 
+     signature_element = &shader_signature->elements[element_idx];
++    spirv_widen_signature_mask(signature_element);
+     sysval = signature_element->sysval_semantic;
+     /* The Vulkan spec does not explicitly forbid passing varyings from the
+      * TCS to the TES via builtins. However, Mesa doesn't seem to handle it
+@@ -5830,6 +5845,7 @@ static void spirv_compiler_emit_output(struct spirv_compiler *compiler,
+             : &compiler->program->output_signature;
+ 
+     signature_element = &shader_signature->elements[element_idx];
++    spirv_widen_signature_mask(signature_element);
+     sysval = signature_element->sysval_semantic;
+     /* Don't use builtins for TCS -> TES varyings. See spirv_compiler_emit_input(). */
+     if (compiler->shader_type == VKD3D_SHADER_TYPE_HULL && !is_patch_constant)

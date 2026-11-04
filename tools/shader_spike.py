@@ -7,8 +7,12 @@ u32 size, D3D9 token stream) into out/shaders/<pkg>/ (git-ignored), then runs ev
   tint -f wgsl                                (SPIR-V -> WGSL)
 and reports pass rates and bucketed failure reasons. Nothing derived from the shaders leaves out/.
 
-usage: python tools/shader_spike.py <package.sdp> [<package.sdp> ...] [--vkd3d EXE] [--tint EXE]
+Per-shader results (sha1 of the token stream, name, profile, stage, reason) go to out/shader_results/<pkg>.jsonl.
+Arguments may be .sdp files or already-unpacked out/shaders/<pkg> directories (*.dxbc are the raw token streams).
+
+usage: python tools/shader_spike.py <package.sdp|dir> [...] [--vkd3d EXE] [--tint EXE]
 """
+import hashlib
 import argparse
 import json
 import re
@@ -57,7 +61,7 @@ def run(tools, path):
                        capture_output=True, text=True, errors='replace')
     if r.returncode or not spv.exists():
         return 'vkd3d', bucket(r.stderr + r.stdout)
-    r = subprocess.run([str(tools['tint']), str(spv), '-f', 'wgsl', '-o', str(wgsl)],
+    r = subprocess.run([str(tools['tint']), str(spv), '-f', 'wgsl', '--allow-non-uniform-derivatives', 'true', '-o', str(wgsl)],
                        capture_output=True, text=True, errors='replace')
     if r.returncode or not wgsl.exists():
         return 'tint', bucket(r.stderr + r.stdout)
@@ -74,11 +78,19 @@ def main():
     tools = dict(vkd3d=a.vkd3d, tint=a.tint)
     summary = {}
     for sdp in map(Path, a.sdp):
-        version, shaders = unpack(sdp)
         d = ROOT / 'out/shaders' / sdp.stem
+        if sdp.is_dir():
+            d = sdp
+            version = 100
+            shaders = [(f.name[:-5], f.read_bytes()) for f in sorted(d.glob('*.dxbc'))]
+        else:
+            version, shaders = unpack(sdp)
         d.mkdir(parents=True, exist_ok=True)
-        paths, profiles = [], Counter()
+        paths, profiles, p_seen = [], Counter(), {}
         for name, code in shaders:
+            if p_seen.get(name):
+                name = '%s#%d' % (name, p_seen[name])
+            p_seen[name] = p_seen.get(name, 0) + 1
             p = d / (name + '.dxbc')        # *.dxbc is git-ignored; content is legacy d3dbc
             p.write_bytes(code)
             paths.append(p)
@@ -88,13 +100,19 @@ def main():
         stages = Counter(r[0] for r in results)
         reasons = Counter((r[0], r[1]) for r in results if r[0] != 'ok')
         per_profile = Counter((profile(c), r[0]) for (n, c), r in zip(shaders, results))
-        summary[sdp.name] = dict(version=version, shaders=len(shaders), profiles=dict(profiles),
+        summary[d.name] = dict(version=version, shaders=len(shaders), profiles=dict(profiles),
                                  ok=stages['ok'], vkd3d_fail=stages['vkd3d'], tint_fail=stages['tint'],
                                  pass_rate=round(stages['ok'] / len(shaders), 4),
                                  by_profile={'%s/%s' % k: v for k, v in sorted(per_profile.items())},
                                  top_failures=[[s, m, n] for (s, m), n in reasons.most_common(12)],
                                  failed=[[n, r[0]] for (n, _), r in zip(shaders, results) if r[0] != 'ok'])
-        s = summary[sdp.name]
+        rd = ROOT / 'out/shader_results'
+        rd.mkdir(parents=True, exist_ok=True)
+        with open(rd / (d.name + '.jsonl'), 'w') as f:
+            for (n, c), r in zip(shaders, results):
+                f.write(json.dumps(dict(hash=hashlib.sha1(c).hexdigest(), name=n, profile=profile(c),
+                                        stage=r[0], reason=r[1])) + chr(10))
+        s = summary[d.name]
         print('%s: %d shaders %s  ok=%d vkd3d_fail=%d tint_fail=%d' % (sdp.name, s['shaders'], s['profiles'],
                                                                         s['ok'], s['vkd3d_fail'], s['tint_fail']))
         for st, m, n in s['top_failures']:
