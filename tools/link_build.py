@@ -1378,6 +1378,34 @@ def main():
     tick('symbol tables + dup scan')
     exe_key = img.data + (DECOMP / 'build/units.json').read_bytes()
     ctx['orig_calls'] = cached('orig_calls', exe_key, lambda: original_calls(img, units))
+    # Float-return disagreements: one name for an address returns float/double (in st0), another void/int/pointer.
+    # A caller compiled from the non-float name never pops st0 (one x87 register leaked per call); a float-declared
+    # caller of a non-float callee pops nothing (-nan). Lift the address and every compiled caller of it, so both
+    # sides follow the original's x87 use (0x4bd400 inventory value/weight: HUD activate-prompt update jumped to a
+    # stack address while walking around Doc Mitchell's house).
+    if not os.environ.get('FNV_NO_FLOATLIFT'):
+        def rtype_(name):
+            if not name.startswith('?') or name.startswith(('??_', '??$', '??0', '??1')):
+                return None
+            i_ = name.find('@@')
+            t_ = name[i_ + 2:] if i_ >= 0 else ''
+            if not t_:
+                return None
+            return (t_[2:] if t_[0] in STATIC_CLASS else t_[3:] if t_[0] in MEMBER_CLASS else '') or None
+        kinds_ = defaultdict(set)
+        for u_ in units:
+            for f_ in u_['functions']:
+                r_ = rtype_(f_['symbol'])
+                if r_:
+                    kinds_[int(f_['address'], 16)].add(r_[:1] in 'MNO')
+            for n_, v_ in u_.get('symbols', {}).items():
+                r_ = rtype_(n_)
+                if r_:
+                    kinds_[int(v_, 0)].add(r_[:1] in 'MNO')
+        float_mm = {a_ for a_, k_ in kinds_.items() if len(k_) == 2}
+        float_callers = {fn_ for fn_, tg_ in ctx['orig_calls'].items() if tg_ & float_mm}
+        ctx['lift_replace'] |= {x_ for x_ in float_mm | float_callers if owner.get(x_) is not None}
+        print('   float-return disagreements: %d addresses, %d callers' % (len(float_mm), len(float_callers)))
     # bool/char/short-declared parameters that the original reads as a full dword (tools/narrow_params.py): clang
     # zero-extends the byte, so a forwarded pointer is truncated (0xa52b00 passed CloningProcess* as a byte)
     if not os.environ.get('FNV_NO_NARROWPARAM'):
