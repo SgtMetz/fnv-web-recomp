@@ -184,6 +184,49 @@ def passes_edx(name):
         return None
 
 
+def preserved_across_calls(exe, text_range, units, watch=('ecx', 'edx')):
+    """Callees whose original callers read ECX/EDX right after the call, before writing it: the caller relies on the
+    callee leaving that volatile register alone (MSVC LTCG knows the callee's register use). 0xd142b0
+    (hkp3AxisSweep::addObject) sets EDX = node index, calls 0xd10b30, then stores `handle->m_id = edx`; the clang
+    build of 0xd10b30 clobbers EDX, so m_id became a leftover pointer and the broadphase later indexed with it
+    (0xd12040). Lifted callees keep the original register behaviour. A callee that returns a 64-bit value in EDX:EAX
+    is also flagged, which only costs speed.
+
+    Returns {callee: sorted registers} over direct calls in recipe functions (straight-line scan from the return
+    address to the next branch/call/ret)."""
+    cache = lift_stubs.text_cache(exe, text_range)
+    spans = {int(f['address'], 16): f['size'] for u in units for f in u['functions']}
+    out = defaultdict(set)
+    for f, size in spans.items():
+        code = decode(cache.lines(f, f + size))
+        for a in sorted(code):
+            n, mnem, ops = code[a]
+            if mnem != 'call':
+                continue
+            try:
+                t = int(ops.split()[0], 16)
+            except ValueError:
+                continue
+            if t not in spans:
+                continue
+            written, x = set(), a + n
+            while x in code:
+                k, mn, op = code[x]
+                if mn in ('call', 'ret', 'int3', 'hlt', 'ud2') or mn.startswith(('j', 'loop', 'rep')):
+                    break
+                r, w = effect(mn, op)
+                if mn == 'push' and op == 'ecx':
+                    r = set()                         # `push ecx` reserves a slot (`push ecx; fstp [esp]`)
+                hit = (r & set(watch)) - written
+                if hit:
+                    out[t] |= hit
+                written |= w
+                if written >= set(watch):
+                    break
+                x += k
+    return {t: sorted(r) for t, r in out.items()}
+
+
 def ecx_free_callers(exe, text_range, units):
     return reg_free_callers(exe, text_range, units, 'ecx', passes_ecx)
 

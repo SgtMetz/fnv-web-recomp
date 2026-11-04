@@ -1308,8 +1308,16 @@ def main():
                      # calls the base dtor 0x57c930 with this+4 (it then clears a garbage map: null table read).
         0x00DAF1E0,  # Havok GSK manifold: the unit calls its own static copy of 0xdae220 (another model type); the
                      # compiled call faulted reading [0+3] after New Game. Lifted: crash moved to 0xd12040.
-        0x00C540A0}  # NiIntegersExtraData::LoadBinary: the lifted entry loader 0xc545d0 writes past the decomp's
+        0x00C540A0,  # NiIntegersExtraData::LoadBinary: the lifted entry loader 0xc545d0 writes past the decomp's
                      # local, the compiled frame fails its /GS cookie check (overrun) after New Game.
+        0x00659710,  # FaceGenTextureFile dtor: the original destroys its two 0x18-byte members with __ehvec_dtor
+        0x00659AB0,  # and element dtor 0x65ce40; the decomp relies on implicit member dtors. With these compiled,
+        0x00659C40,  # a worker freeing face textures hit heap corruption (c0000374); lifted, it is gone.
+        0x004BC320,  # BSRenderedTexture::GetTexture: `(this ? m_textures[i] : GO(0))` copies the NiPointer bitwise
+                     # (GO has a dtor, no copy ctor) and releases the copy: one lost reference per call, the render
+                     # target was freed and reused (call through a 2-slot vtable into "ANIM" text). Lifted: gone.
+        0x00B5AC90}  # shadow scene frustum update: the decomp's local is 0x30 bytes, the original's ~0x90; lifted
+                     # 0xa694a0 writes past it over the saved `this` (-1.0f, read of 0xbf8001e0). Lifted: gone.
     # Compiled bodies that call a synthetic constructor/destructor/specialization nothing defines (tools/trap_refs.py,
     # generated from the previous link): the soft trap skips the call, e.g. 0x441c50 never constructs its
     # NiPointer<LoadedFile> (garbage DecRef later), 0x431890/0x4786e0 skip member destructors. The original calls
@@ -1322,6 +1330,13 @@ def main():
         ctx['lift_replace'] |= {int(a_, 16) for a_, ns_ in json.loads(trap_refs_p.read_text()).items()
                                 if owner.get(int(a_, 16)) is not None and
                                 any(not n_.endswith('[eh]') for n_ in ns_)}
+    # Compiled bodies that skip a constructor their original runs (tools/ctor_refs.py, generated from the previous
+    # link like trap_refs.json): the decomp's type has no user constructor, clang's implicit one stores only the
+    # vtable. 0xb9a530 left a render pass list's head/count as stale heap bytes (a music file-name table).
+    ctor_refs_p = ROOT / 'out/ctor_refs.json'
+    if ctor_refs_p.exists() and not os.environ.get('FNV_NO_CTORLIFT'):
+        ctx['lift_replace'] |= {int(a_, 16) for a_ in json.loads(ctor_refs_p.read_text())
+                                if owner.get(int(a_, 16)) is not None}
     # bool/char-declared bodies whose original passes a full 32-bit EAX through (see narrow_mismatches)
     if not os.environ.get('FNV_NO_NARROWLIFT'):
         ctx['lift_replace'] |= {a_ for a_ in narrow_mismatches(units) if owner.get(a_) is not None}
@@ -1372,6 +1387,15 @@ def main():
         ecx_lift = {f for f, t, _ in ecx_sites if t in ecx_cand} | {t for t in ecx_cand if ecx_callees[t] is False}
         ctx['lift_replace'] |= {x for x in ecx_lift if owner.get(x) is not None}
         stats_reg += (len(ecx_cand), len(ecx_lift))
+        # callees whose original callers read ECX/EDX right after the call (tools/reg_inputs.py
+        # preserved_across_calls): the caller relies on the callee leaving the register alone (0xd142b0 stores
+        # handle->m_id = EDX after calling 0xd10b30; the clang 0xd10b30 clobbers EDX). Lift the callees.
+        if not os.environ.get('FNV_NO_PRESERVELIFT'):
+            kept = cached('preserved_across_calls', exe_key + (ROOT / 'tools/reg_inputs.py').read_bytes(),
+                          lambda: reg_inputs.preserved_across_calls(a.exe, (text['start'], text['end']), units))
+            ctx['lift_replace'] |= {x for x in kept if owner.get(x) is not None}
+            print('   register-preserving callees lifted: %d of %d' %
+                  (sum(1 for x in kept if owner.get(x) is not None), len(kept)))
     else:
         stats_reg = (0, 0, 0, 0)
     # Tail-jumping thunks (adjustor thunks `sub [esp+4],N; jmp T`, COM forwarders `mov [esp+4],x; jmp [vtbl+N]`) whose

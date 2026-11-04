@@ -434,9 +434,27 @@ LONG CALLBACK bp_handler(EXCEPTION_POINTERS* ep)
                     snprintf(g_bpRing[k3 & 63], sizeof(g_bpRing[0]), "%08lx hit %d ecx=%08lx edx=%08lx ret=%08lx args %08lx %08lx %08lx %08lx", b.original, b.hits + 1,
                              c->Ecx, c->Edx, sp3[0], sp3[1], sp3[2], sp3[3], sp3[4]);
                 }
-                if (b.hits++ < 40)
+                // FNV_BP_FROM=N: log hits N..N+39 (default 1): a crash at hit 199 is past the first 40
+                static const LONG bpFrom = getenv("FNV_BP_FROM") ? atol(getenv("FNV_BP_FROM")) : 1;
+                ++b.hits;
+                if (b.hits >= bpFrom && b.hits < bpFrom + 40)
                 {
                     DWORD* sp = (DWORD*)c->Esp;
+                    // FNV_BP_LIST=headoff,nextoff: walk the singly linked list whose head pointer is at
+                    // [ecx+headoff], following [node+nextoff], printing each node until an unreadable one
+                    if (const char* lw = getenv("FNV_BP_LIST"))
+                    {
+                        char* e2;
+                        DWORD ho = strtoul(lw, &e2, 16), no = *e2 == 0x2c ? strtoul(e2 + 1, nullptr, 16) : 0;
+                        DWORD node = IsBadReadPtr((void*)(c->Ecx + ho), 4) ? 0 : *(DWORD*)(c->Ecx + ho);
+                        for (int k = 0; node && k < 400; ++k)
+                        {
+                            if (IsBadReadPtr((void*)node, 16)) { fprintf(g_log, "[bp]     list #%d %08lx unreadable\n", k, node); break; }
+                            DWORD* v = (DWORD*)node;
+                            fprintf(g_log, "[bp]     list #%d %08lx: %08lx %08lx %08lx %08lx\n", k, node, v[0], v[1], v[2], v[3]);
+                            node = *(DWORD*)(node + no);
+                        }
+                    }
                     fprintf(g_log, "[bp] %08lx hit %d thread %lu eax=%08lx ecx=%08lx edx=%08lx esp=%08lx ret=%08lx args %08lx %08lx %08lx %08lx\n", b.original, b.hits,
                             GetCurrentThreadId(), c->Eax, c->Ecx, c->Edx, c->Esp, sp[0], sp[1], sp[2], sp[3], sp[4]);
                     if (c->Ecx > 0x10000 && !IsBadReadPtr((void*)c->Ecx, 4))   // object chain: ecx -> *ecx -> vtable entries
@@ -1352,13 +1370,14 @@ int main(int argc, char** argv)
                               ep->ExceptionRecord->NumberParameters > 0 ? (DWORD)ep->ExceptionRecord->ExceptionInformation[0] : 0,
                               ep->ExceptionRecord->NumberParameters > 1 ? (DWORD)ep->ExceptionRecord->ExceptionInformation[1] : 0);
             DWORD w; WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
-            if (ep->ExceptionRecord->ExceptionCode == 0xC0000005 && !IsBadReadPtr((void*)ep->ContextRecord->Esp, 128))
-            {
+            DWORD code = ep->ExceptionRecord->ExceptionCode;
+            if ((code == 0xC0000005 || code == 0xC0000374) && !IsBadReadPtr((void*)ep->ContextRecord->Esp, 128))
+            {   // c0000374 (heap corruption) ends the process without the crash handler: this is the only stack
                 DWORD* sp = (DWORD*)ep->ContextRecord->Esp;
                 n = wsprintfA(buf, "[veh]   stack %08lx %08lx %08lx %08lx %08lx %08lx %08lx %08lx\r\n", sp[0], sp[1], sp[2], sp[3], sp[4], sp[5], sp[6], sp[7]);
                 WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), buf, n, &w, nullptr);
                 int shown = 0;
-                for (int i = 8; i < 3000 && shown < 14 && !IsBadReadPtr(sp + i, 4); ++i)
+                for (int i = 8; i < 3000 && shown < (code == 0xC0000374 ? 40 : 14) && !IsBadReadPtr(sp + i, 4); ++i)
                     if (sp[i] >= 0x20001000 && sp[i] < 0x24000000)
                     {
                         n = wsprintfA(buf, "[veh]   dll word +%x = %08lx\r\n", i * 4, sp[i]);

@@ -280,6 +280,8 @@ class Lifter:
             return ('reg8', 8, op)
         if re.match(r'^xmm\d$', op):
             return ('xmm', 128, op[3:])
+        if re.match(r'^mm\d$', op):
+            return ('mm', 64, op[2:])                # MMX: 8-byte copies through mm0 (0xd10b30)
         if re.match(r'^st(\(\d\))?$', op):
             return ('st', 80, op)
         if op in ('cs', 'ds', 'es', 'ss', 'fs', 'gs'):         # segment selectors of a 32-bit Windows process
@@ -504,6 +506,52 @@ class Lifter:
             return '{ uint32_t f_ = POP(); s.cf = f_ & 1; s.pf = (f_ >> 2) & 1; s.zf = (f_ >> 6) & 1; s.sf = (f_ >> 7) & 1; s.of = (f_ >> 11) & 1; lift_flags_id() = f_ & 0x200000u; }'
         if mnem == 'cpuid':
             return '{ int r_[4]; __cpuidex(r_, (int)s.eax, (int)s.ecx); s.eax = r_[0]; s.ebx = r_[1]; s.ecx = r_[2]; s.edx = r_[3]; }'
+        if mnem == 'movq' and len(P) == 2 and 'mm' in (P[0][0], P[1][0]):
+            d, s_ = P[0], P[1]
+            src = {'mm': 'MMX(%s)', 'xmm': 'X(%s)'}.get(s_[0], '(const uint8_t*)(uintptr_t)%s') % s_[2]
+            if d[0] == 'mm':
+                return 'memmove(MMX(%s), %s, 8);' % (d[2], src)
+            if d[0] == 'xmm':
+                return '{ uint8_t t_[8]; memcpy(t_, %s, 8); memset(X(%s), 0, 16); memcpy(X(%s), t_, 8); }' % (src, d[2], d[2])
+            return 'memcpy((uint8_t*)(uintptr_t)%s, %s, 8);' % (d[2], src)
+        if mnem == 'emms':
+            return ''
+        # packed integer ops on mm (8 bytes) or xmm (16 bytes), lane by lane (0xd10b30's MMX loop, Havok pslld)
+        PACKED = {'pcmpgtw': ('int16_t', 'a_[i_] > b_[i_] ? (int16_t)-1 : (int16_t)0'),
+                  'paddw': ('uint16_t', 'a_[i_] + b_[i_]'), 'psubw': ('uint16_t', 'a_[i_] - b_[i_]'),
+                  'paddb': ('uint8_t', 'a_[i_] + b_[i_]'), 'psubq': ('uint64_t', 'a_[i_] - b_[i_]'),
+                  'paddd': ('uint32_t', 'a_[i_] + b_[i_]'), 'psubd': ('uint32_t', 'a_[i_] - b_[i_]'),
+                  'pand': ('uint64_t', 'a_[i_] & b_[i_]'), 'pandn': ('uint64_t', '~a_[i_] & b_[i_]'),
+                  'por': ('uint64_t', 'a_[i_] | b_[i_]'), 'pxor': ('uint64_t', 'a_[i_] ^ b_[i_]')}
+        SHIFTS = {'pslld': ('uint32_t', '<<', 32), 'psrld': ('uint32_t', '>>', 32), 'psllw': ('uint16_t', '<<', 16),
+                  'psrlw': ('uint16_t', '>>', 16), 'psllq': ('uint64_t', '<<', 64), 'psrlq': ('uint64_t', '>>', 64)}
+        if len(P) == 2 and P[0][0] in ('mm', 'xmm') and (mnem in PACKED or (mnem in SHIFTS and P[1][0] == 'imm')):
+            nb = 8 if P[0][0] == 'mm' else 16
+            dst = ('MMX(%s)' if P[0][0] == 'mm' else 'X(%s)') % P[0][2]
+            if mnem in SHIFTS:
+                t, op_, w = SHIFTS[mnem]
+                n_ = P[1][2] & 0xff
+                expr = '(%s)(a_[i_] %s %d)' % (t, op_, n_) if n_ < w else '(%s)0' % t
+                return ('{ %s a_[%d]; memcpy(a_, %s, %d); for (int i_ = 0; i_ < %d; ++i_) a_[i_] = %s; memcpy(%s, a_, %d); }'
+                        % (t, nb * 8 // w, dst, nb, nb * 8 // w, expr, dst, nb))
+            t, expr = PACKED[mnem]
+            src = {'mm': 'MMX(%s)', 'xmm': 'X(%s)'}.get(P[1][0], '(const uint8_t*)(uintptr_t)%s') % P[1][2]
+            n = nb // int({'int16_t': 2, 'uint16_t': 2, 'uint8_t': 1, 'uint32_t': 4, 'uint64_t': 8}[t])
+            return ('{ %s a_[%d], b_[%d]; memcpy(a_, %s, %d); memcpy(b_, %s, %d); for (int i_ = 0; i_ < %d; ++i_) '
+                    'a_[i_] = (%s)(%s); memcpy(%s, a_, %d); }' % (t, n, n, dst, nb, src, nb, n, t, expr, dst, nb))
+        if mnem == 'movd' and len(P) == 2 and P[1][0] in ('xmm', 'mm') and P[0][0] in ('reg', 'mem'):
+            return '{ uint32_t v_; memcpy(&v_, %s, 4); %s }' % (
+                ('MMX(%s)' if P[1][0] == 'mm' else 'X(%s)') % P[1][2], self.write(P[0], 'v_'))
+        if mnem in ('punpcklwd', 'punpckhwd') and len(P) == 2 and P[0][0] == 'xmm':
+            src = 'X(%s)' % P[1][2] if P[1][0] == 'xmm' else '(const uint8_t*)(uintptr_t)%s' % P[1][2]
+            half = 0 if mnem == 'punpcklwd' else 4
+            return ('{ uint16_t a_[8], b_[8], r_[8]; memcpy(a_, X(%s), 16); memcpy(b_, %s, 16); '
+                    'for (int i_ = 0; i_ < 4; ++i_) { r_[2 * i_] = a_[%d + i_]; r_[2 * i_ + 1] = b_[%d + i_]; } '
+                    'memcpy(X(%s), r_, 16); }') % (P[0][2], src, half, half, P[0][2])
+        if mnem == 'psrlq' and len(P) == 2 and P[0][0] == 'xmm' and P[1][0] == 'imm':
+            n_ = P[1][2] & 0xff
+            return ('{ uint64_t q_[2]; memcpy(q_, X(%s), 16); q_[0] = %s; q_[1] = %s; memcpy(X(%s), q_, 16); }') % (
+                P[0][2], 'q_[0] >> %d' % n_ if n_ < 64 else '0', 'q_[1] >> %d' % n_ if n_ < 64 else '0', P[0][2])
         if mnem == 'movq' and len(P) == 2 and (P[0][0] == 'xmm' or P[1][0] == 'xmm'):
             d, s_ = P[0], P[1]
             if d[0] == 'xmm':
@@ -911,6 +959,8 @@ class Lifter:
                     self.resync(a, end)
         lines = ['static void body_%08x(uint32_t in_ecx, uint32_t in_edx, const uint32_t* in_args, FnvLiftReturn* out)'
                  % entry, '{', '    LIFT_STATE(in_ecx, in_edx, in_args, out);']
+        if self.reads_ebp_on_entry(entry):
+            lines.append('    LIFT_EBP_IN();  // addresses the caller\'s frame through ebp (a funclet)')
         for a in sorted(body):
             if a in labels:
                 lines.append('L_%08x:' % a)
@@ -918,6 +968,24 @@ class Lifter:
         lines.append('    RETURN(0);')
         lines.append('}')
         self.lifted[entry] = '\n'.join(lines)
+
+    def reads_ebp_on_entry(self, entry):
+        """True when the straight-line code from the entry reads EBP before writing it (`push ebp` is a save)."""
+        a = entry
+        for _ in range(16):
+            if a not in self.ins:
+                return False
+            n, _, mnem, ops = self.ins[a][:4]
+            if mnem == 'push' and ops.strip() == 'ebp':
+                return False
+            if re.match(r'^(mov|lea|pop)$', mnem) and re.match(r'^ebp\b', ops.strip()):
+                return False
+            if mnem.startswith(('j', 'call', 'ret')):
+                return False
+            if re.search(r'\bebp\b', ops):
+                return True
+            a += n
+        return False
 
     def cache_path(self):
         """out/cache/lift_<key>.pickle: bodies from the previous run, keyed by this file's text and the exe (derived

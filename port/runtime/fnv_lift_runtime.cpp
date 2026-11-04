@@ -70,6 +70,8 @@ extern "C" uint32_t __cdecl fnv_lift_tls_array(void)
     return (uint32_t)(uintptr_t)&fnv_lift_tls_slot;
 }
 
+thread_local uint32_t fnv_lift_ebp_in;   // see fnv_lift.h
+
 extern "C" {
 
 // fn: callee; ecx: this/fastcall arg; args: emulated stack at the call (first argument first); out: results

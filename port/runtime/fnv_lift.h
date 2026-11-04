@@ -59,6 +59,7 @@ struct FnvLiftState
     double st[8];
     int depth;                       // x87 stack depth (st[depth-1] is ST(0))
     alignas(16) uint8_t xmm[8][16];
+    uint8_t mm[8][8];                // MMX registers
     uint32_t* stack;
     size_t arena_mark;
 
@@ -91,6 +92,7 @@ struct FnvLiftState
 #define MF(a) (*(float*)(uintptr_t)(a))
 #define MD(a) (*(double*)(uintptr_t)(a))
 #define X(i) (s.xmm[i])
+#define MMX(i) (s.mm[i])
 #define PUSH(v) do { uint32_t v__ = (uint32_t)(v); s.esp -= 4; M32(s.esp) = v__; } while (0)
 #define POP() (s.esp += 4, M32(s.esp - 4))
 #define ST(i) (s.st[s.depth - 1 - (i)])
@@ -118,9 +120,16 @@ inline int lift_parity(uint32_t r) { r &= 0xff; r ^= r >> 4; r ^= r >> 2; r ^= r
 #define SAHF() do { uint32_t ah__ = (s.eax >> 8) & 0xffu; s.sf = (ah__ >> 7) & 1; s.zf = (ah__ >> 6) & 1; \
     s.pf = (ah__ >> 2) & 1; s.cf = ah__ & 1; } while (0)
 
+// The caller's emulated ebp, for the few lifted functions that read EBP on entry: CRT/SEH funclets the parent calls
+// with `call` and that address the parent's frame (0xecaf0c, the finally block of __ehvec_copy_ctor 0xecaebb, reads
+// [ebp-0x20]). The lifter loads s.ebp from here only in those bodies (LIFT_EBP_IN).
+extern thread_local uint32_t fnv_lift_ebp_in;
+#define LIFT_EBP_IN() (s.ebp = fnv_lift_ebp_in)
+
 inline void fnv_lift_do_call(FnvLiftState& s, void* fn, uint32_t args)
 {
     FnvLiftCall r;
+    fnv_lift_ebp_in = s.ebp;
     r.in_edx = s.edx;
     r.in_ebx = s.ebx;
     r.in_esi = s.esi;
