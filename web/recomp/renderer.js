@@ -384,7 +384,16 @@ export class Renderer {
       if (!j) { this.warn('no WGSL for shader ' + sha); return; }
       sh.info = j.info; sh.name = j.name;
       // both stages bind from group 0 in the translation: the pixel stage moves to group 1
-      sh.wgsl = stage ? j.wgsl.replace(/@group\(0u?\)/g, '@group(1u)') : j.wgsl;
+      let code = stage ? j.wgsl.replace(/@group\(0u?\)/g, '@group(1u)') : j.wgsl;
+      // relative constant addressing (skinning: c[a0.x + n]) can reach any register, but the translation sizes the
+      // array to the highest register it saw: give such shaders the whole register file
+      const c = sh.info.bindings.constants;
+      if (c && /tint_symbol\[\(/.test(code)) {
+        const full = stage ? 224 : 256;
+        code = code.replace(/(tint_symbol\s*:\s*array<vec4<f32>,\s*)\d+u?>/, `$1${full}u>`);
+        sh.info = { ...sh.info, bindings: { ...sh.info.bindings, constants: { ...c, vec4_count: full } } };
+      }
+      sh.wgsl = code;
     });
     this.shaders.set(id, sh);
   }
