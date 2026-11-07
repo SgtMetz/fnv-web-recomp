@@ -4,8 +4,12 @@
 
 #include <string.h>
 
+#include <stdlib.h>
+
+#include <chrono>
 #include <deque>
 #include <mutex>
+#include <thread>
 
 namespace {
 #define A(i) harg(s, (i))
@@ -115,6 +119,29 @@ const PalEntry kInput[] = {{"DirectInput8Create", p_DirectInput8Create}, {nullpt
 } // namespace
 
 const PalEntry* pal_input_entries() { return kInput; }
+
+// FNV_INPUT_SCRIPT="ms:dik,ms:dik,..." (hex scan codes, delays from the previous step, the first from start-up): key
+// taps for unattended runs, the same in the native host and the browser
+void pal_input_script(const char* script)
+{
+    std::string sc(script);
+    std::thread([sc]() {
+        size_t i = 0;
+        while (i < sc.size())
+        {
+            size_t comma = sc.find(',', i);
+            std::string step = sc.substr(i, comma == std::string::npos ? std::string::npos : comma - i);
+            i = comma == std::string::npos ? sc.size() : comma + 1;
+            size_t colon = step.find(':');
+            if (colon == std::string::npos) continue;
+            std::this_thread::sleep_for(std::chrono::milliseconds(atoi(step.c_str())));
+            int dik = (int)strtol(step.c_str() + colon + 1, nullptr, 16);
+            pal_input_key(dik, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(150));
+            pal_input_key(dik, false);
+        }
+    }).detach();
+}
 
 // host input (browser): DirectInput scan code (DIK_*) down/up, mouse movement and buttons
 void pal_input_key(int dik, bool down)

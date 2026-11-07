@@ -517,6 +517,7 @@ int main(int argc, char** argv)
     if (g_browser) pal_d3d_enable_ring(128u << 20);         // web/recomp/renderer.js consumes it on the page's thread
     else if (chdir(dir.c_str())) logf("[web] cannot enter %s\n", dir.c_str());
     if (const char* rd = getenv("FNV_RING_DUMP")) start_ring_dump(rd);
+    if (const char* sc = getenv("FNV_INPUT_SCRIPT")) pal_input_script(sc);
     if (const char* w = getenv("FNV_START_DELAY")) usleep(1000u * (unsigned)atoi(w));   // race test: let the pool load
     // node: the game's main thread runs on the runtime's main thread (blocking is allowed there), so a wasm trap
     // reaches the uncaughtException hook (pre-js) while the instance is intact and fnv_dump_state can report it

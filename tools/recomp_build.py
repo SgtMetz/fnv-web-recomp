@@ -52,7 +52,7 @@ def main():
     t0 = time.time()
     hdr = hashlib.sha1(b''.join(h.read_bytes() for h in HEADERS) + a.opt.encode() +
                        (b'trace' if os.environ.get('FNV_CALL_TRACE') else b'')).hexdigest()
-    srcs = [ROOT / 'port/recomp/fnv_recomp_rt.cpp', ROOT / 'port/recomp/host_win32.cpp', ROOT / 'port/recomp/fnv_intrinsics.cpp', ROOT / 'port/recomp/pal_kernel.cpp', ROOT / 'port/recomp/pal_fs_std.cpp'] + sorted(OUT.glob('recomp_*.cpp'))
+    srcs = [ROOT / 'port/recomp/fnv_recomp_rt.cpp', ROOT / 'port/recomp/host_win32.cpp', ROOT / 'port/recomp/fnv_intrinsics.cpp', ROOT / 'port/recomp/pal_kernel.cpp', ROOT / 'port/recomp/pal_fs_std.cpp', ROOT / 'port/recomp/pal_com.cpp', ROOT / 'port/recomp/pal_input.cpp'] + sorted(OUT.glob('recomp_*.cpp'))
     objdir = OUT / 'obj'
     objdir.mkdir(parents=True, exist_ok=True)
     jobs = [(s, objdir / (s.stem + '.obj'), a.opt, hashlib.sha1(s.read_bytes()).hexdigest() + hdr) for s in srcs]

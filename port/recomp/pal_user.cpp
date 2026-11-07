@@ -293,6 +293,14 @@ void x_XInputSetState(FnvCpu& s) { RET(1167, 2); }
 // ---- Steam API wrapper (cdecl): no client; interface getters return null ----------------------------------------
 void st_false(FnvCpu& s) { RETC(0); }
 
+// ---- libvorbisfile (cdecl): no Ogg decoding yet. Opening reports OV_ENOTVORBIS so the game skips the stream, and
+// the queries answer a valid stereo 44.1 kHz description (the game divides by the rate). ----------------------------
+uint32_t g_vorbis_info[8] = {0, 2, 44100, 0, 0, 0, 0, 0};    // vorbis_info: version, channels, rate, bitrates
+void ov_open_callbacks_(FnvCpu& s) { RETC(0xFFFFFF7Cu); }   // -132
+void ov_info_(FnvCpu& s) { RETC((uint32_t)(uintptr_t)g_vorbis_info); }
+void ov_pcm_total_(FnvCpu& s) { s.edx = 0; RETC(0); }
+void ov_zero_(FnvCpu& s) { RETC(0); }
+
 // ---- d3d9 module function ---------------------------------------------------------------------------------------------
 void d_D3DPERF_SetOptions(FnvCpu& s) { RET(0, 1); }
 
@@ -331,6 +339,8 @@ const PalEntry kUser[] = {
     {"SteamAPI_Init", st_false}, {"SteamAPI_IsSteamRunning", st_false}, {"SteamAPI_RegisterCallback", st_false},
     {"SteamAPI_UnregisterCallback", st_false}, {"SteamAPI_RunCallbacks", st_false}, {"SteamAPI_Shutdown", st_false},
     {"SteamApps", st_false}, {"SteamFriends", st_false}, {"SteamUser", st_false}, {"SteamUserStats", st_false},
+    {"ov_open_callbacks", ov_open_callbacks_}, {"ov_info", ov_info_}, {"ov_pcm_total", ov_pcm_total_},
+    {"ov_read", ov_zero_}, {"ov_clear", ov_zero_}, {"ov_seekable", ov_zero_},
     {"SteamUtils", st_false}, {"D3DPERF_SetOptions", d_D3DPERF_SetOptions},
     {nullptr, nullptr}};
 } // namespace

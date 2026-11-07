@@ -88,6 +88,7 @@ const USAGE_NAMES = ['position', 'blendweight', 'blendindices', 'normal', 'psize
 function semanticsOf(usage, index) {
   const n = USAGE_NAMES[usage] || 'unknown';
   const s = [n + index];
+  if (index === 0) s.push(n);                       // the manifests drop the 0 on tangent, binormal and color
   if (usage === 1) s.push('weight');
   if (usage === 2) s.push('blend');
   if (usage === 10 && index === 1) s.push('specular0');
@@ -548,6 +549,9 @@ export class Renderer {
       pre.push(`  let ${p.name} = ${convertExpr(p.name + '_in', vt, p.type)};`);
     }
     let code = joinEntry(e, params, pre);
+    // debugging: renderer.debugPs = {name substring: 'vec4<f32>(...)'} replaces the colour those shaders write
+    for (const [k, v] of Object.entries(this.debugPs || {}))
+      if (ps.name.includes(k)) code = code.replace(/(\n\s*main_inner\([^;]*\);)/, `$1\n  o0 = ${v};`);
     if (alpha) {
       const [func, ref] = alpha;
       const op = { 1: 'false', 2: 'a < r', 3: 'a == r', 4: 'a <= r', 5: 'a > r', 6: 'a != r', 7: 'a >= r', 8: 'true' }[func] || 'true';
@@ -754,6 +758,9 @@ export class Renderer {
     if (vstate.zeroSlot) pass.setVertexBuffer(slot, this.zeroVB);
     if (isUP) this.streams[0] = savedStream0;
     this.stats.draws++;
+    if (this.trace) this.trace.push({ vs: vs.name, ps: ps.name, prim, count, rt: this.rt.map((r) => r && r.id), depth: this.depth,
+      tex: texViews.map((v, i) => { const st = i < vs.info.bindings.samplers.length ? 16 + vs.info.bindings.samplers[i].n : ps.info.bindings.samplers[i - vs.info.bindings.samplers.length].n; const tx = this.textures.get(this.tex[st]); return tx ? `${tx.id}:${tx.fmt}:${tx.w}x${tx.h}${v === tx.sampleView ? '' : '(dummy)'}` : 'none'; }),
+      blend: rs[RS.ALPHABLENDENABLE] ? `${rs[RS.SRCBLEND]}/${rs[RS.DESTBLEND]}` : 'off', alpha, z: `${rs[RS.ZENABLE]}${rs[RS.ZWRITEENABLE]}${rs[RS.ZFUNC]}`, stencil: rs[RS.STENCILENABLE] });
     if (fanIndex != null) {
       pass.setIndexBuffer(this.vertexArena, 'uint32', fanIndex);
       pass.drawIndexed(count, instances, 0, indexed && !isUP ? baseVertex : 0, 0);
@@ -813,7 +820,14 @@ export class Renderer {
     if (this.pendingDestroy) { for (const g of this.pendingDestroy) g.destroy(); this.pendingDestroy = null; }
   }
 
+  // debugging: the draws of the next whole frame
+  traceFrame() {
+    return new Promise((resolve) => { this.traceWant = resolve; });
+  }
+
   present() {
+    if (this.trace && this.traceWant) { const r = this.traceWant; this.traceWant = null; r(this.trace); this.trace = null; }
+    else if (this.traceWant && !this.trace) this.trace = [];
     const bb = this.textures.get(1);
     this.endPass();
     if (bb) {
@@ -915,7 +929,8 @@ export class Renderer {
         break;
       }
       case OP.SCISSOR: this.scissor = [w[0] | 0, w[1] | 0, w[2] | 0, w[3] | 0]; break;
-      case OP.CLEAR: this.clear(w[0], w[1], new Float32Array(w.slice(2, 3).buffer)[0], w[3]); break;
+      case OP.CLEAR: if (this.trace) this.trace.push({ clear: w[0], color: w[1].toString(16), rt: this.rt.map((r) => r && r.id), vp: this.viewport.slice(0, 4) });
+        this.clear(w[0], w[1], new Float32Array(w.slice(2, 3).buffer)[0], w[3]); break;
       case OP.DRAW: case OP.DRAW_INDEXED: await this.draw(op, w, null); break;
       case OP.DRAW_UP: await this.draw(op, w, data.subarray(16)); break;
       case OP.DRAW_INDEXED_UP: await this.draw(op, w, data.subarray(32)); break;

@@ -136,7 +136,8 @@ const server = http.createServer(async (req, res) => {
     return;
   }
   if (p === '/snap' && req.method === 'POST') {           // a debugging screenshot from the page
-    await fsp.writeFile(path.join(ROOT, 'out/recomp/snap.png'), await body(req));
+    const name = (url.searchParams.get('name') || 'snap').replace(/[^\w-]/g, '');
+    await fsp.writeFile(path.join(ROOT, 'out/recomp', name + '.png'), await body(req));
     res.writeHead(200).end();
     return;
   }

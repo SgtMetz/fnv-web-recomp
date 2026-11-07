@@ -14,6 +14,7 @@ struct PalEntry
 const PalEntry* pal_kernel_entries();
 const PalEntry* pal_user_entries();     // pal_user.cpp: user32, gdi32, comctl32, shell32, ole32, mmio, WinSock, Bink, XInput, Steam
 const PalEntry* pal_input_entries();    // pal_input.cpp: DirectInput8
+void pal_input_script(const char* script);                       // FNV_INPUT_SCRIPT key taps
 void pal_input_key(int dik, bool down);                         // host input: DIK_* scan code
 void pal_input_mouse(int dx, int dy, int dz, int button, bool down);   // button -1: movement only
 const PalEntry* pal_sound_entries();    // pal_dsound.cpp: DirectSound 8
