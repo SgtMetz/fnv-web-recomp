@@ -14,6 +14,9 @@ struct PalEntry
 const PalEntry* pal_kernel_entries();
 const PalEntry* pal_user_entries();     // pal_user.cpp: user32, gdi32, comctl32, shell32, ole32, mmio, WinSock, Bink, XInput, Steam
 const PalEntry* pal_input_entries();    // pal_input.cpp: DirectInput8
+const PalEntry* pal_sound_entries();    // pal_dsound.cpp: DirectSound 8
+const PalEntry* pal_d3d9_entries();     // pal_d3d9.cpp: Direct3DCreate9
+const PalEntry* pal_d3dx_entries();     // pal_d3dx.cpp: D3DX
 // pal_user.cpp: the host's screen size, input messages for the main window, its handle
 void pal_user_set_screen(int w, int h);
 void pal_user_post(uint32_t msg, uint32_t wp, uint32_t lp);

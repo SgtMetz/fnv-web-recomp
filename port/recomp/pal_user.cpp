@@ -3,6 +3,8 @@
 // Bink (no movies yet), XInput (no pad), the Steam/Galaxy wrapper (no client), DirectShow (CoCreateInstance fails).
 #include "pal.h"
 
+uint32_t pal_dshow_create(uint32_t clsid);   // pal_dshow.cpp: the DirectShow filter graph
+
 #include <stdio.h>
 #include <string.h>
 
@@ -244,8 +246,9 @@ void o_CoInitializeEx(FnvCpu& s) { RET(0, 2); }
 void o_CoUninitialize(FnvCpu& s) { RET(0, 0); }
 void o_CoCreateInstance(FnvCpu& s)
 {
-    if (A(4)) M32(A(4)) = 0;
-    RET(0x80040154u, 5);                                     // REGDB_E_CLASSNOTREG
+    uint32_t obj = pal_dshow_create(A(0));                     // the DirectShow filter graph (music); nothing else
+    if (A(4)) M32(A(4)) = obj;
+    RET(obj ? 0 : 0x80040154u, 5);                           // REGDB_E_CLASSNOTREG
 }
 void o_CoFreeUnusedLibraries(FnvCpu& s) { RET(0, 0); }
 void o_CoTaskMemAlloc(FnvCpu& s) { RET((uintptr_t)malloc(A(0) ? A(0) : 1), 1); }

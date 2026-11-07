@@ -137,7 +137,32 @@ void w_SHGetFolderPathA(FnvCpu& s)
     strcpy(gbuf(harg(s, 4)), g_docs.c_str());
     hret(s, 0, 5);
 }
-void w_GetModuleHandleA(FnvCpu& s) { hret(s, harg(s, 0) ? 0x7e000000u : g_image_lo, 1); }   // a fake module for DLL names
+// Modules: every DLL name gets a fake handle; GetProcAddress answers with the PAL's host function of that name (any
+// group), or 0 for what the PAL does not have (the CRT then takes its fallbacks, as for FlsAlloc/EncodePointer)
+uint32_t fake_module(const char* name)
+{
+    if (!name) return g_image_lo;
+    uint32_t h = 2166136261u;
+    for (const char* p = name; *p; ++p) h = (h ^ (uint32_t)tolower((unsigned char)*p)) * 16777619u;
+    return 0x7e000000u + ((h & 0xff) << 16);
+}
+void w_GetModuleHandleA(FnvCpu& s) { hret(s, fake_module(gstr(harg(s, 0))), 1); }
+void w_GetModuleHandleW(FnvCpu& s) { hret(s, harg(s, 0) ? 0x7e010000u : g_image_lo, 1); }
+void w_LoadLibraryA(FnvCpu& s)
+{
+    logf("[web] LoadLibraryA(%s)\n", gstr(harg(s, 0)));
+    hret(s, fake_module(gstr(harg(s, 0))), 1);
+}
+void w_FreeLibrary(FnvCpu& s) { hret(s, 1, 1); }
+uint32_t lookup_export(const char* name);
+void w_GetProcAddress(FnvCpu& s)
+{
+    uint32_t name = harg(s, 1);
+    if (name < 0x10000) { hret(s, 0, 2); return; }                       // by ordinal: none
+    uint32_t v = lookup_export(gstr(name));
+    logf("[web] GetProcAddress(%s) -> %08x\n", gstr(name), v);
+    hret(s, v, 2);
+}
 void w_GetModuleFileNameA(FnvCpu& s)
 {
     uint32_t n = harg(s, 2);
@@ -248,10 +273,29 @@ void w_VirtualQuery(FnvCpu& s)
 struct Override { const char* name; HostFn fn; };
 const Override kWeb[] = {
     {"SHGetFolderPathA", w_SHGetFolderPathA}, {"GetModuleHandleA", w_GetModuleHandleA},
-    {"GetModuleHandleW", w_GetModuleHandleA}, {"GetModuleFileNameA", w_GetModuleFileNameA},
+    {"GetModuleHandleW", w_GetModuleHandleW}, {"GetModuleFileNameA", w_GetModuleFileNameA},
+    {"LoadLibraryA", w_LoadLibraryA}, {"FreeLibrary", w_FreeLibrary}, {"GetProcAddress", w_GetProcAddress},
     {"MessageBoxA", w_MessageBoxA}, {"ExitProcess", w_ExitProcess}, {"VirtualAlloc", w_VirtualAlloc},
     {"VirtualFree", w_VirtualFree}, {"VirtualQuery", w_VirtualQuery},
 };
+
+uint32_t lookup_export(const char* name)
+{
+    static std::mutex mx;
+    static std::map<std::string, uint32_t> done;
+    std::lock_guard<std::mutex> lk(mx);
+    auto it = done.find(name);
+    if (it != done.end()) return it->second;
+    uint32_t v = 0;
+    for (const PalEntry* grp : {pal_kernel_entries(), pal_user_entries(), pal_input_entries(), pal_sound_entries(),
+                                pal_d3d9_entries(), pal_d3dx_entries()})
+        for (const PalEntry* p = grp; p->name && !v; ++p)
+            if (!strcmp(p->name, name)) v = fnv_host_register(p->name, p->fn);
+    for (const Override& o : kWeb)
+        if (!v && !strcmp(o.name, name)) v = fnv_host_register(o.name, o.fn);
+    done[name] = v;
+    return v;
+}
 
 const ImportInfo* import_info(const char* dll, const char* name)
 {
@@ -318,7 +362,8 @@ bool map_exe(const char* path)
             const ImportInfo* im = import_info(dll, nm);
             const char* real = im ? im->real : nm;
             uint32_t v = 0;
-            for (const PalEntry* grp : {pal_kernel_entries(), pal_user_entries(), pal_input_entries()})
+            for (const PalEntry* grp : {pal_kernel_entries(), pal_user_entries(), pal_input_entries(), pal_sound_entries(),
+                                         pal_d3d9_entries(), pal_d3dx_entries()})
                 for (const PalEntry* p = grp; p->name && !v; ++p)
                     if (!strcmp(p->name, real)) { v = fnv_host_register(p->name, p->fn); ++pal; }
             for (const Override& o : kWeb)

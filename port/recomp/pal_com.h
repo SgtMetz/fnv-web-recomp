@@ -14,6 +14,10 @@ struct ComInterface { const char* name; const ComMethod* methods; uint32_t count
 struct ComClass;
 // The interface's class, with these methods implemented (the rest default). Built once per interface name.
 ComClass* com_class(const char* iface, std::initializer_list<std::pair<const char*, HostFn>> impl);
+// An interface that is not in the SDK tables (D3DX's ID3DXBuffer): method names, argument bytes and implementations
+// in vtable order (null implementation = default).
+struct ComCustom { const char* name; uint32_t arg_bytes; HostFn fn; };
+ComClass* com_class_custom(const char* iface, std::initializer_list<ComCustom> methods);
 // A new guest object of that class around `host` (reference count 1).
 uint32_t com_new(ComClass* cls, void* host);
 inline void* com_host(uint32_t obj) { return (void*)(uintptr_t)M32(obj + 4); }

@@ -93,6 +93,30 @@ ComClass* com_class(const char* iface, std::initializer_list<std::pair<const cha
     return cls;
 }
 
+ComClass* com_class_custom(const char* iface, std::initializer_list<ComCustom> methods)
+{
+    std::lock_guard<std::mutex> lk(g_mx);
+    auto it = g_classes.find(iface);
+    if (it != g_classes.end()) return it->second;
+    uint32_t n = (uint32_t)methods.size(), i = 0;
+    ComMethod* ms = new ComMethod[n];
+    for (auto& m : methods) ms[i++] = {m.name, m.arg_bytes};
+    ComInterface* ci = new ComInterface{strdup(iface), ms, n};
+    ComClass* cls = new ComClass{ci, 0};
+    uint32_t* vt = (uint32_t*)calloc(n, 4);
+    i = 0;
+    for (auto& m : methods)
+    {
+        std::string label = std::string(iface) + "::" + m.name;
+        uint32_t a = fnv_host_register(strdup(label.c_str()), m.fn ? m.fn : default_method);
+        g_stub_info[(a - fnv_host_base()) / 16] = {ci, i};
+        vt[i++] = a;
+    }
+    cls->vtbl = (uint32_t)(uintptr_t)vt;
+    g_classes[iface] = cls;
+    return cls;
+}
+
 uint32_t com_new(ComClass* cls, void* host)
 {
     uint32_t* o = (uint32_t*)calloc(4, 4);
