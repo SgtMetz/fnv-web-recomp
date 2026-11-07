@@ -281,7 +281,7 @@ class Recompiler(ls.Lifter):
                 a += n
                 if a not in self.ins and a < end:
                     self.resync(a, end)
-        lines = ['void f_%08x(FnvCpu& s)' % entry, '{']
+        lines = ['void f_%08x(FnvCpu& s)' % entry, '{', '    FNV_ENTER(0x%08xu);' % entry]
         for a in sorted(body):
             if a in labels:
                 lines.append('L_%08x:' % a)

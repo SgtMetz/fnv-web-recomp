@@ -29,6 +29,15 @@ void fnv_rtrap_soft(uint32_t addr, const char* what);         // report once, co
 void fnv_register_functions(const uint32_t* addrs, const FnvFn* fns, uint32_t n);   // one table per shard
 }
 
+// Call trace (compile with -DFNV_CALL_TRACE): every recompiled function records its address on entry, so two builds
+// (native and wasm) can be compared until they diverge (fnv_recomp_rt.cpp writes the main thread's sequence).
+#ifdef FNV_CALL_TRACE
+extern "C" void fnv_trace_enter(uint32_t addr);
+#define FNV_ENTER(a) fnv_trace_enter(a)
+#else
+#define FNV_ENTER(a) ((void)0)
+#endif
+
 #define M8(a) (*(uint8_t*)(uintptr_t)(uint32_t)(a))
 #define M16(a) (*(uint16_t*)(uintptr_t)(uint32_t)(a))
 #define M32(a) (*(uint32_t*)(uintptr_t)(uint32_t)(a))

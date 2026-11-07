@@ -7,6 +7,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include <atomic>
+
 namespace {
 // open-addressing table, power-of-two size, key 0 = empty (no function lives at address 0)
 uint32_t* g_keys;
@@ -16,6 +18,7 @@ HostFn g_host[kHostFnMax];
 const char* g_host_names[kHostFnMax];
 uint32_t g_host_n;
 bool g_trace_host = getenv("FNV_TRACE_IMPORTS") != nullptr;
+thread_local uint32_t t_host_index;              // the host function being dispatched (generic stubs read it)
 
 inline uint32_t hash(uint32_t a) { a ^= a >> 15; a *= 0x2c1b3c6du; a ^= a >> 12; return a; }
 
@@ -76,6 +79,31 @@ uint32_t fnv_host_register(const char* name, HostFn fn)
     return fnv_host_base() + 16u * g_host_n++;
 }
 
+uint32_t fnv_host_current() { return t_host_index; }
+
+#ifdef FNV_CALL_TRACE
+// The first thread to enter recompiled code (the game's main thread) writes its first 4M function entries to the file
+// named by FNV_CALL_TRACE_FILE, as little-endian u32 addresses (tools compare two builds' files).
+namespace {
+FILE* g_trace_file;
+uint32_t g_trace_n;
+thread_local int t_trace_role;   // 0 unknown, 1 traced, 2 not traced
+std::atomic<bool> g_trace_claimed;
+}
+extern "C" void fnv_trace_enter(uint32_t addr)
+{
+    if (t_trace_role == 0)
+    {
+        bool f = false;
+        t_trace_role = g_trace_claimed.compare_exchange_strong(f, true) ? 1 : 2;
+        if (t_trace_role == 1 && getenv("FNV_CALL_TRACE_FILE")) g_trace_file = fopen(getenv("FNV_CALL_TRACE_FILE"), "wb");
+    }
+    if (t_trace_role != 1 || !g_trace_file || g_trace_n >= (4u << 20)) return;
+    fwrite(&addr, 4, 1, g_trace_file);
+    if ((++g_trace_n & 0xfff) == 0) fflush(g_trace_file);
+}
+#endif
+
 const char* fnv_host_name(uint32_t addr)
 {
     uint32_t i = (addr - fnv_host_base()) / 16u;
@@ -89,6 +117,7 @@ extern "C" void fnv_dispatch(FnvCpu& s, uint32_t addr)
     uint32_t hb = fnv_host_base();
     if (addr - hb < 16u * g_host_n && (addr - hb) % 16u == 0)
     {
+        t_host_index = (addr - hb) / 16u;
         if (!g_trace_host)
             return g_host[(addr - hb) / 16u](s);
         uint32_t ret = M32(s.esp), a0 = M32(s.esp + 4), a1 = M32(s.esp + 8), a2 = M32(s.esp + 12);

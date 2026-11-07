@@ -439,6 +439,12 @@ void h_OutputDebugStringA(FnvCpu& s)
     hret(s, 0, 1);
 }
 void h_SetUnhandledExceptionFilter(FnvCpu& s) { hret(s, 0, 1); }
+// FNV_GPA_NULL=1: GetProcAddress finds nothing (what the web host's stub does), to compare the CRT's fallback paths
+void h_GetProcAddress(FnvCpu& s)
+{
+    if (getenv("FNV_GPA_NULL")) return hret(s, 0, 2);
+    hret(s, (uint32_t)(uintptr_t)GetProcAddress((HMODULE)(uintptr_t)harg(s, 0), (LPCSTR)(uintptr_t)harg(s, 1)), 2);
+}
 void h_GetModuleHandleA(FnvCpu& s)
 {
     const char* n = (const char*)(uintptr_t)harg(s, 0);
@@ -552,7 +558,7 @@ void h_VirtualAlloc(FnvCpu& s)
     uint32_t addr = harg(s, 0), size = harg(s, 1), type = harg(s, 2), prot = harg(s, 3);
     void* p = VirtualAlloc((void*)(uintptr_t)addr, size, type, prot);
     static int failures;
-    if ((!p && failures++ < 6) || size >= (64u << 20))
+    if ((!p && failures++ < 6) || size >= (64u << 20) || (p && addr && (type & 0x2000)))
     {
         DWORD err = GetLastError();
         MEMORY_BASIC_INFORMATION mi = {};
@@ -586,6 +592,7 @@ struct Override { const char* name; HostFn fn; };
 const Override kOverrides[] = {
     {"SHGetFolderPathA", h_SHGetFolderPathA}, {"ShellExecuteA", h_ShellExecuteA}, {"MessageBoxA", h_MessageBoxA},
     {"OutputDebugStringA", h_OutputDebugStringA}, {"SetUnhandledExceptionFilter", h_SetUnhandledExceptionFilter},
+    {"GetProcAddress", h_GetProcAddress},
     {"GetModuleHandleA", h_GetModuleHandleA}, {"GetModuleFileNameA", h_GetModuleFileNameA},
     {"ExitProcess", h_ExitProcess}, {"TerminateProcess", h_TerminateProcess}, {"CreateThread", h_CreateThread},
     {"SteamAPI_RegisterCallback", h_SteamAPI_RegisterCallback}, {"SteamAPI_UnregisterCallback", h_SteamAPI_RegisterCallback},

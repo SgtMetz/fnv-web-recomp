@@ -12,6 +12,7 @@ FnvFn fnv_lookup(uint32_t addr);
 uint32_t fnv_function_count();
 uint32_t fnv_host_register(const char* name, HostFn fn);   // returns the guest address of the host function
 const char* fnv_host_name(uint32_t addr);
+uint32_t fnv_host_current();                               // index of the host function being dispatched
 uint32_t fnv_guest_call(FnvCpu& s, uint32_t fn, const uint32_t* args, int nargs);
 
 // platform
