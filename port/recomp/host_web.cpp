@@ -318,8 +318,9 @@ bool map_exe(const char* path)
             const ImportInfo* im = import_info(dll, nm);
             const char* real = im ? im->real : nm;
             uint32_t v = 0;
-            for (const PalEntry* p = pal_kernel_entries(); p->name && !v; ++p)
-                if (!strcmp(p->name, real)) { v = fnv_host_register(p->name, p->fn); ++pal; }
+            for (const PalEntry* grp : {pal_kernel_entries(), pal_user_entries(), pal_input_entries()})
+                for (const PalEntry* p = grp; p->name && !v; ++p)
+                    if (!strcmp(p->name, real)) { v = fnv_host_register(p->name, p->fn); ++pal; }
             for (const Override& o : kWeb)
                 if (!v && !strcmp(o.name, real)) { v = fnv_host_register(o.name, o.fn); ++web; }
             if (!v)

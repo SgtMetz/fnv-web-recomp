@@ -12,6 +12,12 @@ struct PalEntry
 
 // The implemented imports, terminated by {nullptr, nullptr}. Groups: pal_kernel.cpp (more to come).
 const PalEntry* pal_kernel_entries();
+const PalEntry* pal_user_entries();     // pal_user.cpp: user32, gdi32, comctl32, shell32, ole32, mmio, WinSock, Bink, XInput, Steam
+const PalEntry* pal_input_entries();    // pal_input.cpp: DirectInput8
+// pal_user.cpp: the host's screen size, input messages for the main window, its handle
+void pal_user_set_screen(int w, int h);
+void pal_user_post(uint32_t msg, uint32_t wp, uint32_t lp);
+uint32_t pal_user_main_window();
 
 // Host services the PAL needs (the host provides them):
 //   run guest code `fn(arg)` as a new guest thread, on the calling OS thread (it sets up the TEB, stack, TLS)

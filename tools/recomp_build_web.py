@@ -19,8 +19,9 @@ EMSDK = ROOT / 'local/dl/emsdk'
 EMXX = [os.environ.get('PYTHON', 'python'), str(EMSDK / 'upstream/emscripten/em++.py')]
 ENV = dict(os.environ, EM_CONFIG=str(EMSDK / '.emscripten'))
 HEADERS = [ROOT / 'port/recomp/fnv_recomp.h', ROOT / 'port/recomp/fnv_recomp_host.h', ROOT / 'port/runtime/fnv_lift_ops.h',
-           ROOT / 'port/recomp/pal.h', OUT / 'import_table.inc']
-PORT = ['fnv_recomp_rt.cpp', 'fnv_intrinsics.cpp', 'pal_kernel.cpp', 'host_web.cpp']
+           ROOT / 'port/recomp/pal.h', ROOT / 'port/recomp/pal_com.h', OUT / 'import_table.inc', OUT / 'com_tables.inc']
+PORT = ['fnv_recomp_rt.cpp', 'fnv_intrinsics.cpp', 'pal_kernel.cpp', 'pal_com.cpp', 'pal_user.cpp', 'pal_input.cpp',
+        'host_web.cpp']
 CFLAGS = [os.environ.get('FNV_WEB_OPT', '-O2'), '-fno-strict-aliasing', '-fwrapv', '-fno-delete-null-pointer-checks', '-fno-strict-float-cast-overflow', '-c', '-w', '-pthread', '-std=c++17', '-I' + str(ROOT / 'port/recomp')] +     (['-DFNV_CALL_TRACE'] if os.environ.get('FNV_CALL_TRACE') else [])
 LDFLAGS = ['-O1', '-pthread', '-sGLOBAL_BASE=22020096', '-sINITIAL_MEMORY=3221225472', '-sMAXIMUM_MEMORY=3221225472', '-sSTACK_SIZE=64MB',
            '-sDEFAULT_PTHREAD_STACK_SIZE=4MB', '-sPTHREAD_POOL_SIZE=48', '-sNODERAWFS=1', '-sENVIRONMENT=node,worker',
