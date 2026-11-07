@@ -6,12 +6,12 @@
 #include <setjmp.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/stat.h>
+
+#include "pal_fs.h"
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
-#include <filesystem>
 #include <map>
 #include <mutex>
 #include <string>
@@ -19,21 +19,6 @@
 #include <unordered_map>
 #include <vector>
 
-#ifdef _WIN32
-#include <direct.h>
-#define fseeko _fseeki64
-#define ftello _ftelli64
-#define pal_mkdir(p) _mkdir(p)
-typedef struct _stat64 pal_stat_t;
-#define pal_stat _stat64
-#else
-#include <unistd.h>
-#define pal_mkdir(p) mkdir((p), 0777)
-typedef struct stat pal_stat_t;
-#define pal_stat stat
-#endif
-
-namespace fs = std::filesystem;
 
 namespace {
 int strcasecmp_portable(const char* a, const char* b);
@@ -57,10 +42,10 @@ struct Obj
     uintptr_t os_thread = 0;                      // fnv_host_spawn's token
     int priority = 0;
     // file
-    FILE* f = nullptr;
+    PalFile* f = nullptr;
     std::string path;
     // find
-    std::vector<fs::path> found;
+    std::vector<std::string> found;            // full paths
     size_t next = 0;
     int std_id = 0;
 };
@@ -192,24 +177,23 @@ void put_filetime(uint32_t p, uint64_t ft)
     if (p) { M32(p) = (uint32_t)ft; M32(p + 4) = (uint32_t)(ft >> 32); }
 }
 
-bool stat_path(const std::string& p, pal_stat_t& st) { return pal_stat(p.c_str(), &st) == 0; }
+bool stat_path(const std::string& p, PalStat& st) { return pal_fs_stat(p.c_str(), &st); }
 
-void fill_find(uint32_t d, const fs::path& p)
+void fill_find(uint32_t d, const std::string& full)
 {
     memset((void*)(uintptr_t)d, 0, 320);
-    pal_stat_t st;
-    std::string full = p.string();
+    PalStat st;
     if (!stat_path(full, st)) return;
-    bool dir = (st.st_mode & S_IFMT) == S_IFDIR;
-    M32(d) = dir ? 0x10u : 0x20u;
-    uint64_t ft = to_filetime((int64_t)st.st_mtime);
+    M32(d) = st.dir ? 0x10u : 0x20u;
+    uint64_t ft = to_filetime(st.mtime);
     put_filetime(d + 4, ft);
     put_filetime(d + 12, ft);
     put_filetime(d + 20, ft);
-    uint64_t size = dir ? 0 : (uint64_t)st.st_size;
+    uint64_t size = st.dir ? 0 : st.size;
     M32(d + 28) = (uint32_t)(size >> 32);
     M32(d + 32) = (uint32_t)size;
-    std::string name = p.filename().string();
+    size_t slash = full.find_last_of("\\/");
+    std::string name = slash == std::string::npos ? full : full.substr(slash + 1);
     strncpy(gbuf(d + 44), name.c_str(), 259);
 }
 
@@ -235,17 +219,25 @@ std::string trim(const std::string& s)
 
 const Ini& load_ini(const std::string& path)
 {
-    pal_stat_t st;
-    int64_t mt = stat_path(path, st) ? (int64_t)st.st_mtime : -2;
+    PalStat st;
+    int64_t mt = stat_path(path, st) ? st.mtime : -2;
     Ini& ini = g_ini[lower(path)];
     if (ini.mtime == mt) return ini;
     ini = Ini();
     ini.mtime = mt;
-    FILE* f = fopen(path.c_str(), "rb");
+    PalFile* f = pal_fs_open(path.c_str(), "rb");
     if (!f) return ini;
-    char line[4096];
-    while (fgets(line, sizeof line, f))
+    std::string text;
+    char chunk[65536];
+    for (size_t n; (n = pal_fs_read(chunk, sizeof chunk, f)) > 0;) text.append(chunk, n);
+    pal_fs_close(f);
+    size_t at = 0;
+    while (at < text.size())
     {
+        size_t eol = text.find('\n', at);
+        std::string raw = text.substr(at, eol == std::string::npos ? std::string::npos : eol - at);
+        at = eol == std::string::npos ? text.size() : eol + 1;
+        const char* line = raw.c_str();
         std::string l = trim(line);
         if (l.empty() || l[0] == ';') continue;
         if (l[0] == '[')
@@ -258,7 +250,6 @@ const Ini& load_ini(const std::string& path)
         if (eq == std::string::npos || ini.sections.empty()) continue;
         ini.sections.back().second.push_back({trim(l.substr(0, eq)), trim(l.substr(eq + 1))});
     }
-    fclose(f);
     return ini;
 }
 
@@ -569,7 +560,7 @@ void k_CloseHandle(FnvCpu& s)
     uint32_t h = A(0);
     Obj* o = get(h);
     if (!o) RET(fnv_host_close_foreign(h) ? 1 : 1, 1);
-    if (o->type == OBJ_FILE && o->f) fclose(o->f);
+    if (o->type == OBJ_FILE && o->f) pal_fs_close(o->f);
     if (o->type == OBJ_THREAD && !o->signaled) RET(1, 1);   // the thread still uses its object: keep it until it ends
     for (auto it = g_named.begin(); it != g_named.end();)
         it = it->second == h ? g_named.erase(it) : std::next(it);
@@ -743,9 +734,9 @@ void k_CreateFileA(FnvCpu& s)
 {
     std::string p = host_path(gstr(A(0)));
     uint32_t access = A(1), disp = A(4);
-    pal_stat_t st;
+    PalStat st;
     bool exists = stat_path(p, st);
-    if (exists && (st.st_mode & S_IFMT) == S_IFDIR) { set_err(5); RET(0xffffffffu, 7); }
+    if (exists && st.dir) { set_err(5); RET(0xffffffffu, 7); }
     const char* mode = "rb";
     if (access & 0x40000000u)                          // GENERIC_WRITE
     {
@@ -764,7 +755,7 @@ void k_CreateFileA(FnvCpu& s)
             mode = "w+b";
         else { set_err(2); RET(0xffffffffu, 7); }
     }
-    FILE* f = fopen(p.c_str(), mode);
+    PalFile* f = pal_fs_open(p.c_str(), mode);
     if (!f) { set_err(exists ? 32 : 3); RET(0xffffffffu, 7); }
     Obj* o = new Obj;
     o->type = OBJ_FILE;
@@ -783,7 +774,7 @@ void k_ReadFile(FnvCpu& s)
 {
     Obj* o = file_of(A(0));
     if (!o || !o->f) { if (A(3)) M32(A(3)) = 0; set_err(6); RET(0, 5); }
-    size_t n = fread(gbuf(A(1)), 1, A(2), o->f);
+    size_t n = pal_fs_read(gbuf(A(1)), A(2), o->f);
     if (A(3)) M32(A(3)) = (uint32_t)n;
     RET(1, 5);
 }
@@ -795,7 +786,7 @@ void k_WriteFile(FnvCpu& s)
     if (o->type == OBJ_STD)
         fnv_host_log(std::string(gstr(A(1)), n).c_str());
     else
-        n = fwrite(gstr(A(1)), 1, n, o->f);
+        n = pal_fs_write(gstr(A(1)), n, o->f);
     if (A(3)) M32(A(3)) = (uint32_t)n;
     RET(1, 5);
 }
@@ -806,8 +797,8 @@ void k_SetFilePointer(FnvCpu& s)
     int64_t off = (int32_t)A(1);
     if (A(2)) off = (int64_t)(((uint64_t)M32(A(2)) << 32) | A(1));
     int whence = A(3) == 0 ? SEEK_SET : A(3) == 1 ? SEEK_CUR : SEEK_END;
-    if (fseeko(o->f, off, whence)) { set_err(131); RET(0xffffffffu, 4); }
-    int64_t pos = ftello(o->f);
+    if (pal_fs_seek(o->f, off, whence)) { set_err(131); RET(0xffffffffu, 4); }
+    int64_t pos = pal_fs_tell(o->f);
     if (A(2)) M32(A(2)) = (uint32_t)((uint64_t)pos >> 32);
     set_err(0);
     RET((uint32_t)pos, 4);
@@ -816,10 +807,10 @@ void k_GetFileSize(FnvCpu& s)
 {
     Obj* o = file_of(A(0));
     if (!o || !o->f) { set_err(6); RET(0xffffffffu, 2); }
-    int64_t cur = ftello(o->f);
-    fseeko(o->f, 0, SEEK_END);
-    int64_t size = ftello(o->f);
-    fseeko(o->f, cur, SEEK_SET);
+    int64_t cur = pal_fs_tell(o->f);
+    pal_fs_seek(o->f, 0, SEEK_END);
+    int64_t size = pal_fs_tell(o->f);
+    pal_fs_seek(o->f, cur, SEEK_SET);
     if (A(1)) M32(A(1)) = (uint32_t)((uint64_t)size >> 32);
     RET((uint32_t)size, 2);
 }
@@ -827,22 +818,22 @@ void k_GetFileSizeEx(FnvCpu& s)
 {
     Obj* o = file_of(A(0));
     if (!o || !o->f) { set_err(6); RET(0, 2); }
-    int64_t cur = ftello(o->f);
-    fseeko(o->f, 0, SEEK_END);
-    int64_t size = ftello(o->f);
-    fseeko(o->f, cur, SEEK_SET);
+    int64_t cur = pal_fs_tell(o->f);
+    pal_fs_seek(o->f, 0, SEEK_END);
+    int64_t size = pal_fs_tell(o->f);
+    pal_fs_seek(o->f, cur, SEEK_SET);
     M32(A(1)) = (uint32_t)size;
     M32(A(1) + 4) = (uint32_t)((uint64_t)size >> 32);
     RET(1, 2);
 }
-void k_FlushFileBuffers(FnvCpu& s) { if (Obj* o = file_of(A(0))) if (o->f) fflush(o->f); RET(1, 1); }
+void k_FlushFileBuffers(FnvCpu& s) { if (Obj* o = file_of(A(0))) if (o->f) pal_fs_flush(o->f); RET(1, 1); }
 void k_SetEndOfFile(FnvCpu& s) { RET(1, 1); }        // only used after full rewrites here
 void k_GetFileTime(FnvCpu& s)
 {
     Obj* o = file_of(A(0));
-    pal_stat_t st;
+    PalStat st;
     if (!o || !stat_path(o->path, st)) { set_err(6); RET(0, 4); }
-    uint64_t ft = to_filetime((int64_t)st.st_mtime);
+    uint64_t ft = to_filetime(st.mtime);
     put_filetime(A(1), ft);
     put_filetime(A(2), ft);
     put_filetime(A(3), ft);
@@ -850,19 +841,19 @@ void k_GetFileTime(FnvCpu& s)
 }
 void k_GetFileAttributesA(FnvCpu& s)
 {
-    pal_stat_t st;
+    PalStat st;
     if (!stat_path(host_path(gstr(A(0))), st)) { set_err(2); RET(0xffffffffu, 1); }
-    RET((st.st_mode & S_IFMT) == S_IFDIR ? 0x10u : 0x20u, 1);
+    RET(st.dir ? 0x10u : 0x20u, 1);
 }
 void k_CreateDirectoryA(FnvCpu& s)
 {
     std::string p = host_path(gstr(A(0)));
-    pal_stat_t st;
+    PalStat st;
     if (stat_path(p, st)) { set_err(183); RET(0, 2); }
-    RET(pal_mkdir(p.c_str()) == 0, 2);
+    RET(pal_fs_mkdir(p.c_str()), 2);
 }
-void k_DeleteFileA(FnvCpu& s) { RET(remove(host_path(gstr(A(0))).c_str()) == 0, 1); }
-void k_MoveFileA(FnvCpu& s) { RET(rename(host_path(gstr(A(0))).c_str(), host_path(gstr(A(1))).c_str()) == 0, 2); }
+void k_DeleteFileA(FnvCpu& s) { RET(pal_fs_remove(host_path(gstr(A(0))).c_str()), 1); }
+void k_MoveFileA(FnvCpu& s) { RET(pal_fs_rename(host_path(gstr(A(0))).c_str(), host_path(gstr(A(1))).c_str()), 2); }
 void k_FindFirstFileA(FnvCpu& s)
 {
     std::string pat = host_path(gstr(A(0)));
@@ -870,15 +861,19 @@ void k_FindFirstFileA(FnvCpu& s)
     std::string dir = slash == std::string::npos ? "." : pat.substr(0, slash), name = slash == std::string::npos ? pat : pat.substr(slash + 1);
     Obj* o = new Obj;
     o->type = OBJ_FIND;
-    std::error_code ec;
     if (name.find_first_of("*?") == std::string::npos)
     {
-        if (fs::exists(fs::path(pat), ec)) o->found.push_back(fs::path(pat));
+        PalStat st;
+        if (stat_path(pat, st)) o->found.push_back(pat);
     }
     else
-        for (auto& e : fs::directory_iterator(fs::path(dir), ec))
-            if (wild_match(name.c_str(), e.path().filename().string().c_str()))
-                o->found.push_back(e.path());
+    {
+        std::vector<std::string> names;
+        pal_fs_list(dir.c_str(), names);
+        for (const std::string& n : names)
+            if (wild_match(name.c_str(), n.c_str()))
+                o->found.push_back(dir + "/" + n);
+    }
     if (o->found.empty()) { delete o; set_err(2); RET(0xffffffffu, 2); }
     fill_find(A(1), o->found[0]);
     o->next = 1;
@@ -1082,8 +1077,7 @@ void k_GetUserNameA(FnvCpu& s) { strcpy(gbuf(A(0)), "Player"); if (A(1)) M32(A(1
 void k_GetComputerNameA(FnvCpu& s) { strcpy(gbuf(A(0)), "PC"); if (A(1)) M32(A(1)) = 2; RET(1, 2); }
 void k_GetCurrentDirectoryA(FnvCpu& s)
 {
-    std::error_code ec;
-    std::string d = fs::current_path(ec).string();
+    std::string d = pal_fs_cwd();
     if (A(0) <= d.size()) RET(d.size() + 1, 2);
     strcpy(gbuf(A(1)), d.c_str());
     RET(d.size(), 2);

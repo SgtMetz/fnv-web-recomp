@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FNV ring replay</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #111; color: #ddd; font: 13px/1.4 system-ui, sans-serif; }
+  canvas { display: block; width: 100%; max-width: 1280px; aspect-ratio: 16 / 9; background: #000; }
+  #bar { padding: 6px 10px; display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
+  #log { white-space: pre-wrap; padding: 6px 10px; font: 12px ui-monospace, monospace; color: #e9a; max-height: 30vh; overflow: auto; }
+</style>
+</head>
+<body>
+<div id="bar"><button id="play">pause</button><button id="step">step</button><span id="status">loading…</span></div>
+<canvas id="c" width="1280" height="720"></canvas>
+<div id="log"></div>
+<script type="module">
+import { Renderer, createDevice } from './renderer.js';
+const status = document.getElementById('status'), logEl = document.getElementById('log');
+const log = (m) => { logEl.textContent += m + '\n'; console.log(m); };
+const q = new URLSearchParams(location.search);
+const skipTo = +(q.get('frame') || 0);
+try {
+  const { device, features } = await createDevice();
+  log('features: ' + features.join(', '));
+  const r = new Renderer(device, document.getElementById('c'), { log });
+  window.renderer = r;
+  const buf = await (await fetch('/ring.bin')).arrayBuffer();
+  const u32 = new Uint32Array(buf), u8 = new Uint8Array(buf);
+  let p = 0, playing = true;
+  async function frame() {
+    while (p + 8 <= buf.byteLength) {
+      const op = u32[p >> 2], len = u32[(p >> 2) + 1];
+      const w = u32.subarray((p >> 2) + 2, (p >> 2) + 2 + (len >> 2)), data = u8.subarray(p + 8, p + 8 + len);
+      p += 8 + len;
+      if (await r.exec(op, w, data)) return true;
+    }
+    return false;
+  }
+  while (r.frames < skipTo && await frame()) {}
+  const tick = async () => {
+    if (playing) {
+      const more = await frame();
+      status.textContent = `frame ${r.frames}  draws ${r.stats.draws}  skipped ${r.stats.skipped}  submits ${r.stats.submits}  pipelines ${r.pipelines.size}`;
+      if (!more) { status.textContent += '  (end)'; return; }
+    }
+    requestAnimationFrame(tick);
+  };
+  document.getElementById('play').onclick = (e) => { playing = !playing; e.target.textContent = playing ? 'pause' : 'play'; };
+  document.getElementById('step').onclick = async () => { playing = false; await frame(); status.textContent = `frame ${r.frames}`; };
+  requestAnimationFrame(tick);
+} catch (e) {
+  status.textContent = 'error';
+  log(String(e.stack || e));
+}
+</script>
+</body>
+</html>

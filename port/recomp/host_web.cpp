@@ -23,6 +23,8 @@
 #include <string>
 
 #include "pal.h"
+#include "pal_d3d9.h"
+#include "pal_fs.h"
 
 extern "C" char __global_base;                 // wasm-ld: start of Emscripten's static data
 
@@ -33,6 +35,7 @@ const ImportInfo kImports[] = {
 };
 
 FILE* g_log;
+bool g_browser;                                  // in a browser (else node)
 uint32_t g_image_lo, g_image_hi, g_entry;
 std::string g_exe_path, g_docs;
 uint32_t g_tls_start, g_tls_end, g_tls_zero, g_tls_index, g_tls_callbacks;
@@ -307,14 +310,12 @@ const ImportInfo* import_info(const char* dll, const char* name)
 // ---- mapping the exe -----------------------------------------------------------------------------------------------
 bool map_exe(const char* path)
 {
-    FILE* f = fopen(path, "rb");
+    PalFile* f = pal_fs_open(path, "rb");
     if (!f) { logf("[web] cannot open %s\n", path); return false; }
-    fseek(f, 0, SEEK_END);
-    long size = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    std::string file(size, '\0');
-    fread(&file[0], 1, size, f);
-    fclose(f);
+    std::string file;
+    char chunk[1 << 16];
+    for (size_t n; (n = pal_fs_read(chunk, sizeof chunk, f)) > 0;) file.append(chunk, n);
+    pal_fs_close(f);
     const uint8_t* d = (const uint8_t*)file.data();
     uint32_t pe = *(uint32_t*)(d + 0x3c), opt = pe + 24;
     uint16_t nsec = *(uint16_t*)(d + pe + 6), optsize = *(uint16_t*)(d + pe + 20);
@@ -460,8 +461,38 @@ void fnv_host_cpuid(int out[4], int leaf, int)
     else if (leaf == 1) { out[0] = 0x000006f2; out[3] = (1 << 0) | (1 << 4) | (1 << 15) | (1 << 23) | (1 << 25) | (1 << 26); }
 }
 
+// FNV_RING_DUMP=<file>: consume the D3D9 command ring here and write the packets to a file (renderer development:
+// web/recomp/replay.html plays it back); FNV_RING_FRAMES limits it to that many presents
+void start_ring_dump(const char* path)
+{
+    pal_d3d_enable_ring(64u << 20);
+    static FILE* f = fopen(path, "wb");
+    static int limit = getenv("FNV_RING_FRAMES") ? atoi(getenv("FNV_RING_FRAMES")) : 600;
+    fnv_host_spawn([](void*) {
+        D3dRing* r = pal_d3d_ring();
+        int frames = 0;
+        for (;;)
+        {
+            uint32_t rd = r->read, w = __atomic_load_n(&r->write, __ATOMIC_ACQUIRE);
+            if (rd == w) { usleep(200); continue; }
+            uint32_t op = M32(r->data + rd), len = M32(r->data + rd + 4);
+            if (op == OP_WRAP) { __atomic_store_n(&r->read, 0u, __ATOMIC_RELEASE); continue; }
+            if (f && frames < limit) fwrite((void*)(uintptr_t)(r->data + rd), 1, 8 + len, f);
+            if (op == OP_PRESENT) __atomic_add_fetch(&r->frames_done, 1, __ATOMIC_RELEASE);
+            if (op == OP_PRESENT && ++frames == limit && f) { fclose(f); f = nullptr; logf("[web] ring dump done%c", 10); }
+            __atomic_store_n(&r->read, rd + 8 + len, __ATOMIC_RELEASE);
+        }
+    }, nullptr);
+}
+
+// the page's hooks (web/recomp/index.html): the command ring, and input as DirectInput sees it
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_ring() { return (uint32_t)(uintptr_t)pal_d3d_ring(); }
+extern "C" EMSCRIPTEN_KEEPALIVE void fnv_key(int dik, int down) { pal_input_key(dik, down != 0); }
+extern "C" EMSCRIPTEN_KEEPALIVE void fnv_mouse(int dx, int dy, int dz, int button, int down) { pal_input_mouse(dx, dy, dz, button, down != 0); }
+
 int main(int argc, char** argv)
 {
+    g_browser = EM_ASM_INT({ return typeof process === 'undefined' || !process.versions || !process.versions.node ? 1 : 0; });
     const char* exe = nullptr;
     const char* docs = nullptr;
     for (int i = 1; i + 1 < argc; ++i)
@@ -482,7 +513,10 @@ int main(int argc, char** argv)
     g_fixed_hi = g_fixed_lo + kFixedArea;
     logf("[web] fixed-address reservation area %08x-%08x\n", g_fixed_lo, g_fixed_hi);
     std::string dir = g_exe_path.substr(0, g_exe_path.find_last_of('/'));
-    if (chdir(dir.c_str())) logf("[web] cannot enter %s\n", dir.c_str());
+    pal_fs_chdir(dir.c_str());
+    if (g_browser) pal_d3d_enable_ring(128u << 20);         // web/recomp/renderer.js consumes it on the page's thread
+    else if (chdir(dir.c_str())) logf("[web] cannot enter %s\n", dir.c_str());
+    if (const char* rd = getenv("FNV_RING_DUMP")) start_ring_dump(rd);
     if (const char* w = getenv("FNV_START_DELAY")) usleep(1000u * (unsigned)atoi(w));   // race test: let the pool load
     // node: the game's main thread runs on the runtime's main thread (blocking is allowed there), so a wasm trap
     // reaches the uncaughtException hook (pre-js) while the instance is intact and fnv_dump_state can report it

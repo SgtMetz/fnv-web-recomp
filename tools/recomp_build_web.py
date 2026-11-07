@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""Build the Emscripten version of the whole-game recompiler (milestone 2, docs/RECOMP.md): out/recomp/recomp_NN.cpp
-(tools/recomp.py) and the portable runtime + PAL + web host, linked to out/recomp/web/fnv_web.js (+ .wasm). Node runs it
-with direct access to the host filesystem (NODERAWFS). A shard whose source and headers are unchanged keeps its object.
+"""Build the Emscripten version of the whole-game recompiler (docs/RECOMP.md): out/recomp/recomp_NN.cpp
+(tools/recomp.py) and the portable runtime + PAL + web host. Two links share the objects:
+  node     out/recomp/web/fnv_web.js (+ .wasm): direct access to the host filesystem (NODERAWFS), pal_fs_std
+  browser  out/recomp/web_browser/fnv_web.js: the game in a worker (PROXY_TO_PTHREAD), files from the local dev server
+           (pal_fs_web, tools/recomp_serve.mjs), frames to web/recomp/renderer.js through the D3D9 command ring
+A shard whose source and headers are unchanged keeps its object.
 
-usage: python tools/recomp_build_web.py [--jobs N]
+usage: python tools/recomp_build_web.py [--jobs N] [--target node|browser|both]
 """
 import argparse
 import hashlib
@@ -21,14 +24,19 @@ ENV = dict(os.environ, EM_CONFIG=str(EMSDK / '.emscripten'))
 HEADERS = [ROOT / 'port/recomp/fnv_recomp.h', ROOT / 'port/recomp/fnv_recomp_host.h', ROOT / 'port/runtime/fnv_lift_ops.h',
            ROOT / 'port/recomp/pal.h', ROOT / 'port/recomp/pal_com.h', OUT / 'import_table.inc', OUT / 'com_tables.inc',
            ROOT / 'port/recomp/pal_d3d9.h', OUT / 'd3d9_caps.inc']
-PORT = ['fnv_recomp_rt.cpp', 'fnv_intrinsics.cpp', 'pal_kernel.cpp', 'pal_com.cpp', 'pal_user.cpp', 'pal_input.cpp',
+PORT = ['fnv_recomp_rt.cpp', 'fnv_intrinsics.cpp', 'pal_kernel.cpp', 'pal_fs_std.cpp', 'pal_fs_web.cpp', 'pal_com.cpp', 'pal_user.cpp', 'pal_input.cpp',
         'pal_dsound.cpp', 'pal_d3d9.cpp', 'pal_d3dx.cpp', 'pal_dshow.cpp', 'host_web.cpp']
 CFLAGS = [os.environ.get('FNV_WEB_OPT', '-O2'), '-fno-strict-aliasing', '-fwrapv', '-fno-delete-null-pointer-checks', '-fno-strict-float-cast-overflow', '-c', '-w', '-pthread', '-std=c++17', '-I' + str(ROOT / 'port/recomp')] +     (['-DFNV_CALL_TRACE'] if os.environ.get('FNV_CALL_TRACE') else [])
 LDFLAGS = ['-O1', '-pthread', '-sGLOBAL_BASE=22020096', '-sINITIAL_MEMORY=3221225472', '-sMAXIMUM_MEMORY=3221225472', '-sSTACK_SIZE=64MB',
-           '-sDEFAULT_PTHREAD_STACK_SIZE=4MB', '-sPTHREAD_POOL_SIZE=48', '-sNODERAWFS=1', '-sENVIRONMENT=node,worker',
+           '-sDEFAULT_PTHREAD_STACK_SIZE=4MB', '-sPTHREAD_POOL_SIZE=64',
            '-sEXIT_RUNTIME=1', '-sSUPPORT_LONGJMP=emscripten', '-sMALLOC=' + os.environ.get('FNV_WEB_MALLOC', 'dlmalloc'), '-sWASM_BIGINT=1',
            '-sERROR_ON_UNDEFINED_SYMBOLS=1', '--profiling-funcs',
            '--pre-js', str(ROOT / 'port/recomp/web_pre.js')]
+TARGETS = {
+    'node': ('web', 'pal_fs_web.cpp', ['-sNODERAWFS=1', '-sENVIRONMENT=node,worker']),
+    'browser': ('web_browser', 'pal_fs_std.cpp', ['-sENVIRONMENT=web,worker', '-sPROXY_TO_PTHREAD=1',
+                '-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,HEAPF32']),
+}
 
 
 def compile_one(args):
@@ -46,6 +54,7 @@ def compile_one(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
+    ap.add_argument('--target', choices=['node', 'browser', 'both'], default=os.environ.get('FNV_WEB_TARGET', 'both'))
     a = ap.parse_args()
     t0 = time.time()
     hdr = hashlib.sha1(b''.join(h.read_bytes() for h in HEADERS) + ' '.join(CFLAGS).encode()).hexdigest()
@@ -62,19 +71,21 @@ def main():
     if failed:
         raise SystemExit('%d sources failed' % len(failed))
     print('compiled %d sources in %.0f s' % (len(jobs), time.time() - t0), flush=True)
-    web = OUT / 'web'
-    web.mkdir(exist_ok=True)
-    out = web / 'fnv_web.js'
-    r = subprocess.run(EMXX + LDFLAGS + [str(j[1]) for j in jobs] + ['-o', str(out)], capture_output=True, text=True,
-                       errors='replace', env=ENV)
-    if r.returncode:
-        # the command line itself is huge: show the diagnostics, not the echo of the command
-        lines = [l for l in (r.stdout + r.stderr).splitlines() if 'web_obj' not in l or l.startswith('wasm-ld')]
-        print(chr(10).join(l[:300] for l in lines[:40]))
-        raise SystemExit('link failed')
-    wasm = web / 'fnv_web.wasm'
-    print('linked %s (%.1f MB wasm) in %.0f s total' % (out, wasm.stat().st_size / 1e6, time.time() - t0))
-
+    for target in (['node', 'browser'] if a.target == 'both' else [a.target]):
+        sub, exclude, extra = TARGETS[target]
+        web = OUT / sub
+        web.mkdir(exist_ok=True)
+        out = web / 'fnv_web.js'
+        objs = [str(j[1]) for j in jobs if j[0].name != exclude]
+        r = subprocess.run(EMXX + LDFLAGS + extra + objs + ['-o', str(out)], capture_output=True, text=True,
+                           errors='replace', env=ENV)
+        if r.returncode:
+            # the command line itself is huge: show the diagnostics, not the echo of the command
+            lines = [l for l in (r.stdout + r.stderr).splitlines() if 'web_obj' not in l or l.startswith('wasm-ld')]
+            print(chr(10).join(l[:300] for l in lines[:40]))
+            raise SystemExit('link failed: ' + target)
+        wasm = web / 'fnv_web.wasm'
+        print('linked %s (%.1f MB wasm) in %.0f s total' % (out, wasm.stat().st_size / 1e6, time.time() - t0), flush=True)
 
 if __name__ == '__main__':
     main()

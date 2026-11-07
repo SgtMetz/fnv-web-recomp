@@ -748,6 +748,7 @@ void dv_SetTransform(FnvCpu& s)
     Device* d = D(s);
     std::vector<uint8_t>& m = d->transforms[A(1)];
     m.assign(gbuf(A(2)), gbuf(A(2)) + 64);
+    emit(OP_SET_TRANSFORM, {A(1)}, gbuf(A(2)), 64);
     RET(0, 3);
 }
 void dv_GetTransform(FnvCpu& s)

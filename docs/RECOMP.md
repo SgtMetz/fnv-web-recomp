@@ -47,8 +47,10 @@ understanding and debugging.
 2. **Emscripten build of the same code, headless in node.** Host imports are the browser `pal_win32` (files through
    the OPFS layer in `web/`). Exit (ROADMAP Phase 3): load `FalloutNV.esm`, `coc GSDocMitchellHouse`, tick for
    60 s, exit cleanly.
-3. **Browser.** Worker plus OffscreenCanvas, the D3D9 model with a WebGPU backend (translated shaders), input, audio.
-   Exit: the main menu in a browser, then the opening.
+3. **Browser.** The game in a worker (PROXY_TO_PTHREAD), files from the local dev server (`tools/recomp_serve.mjs`,
+   `pal_fs_web.cpp`), the D3D9 model sending a command ring that `web/recomp/renderer.js` draws with WebGPU and the
+   translated shaders, input through `fnv_key`/`fnv_mouse`, audio still to do. Exit: the main menu in a browser
+   (reached 2026-11-07, `out/recomp/browser_main_menu.png`), then the opening.
 
 ## Performance notes (to measure, not assumed)
 

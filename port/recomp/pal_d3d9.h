@@ -40,6 +40,7 @@ enum D3dOp : uint32_t
     OP_COLOR_FILL = 29,         // id, face, level, rect[4] (all -1 = whole), color
     OP_TEX_STAGE_STATE = 30,    // stage, type, value
     OP_RESIZE = 31,             // back buffer width, height
+    OP_SET_TRANSFORM = 32,      // state, float[16]
 };
 
 // The renderer's view of the ring (exported to JavaScript): base address, size, write and read offsets, frames.
