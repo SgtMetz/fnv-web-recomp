@@ -22,6 +22,7 @@
 #include <string.h>
 
 #include "fnv_recomp_host.h"
+#include "pal.h"
 
 namespace {
 FILE* g_log;
@@ -36,6 +37,7 @@ uint32_t g_import_addr[512];
 const char* g_import_name[512];
 int g_nimport;
 bool g_trace_imports;
+bool g_pal;                                 // FNV_PAL=1: imports the PAL implements go to it
 const char* import_name(uint32_t a)
 {
     for (int i = 0; i < g_nimport; ++i)
@@ -81,10 +83,15 @@ uint32_t galloc(uint32_t size, DWORD protect = PAGE_READWRITE)
 }
 
 // ---- threads: TEB block, guest stack, the original exe's static TLS -------------------------------------------
+HostThread* g_threads[256];                // every guest thread, for crash reports
+long g_nthreads;
+void dump_all_threads(HostThread* except);
 HostThread* new_thread(uint32_t stack_size)
 {
     // FnvCpu holds SSE registers (alignas(16)); calloc only guarantees 8 bytes here
     HostThread* ht = (HostThread*)_aligned_malloc(sizeof(HostThread), 64);
+    long slot = InterlockedIncrement(&g_nthreads) - 1;
+    if (slot < 256) g_threads[slot] = ht;
     memset(ht, 0, sizeof(HostThread));
     ht->stack_lo = galloc(stack_size);
     ht->stack_hi = ht->stack_lo + stack_size;
@@ -120,6 +127,28 @@ void run_tls_callbacks(HostThread* ht, uint32_t reason)
     {
         uint32_t args[3] = {g_image_lo, reason, 0};
         fnv_guest_call(ht->cpu, M32(p), args, 3);
+    }
+}
+
+void dump_all_threads(HostThread* except)
+{
+    for (long i = 0; i < g_nthreads && i < 256; ++i)
+    {
+        HostThread* ht = g_threads[i];
+        if (!ht || ht == except) continue;
+        char line[512];
+        int pos = snprintf(line, sizeof line, "[recomp] other guest thread %ld (esp %08x):", i, ht->cpu.esp);
+        int shown = 0;
+        for (uint32_t p = ht->cpu.esp; p >= ht->stack_lo && p + 4 <= ht->stack_hi && shown < 8 && pos < 440; p += 4)
+        {
+            uint32_t v = M32(p);
+            if (v >= g_image_lo + 0x1005 && v < 0x00fdf000u && M8(v - 5) == 0xe8)
+            {
+                pos += snprintf(line + pos, sizeof line - pos, " %08x", v);
+                ++shown;
+            }
+        }
+        logf("%s%c", line, 10);
     }
 }
 
@@ -364,6 +393,7 @@ LONG WINAPI veh(EXCEPTION_POINTERS* e)
             logf("[recomp]   guest eax=%08x ecx=%08x edx=%08x ebx=%08x esp=%08x ebp=%08x esi=%08x edi=%08x\n", s->eax,
                  s->ecx, s->edx, s->ebx, s->esp, s->ebp, s->esi, s->edi);
         // guest return addresses on the guest stack: the call chain in original addresses
+        dump_all_threads(t_ht);
         if (s && s->esp >= t_ht->stack_lo && s->esp < t_ht->stack_hi - 4)
         {
             int shown = 0;
@@ -595,7 +625,7 @@ bool map_exe(const char* path)
     }
     // imports: the real functions, or a host override
     auto& id = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
-    int n = 0, over = 0, missing = 0;
+    int n = 0, over = 0, missing = 0, pal = 0;
     for (auto d = (IMAGE_IMPORT_DESCRIPTOR*)(uintptr_t)(base + id.VirtualAddress); d->Name; ++d)
     {
         const char* dll = (const char*)(uintptr_t)(base + d->Name);
@@ -607,7 +637,22 @@ bool map_exe(const char* path)
             const char* nm = (names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32) ? (const char*)(uintptr_t)(names[k].u1.Ordinal & 0xffff)
                                                                           : (const char*)(uintptr_t)(base + names[k].u1.AddressOfData + 2);
             uint32_t v = 0;
-            if (!(names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32))
+            const char* excl = getenv("FNV_PAL_EXCLUDE");   // comma-separated names kept native (bisecting)
+            bool excluded = false;
+            if (excl && !(names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32))
+            {
+                const char* hit = strstr(excl, nm);
+                size_t len = strlen(nm);
+                excluded = hit && (hit == excl || hit[-1] == ',') && (hit[len] == 0 || hit[len] == ',');
+            }
+            if (g_pal && !excluded && !(names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32))
+                for (const PalEntry* e = pal_kernel_entries(); e->name && !v; ++e)
+                    if (!strcmp(e->name, nm))
+                    {
+                        v = fnv_host_register(e->name, e->fn);
+                        ++pal;
+                    }
+            if (!v && !(names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32))
                 for (const Override& o : kOverrides)
                     if (!strcmp(o.name, nm))
                     {
@@ -631,8 +676,8 @@ bool map_exe(const char* path)
             }
         }
     }
-    logf("[recomp] exe mapped at %08x-%08x, entry %08x, %d imports (%d host overrides, %d missing), TLS %s\n", g_image_lo,
-         g_image_hi, g_entry, n, over, missing, g_has_tls ? "yes" : "no");
+    logf("[recomp] exe mapped at %08x-%08x, entry %08x, %d imports (%d PAL, %d host overrides, %d missing), TLS %s\n",
+         g_image_lo, g_image_hi, g_entry, n, pal, over, missing, g_has_tls ? "yes" : "no");
     free(file);
     return true;
 }
@@ -662,6 +707,34 @@ int relaunch(int argc, char** argv)
 } // namespace
 
 uint32_t fnv_host_base() { return g_host_base; }
+
+// ---- PAL hooks ----------------------------------------------------------------------------------------------------
+uint32_t fnv_host_thread_main(uint32_t fn, uint32_t arg)
+{
+    t_ht = new_thread(4u << 20);
+    run_tls_callbacks(t_ht, DLL_THREAD_ATTACH);
+    uint32_t args[1] = {arg};
+    return fnv_guest_call(t_ht->cpu, fn, args, 1);
+}
+uintptr_t fnv_host_spawn(void (*fn)(void*), void* arg)
+{
+    struct P { void (*fn)(void*); void* arg; };
+    HANDLE h = CreateThread(nullptr, 16u << 20, [](void* p) -> DWORD {
+        P q = *(P*)p;
+        delete (P*)p;
+        q.fn(q.arg);
+        return 0;
+    }, new P{fn, arg}, STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+    return (uintptr_t)h;                    // kept open: the PAL sets priorities through it
+}
+void fnv_host_set_priority(uintptr_t token, int priority)
+{
+    SetThreadPriority(token ? (HANDLE)token : GetCurrentThread(), priority);
+}
+int64_t fnv_host_wait_foreign(uint32_t h, uint32_t ms) { return WaitForSingleObject((HANDLE)(uintptr_t)h, ms); }
+bool fnv_host_close_foreign(uint32_t h) { return CloseHandle((HANDLE)(uintptr_t)h) != 0; }
+uint32_t fnv_host_image_base() { return g_image_lo; }
+const char* fnv_host_exe_path() { return g_exe_path; }
 void fnv_host_log(const char* text) { logf("%s", text); }
 
 void fnv_host_unknown(FnvCpu& s, uint32_t addr)
@@ -678,6 +751,18 @@ void fnv_host_unknown(FnvCpu& s, uint32_t addr)
     uint32_t ret = M32(s.esp), a0 = M32(s.esp + 4), a1 = M32(s.esp + 8), a2 = M32(s.esp + 12);
     native_call(s, addr);
     const char* n = import_name(addr);
+    char modbuf[96];
+    if (!n)
+    {                                       // a COM method or a GetProcAddress result: name its module
+        HMODULE m = nullptr;
+        char path[MAX_PATH] = "";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCSTR)(uintptr_t)addr, &m) && m)
+            GetModuleFileNameA(m, path, MAX_PATH);
+        const char* b = strrchr(path, '\\');
+        snprintf(modbuf, sizeof modbuf, "native:%s+%lx", b ? b + 1 : "?", (unsigned long)(addr - (uint32_t)(uintptr_t)m));
+        n = modbuf;
+    }
     char buf[200];
     snprintf(buf, sizeof buf, "[import] %s(%08x, %08x, %08x) -> %08x (from %08x, last error %lu)\n", n ? n : "native",
              a0, a1, a2, s.eax, ret, GetLastError());
@@ -716,6 +801,7 @@ int main(int argc, char** argv)
     if (getenv("FNV_REAL_DOCS")) g_docs[0] = 0;
     g_bg = getenv("FNV_BACKGROUND") != nullptr;
     g_trace_imports = getenv("FNV_TRACE_IMPORTS") != nullptr;
+    g_pal = getenv("FNV_PAL") != nullptr;
     if (!exe) { logf("usage: fnv_recomp.exe --exe <FalloutNV.exe>\n"); return 2; }
     GetFullPathNameA(exe, MAX_PATH, g_exe_path, nullptr);
     char gamedir[MAX_PATH];

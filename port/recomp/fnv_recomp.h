@@ -45,6 +45,20 @@ void fnv_register_functions(const uint32_t* addrs, const FnvFn* fns, uint32_t n)
 
 #include "../runtime/fnv_lift_ops.h"
 
+// x86 intrinsics the lifted code uses (rdtsc 908x, cpuid 6x, MXCSR 8x): native on x86, emulated elsewhere
+#if defined(__i386__) || defined(_M_IX86)
+#include <intrin.h>
+#include <xmmintrin.h>
+#else
+uint64_t fnv_host_rdtsc(void);                          // host clock in "cycles"
+void fnv_host_cpuid(int out[4], int leaf, int sub);     // the CPU the game should see (SSE2, no newer)
+inline uint64_t __rdtsc(void) { return fnv_host_rdtsc(); }
+inline void __cpuidex(int out[4], int leaf, int sub) { fnv_host_cpuid(out, leaf, sub); }
+inline uint32_t& fnv_mxcsr() { static thread_local uint32_t v = 0x1f80u; return v; }
+inline uint32_t _mm_getcsr(void) { return fnv_mxcsr(); }
+inline void _mm_setcsr(uint32_t v) { fnv_mxcsr() = v; }
+#endif
+
 // call: the original return address goes on the guest stack, then the callee's host function runs; its `ret N`
 // pops that address and N argument bytes. Direct calls name the function; indirect ones dispatch on the address.
 #define RCALL(fn, ret) do { PUSH(ret); fn(s); } while (0)

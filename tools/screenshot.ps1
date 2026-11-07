@@ -23,9 +23,11 @@ public class FnvWin {
     return best; }
 }
 "@
-$p = Get-Process $Proc -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $p) { "no process"; exit 1 }
-$h = [FnvWin]::Find([uint32]$p.Id)
+$procs = @(Get-Process $Proc -ErrorAction SilentlyContinue)
+if ($procs.Count -eq 0) { "no process"; exit 1 }
+# several processes can share the name (the recompiled build relaunches itself): take the one with a window
+$h = [IntPtr]::Zero
+foreach ($p in $procs) { $h = [FnvWin]::Find([uint32]$p.Id); if ($h -ne [IntPtr]::Zero) { break } }
 if ($h -eq [IntPtr]::Zero) { "no window"; exit 1 }
 $r = New-Object FnvWin+RECT
 [FnvWin]::GetWindowRect($h, [ref]$r) | Out-Null

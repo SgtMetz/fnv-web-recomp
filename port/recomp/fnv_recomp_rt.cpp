@@ -15,6 +15,7 @@ uint32_t g_mask, g_count;
 HostFn g_host[kHostFnMax];
 const char* g_host_names[kHostFnMax];
 uint32_t g_host_n;
+bool g_trace_host = getenv("FNV_TRACE_IMPORTS") != nullptr;
 
 inline uint32_t hash(uint32_t a) { a ^= a >> 15; a *= 0x2c1b3c6du; a ^= a >> 12; return a; }
 
@@ -87,7 +88,17 @@ extern "C" void fnv_dispatch(FnvCpu& s, uint32_t addr)
         return f(s);
     uint32_t hb = fnv_host_base();
     if (addr - hb < 16u * g_host_n && (addr - hb) % 16u == 0)
-        return g_host[(addr - hb) / 16u](s);
+    {
+        if (!g_trace_host)
+            return g_host[(addr - hb) / 16u](s);
+        uint32_t ret = M32(s.esp), a0 = M32(s.esp + 4), a1 = M32(s.esp + 8), a2 = M32(s.esp + 12);
+        g_host[(addr - hb) / 16u](s);
+        char buf[200];
+        snprintf(buf, sizeof buf, "[host] %s(%08x, %08x, %08x) -> %08x (from %08x)%c", g_host_names[(addr - hb) / 16u], a0, a1,
+                 a2, s.eax, ret, 10);
+        fnv_host_log(buf);
+        return;
+    }
     fnv_host_unknown(s, addr);
 }
 

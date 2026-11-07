@@ -20,7 +20,8 @@ import relink_plan as rp  # noqa: E402
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / 'out/recomp'
 LLVM = Path(r'C:\Program Files\LLVM\bin')
-HEADERS = [ROOT / 'port/recomp/fnv_recomp.h', ROOT / 'port/recomp/fnv_recomp_host.h', ROOT / 'port/runtime/fnv_lift_ops.h']
+HEADERS = [ROOT / 'port/recomp/fnv_recomp.h', ROOT / 'port/recomp/fnv_recomp_host.h', ROOT / 'port/runtime/fnv_lift_ops.h',
+           ROOT / 'port/recomp/pal.h']
 
 
 def includes():
@@ -34,7 +35,7 @@ def compile_one(args):
     stamp = Path(str(obj) + '.key')
     if obj.exists() and stamp.exists() and stamp.read_text() == key:
         return src, True, ''
-    cmd = [str(LLVM / 'clang-cl.exe'), '--target=i686-pc-windows-msvc', '/nologo', '/c', opt, '/MT', '/EHsc', '-w',
+    cmd = [str(LLVM / 'clang-cl.exe'), '--target=i686-pc-windows-msvc', '/nologo', '/c', opt, '/MT', '/EHsc', '-w', '/std:c++17',
            '/Gy', '/I' + str(ROOT / 'port/recomp')] + includes() + ['/Fo' + str(obj), str(src)]
     r = subprocess.run(cmd, capture_output=True, text=True, errors='replace')
     if r.returncode:
@@ -50,7 +51,7 @@ def main():
     a = ap.parse_args()
     t0 = time.time()
     hdr = hashlib.sha1(b''.join(h.read_bytes() for h in HEADERS) + a.opt.encode()).hexdigest()
-    srcs = [ROOT / 'port/recomp/fnv_recomp_rt.cpp', ROOT / 'port/recomp/host_win32.cpp', ROOT / 'port/recomp/fnv_intrinsics.cpp'] + sorted(OUT.glob('recomp_*.cpp'))
+    srcs = [ROOT / 'port/recomp/fnv_recomp_rt.cpp', ROOT / 'port/recomp/host_win32.cpp', ROOT / 'port/recomp/fnv_intrinsics.cpp', ROOT / 'port/recomp/pal_kernel.cpp'] + sorted(OUT.glob('recomp_*.cpp'))
     objdir = OUT / 'obj'
     objdir.mkdir(parents=True, exist_ok=True)
     jobs = [(s, objdir / (s.stem + '.obj'), a.opt, hashlib.sha1(s.read_bytes()).hexdigest() + hdr) for s in srcs]
