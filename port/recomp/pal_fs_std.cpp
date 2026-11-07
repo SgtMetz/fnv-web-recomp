@@ -72,6 +72,7 @@ bool pal_fs_mkdir(const char* path)
 }
 bool pal_fs_remove(const char* path) { return remove(norm(path).c_str()) == 0; }
 bool pal_fs_rename(const char* from, const char* to) { return rename(norm(from).c_str(), norm(to).c_str()) == 0; }
+std::string pal_fs_resolve(const char* path) { return norm(path); }
 void pal_fs_chdir(const char* path)
 {
     std::error_code ec;

@@ -2,6 +2,12 @@
 // comctl32, shell32, ole32, winmm's mmio, and the libraries the browser build does without: WinSock (no network),
 // Bink (no movies yet), XInput (no pad), the Steam/Galaxy wrapper (no client), DirectShow (CoCreateInstance fails).
 #include "pal.h"
+#include "pal_fs.h"
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#include <unistd.h>
+#endif
+#include <stdlib.h>
 
 uint32_t pal_dshow_create(uint32_t clsid);   // pal_dshow.cpp: the DirectShow filter graph
 
@@ -254,12 +260,187 @@ void o_CoFreeUnusedLibraries(FnvCpu& s) { RET(0, 0); }
 void o_CoTaskMemAlloc(FnvCpu& s) { RET((uintptr_t)malloc(A(0) ? A(0) : 1), 1); }
 void o_CoTaskMemFree(FnvCpu& s) { free((void*)(uintptr_t)A(0)); RET(0, 1); }
 
-// ---- winmm mmio (WAV parsing for sounds: not available yet, callers treat it as a missing file) -------------------
-void m_mmioOpenA(FnvCpu& s) { RET(0, 3); }
-void m_mmioClose(FnvCpu& s) { RET(0, 2); }
-void m_mmio_fail3(FnvCpu& s) { RET(0x105, 3); }              // MMIOERR_CANNOTREAD-like failures
-void m_mmio_fail4(FnvCpu& s) { RET(0x105, 4); }
-void m_mmioRead(FnvCpu& s) { RET(0xffffffffu, 3); }
+// ---- winmm mmio: RIFF/WAV parsing for the game's sounds ----------------------------------------------------------------
+// A file opens whole into memory (by name through pal_fs, or from the caller's memory block with FOURCC_MEM); the
+// handle keeps a read position. mmioGetInfo/mmioAdvance expose the whole file as the I/O buffer.
+struct Mmio { uint32_t data = 0, size = 0, pos = 0; bool owned = false; };
+std::mutex g_mmio_mx;
+std::map<uint32_t, Mmio*> g_mmio;
+uint32_t g_mmio_next = 0x6d000010;
+Mmio* mmio(uint32_t h)
+{
+    std::lock_guard<std::mutex> lk(g_mmio_mx);
+    auto it = g_mmio.find(h);
+    return it == g_mmio.end() ? nullptr : it->second;
+}
+uint32_t fcc(const char* c) { return (uint32_t)c[0] | ((uint32_t)c[1] << 8) | ((uint32_t)c[2] << 16) | ((uint32_t)c[3] << 24); }
+
+void m_mmioOpenA(FnvCpu& s)
+{
+    uint32_t name = A(0), info = A(1), flags = A(2);
+    Mmio* m = new Mmio;
+    static int logged = 0;
+    if (info && M32(info + 4) == fcc("MEM "))
+    {
+        m->data = M32(info + 24);
+        m->size = M32(info + 20);
+    }
+    else if (info && M32(info + 8))
+    {   // the caller's own I/O procedure (the game reads WAVs out of its BSA archives this way): open, read it all,
+        // close, then parse from memory. MMIOM_READ 0, MMIOM_OPEN 3, MMIOM_CLOSE 4; the proc keeps its state in the
+        // MMIOINFO, so it gets a private copy as on Windows.
+        uint32_t proc = M32(info + 8);
+        uint32_t mi = (uint32_t)(uintptr_t)calloc(1, 72);
+        memcpy(gbuf(mi), gbuf(info), 72);
+        M32(mi + 44) = 0;
+        uint32_t open_args[4] = {mi, 3, name, 0};
+        if (fnv_guest_call(s, proc, open_args, 4) == 0)
+        {
+            std::string all;
+            uint32_t chunk = (uint32_t)(uintptr_t)malloc(65536);
+            for (;;)
+            {
+                uint32_t read_args[4] = {mi, 0, chunk, 65536};
+                int32_t n = (int32_t)fnv_guest_call(s, proc, read_args, 4);
+                if (n <= 0) break;
+                all.append((const char*)(uintptr_t)chunk, (size_t)n);
+            }
+            free((void*)(uintptr_t)chunk);
+            uint32_t close_args[4] = {mi, 4, 0, 0};
+            fnv_guest_call(s, proc, close_args, 4);
+            m->size = (uint32_t)all.size();
+            m->data = (uint32_t)(uintptr_t)malloc(m->size ? m->size : 4);
+            memcpy((void*)(uintptr_t)m->data, all.data(), all.size());
+            m->owned = true;
+        }
+        free((void*)(uintptr_t)mi);
+    }
+    else if (name)
+    {
+        PalFile* f = pal_fs_open(gstr(name), "rb");
+        if (f)
+        {
+            std::string all;
+            char chunk[65536];
+            for (size_t n; (n = pal_fs_read(chunk, sizeof chunk, f)) > 0;) all.append(chunk, n);
+            pal_fs_close(f);
+            m->size = (uint32_t)all.size();
+            m->data = (uint32_t)(uintptr_t)malloc(m->size ? m->size : 4);
+            memcpy((void*)(uintptr_t)m->data, all.data(), all.size());
+            m->owned = true;
+        }
+    }
+    if (logged < 8)
+    {
+        ++logged;
+        char msg[300];
+        snprintf(msg, sizeof msg, "[mmio] open %s info %08x fcc %08x ioproc %08x flags %08x -> %u bytes%c", name ? gstr(name) : "(null)",
+                 info, info ? M32(info + 4) : 0, info ? M32(info + 8) : 0, flags, m->data ? m->size : 0, 10);
+        fnv_host_log(msg);
+    }
+    if (!m->data) { delete m; if (info) M32(info + 12) = 257; RET(0, 3); }   // MMIOERR_FILENOTFOUND
+    std::lock_guard<std::mutex> lk(g_mmio_mx);
+    uint32_t h = g_mmio_next += 16;
+    g_mmio[h] = m;
+    RET(h, 3);
+}
+void m_mmioClose(FnvCpu& s)
+{
+    std::lock_guard<std::mutex> lk(g_mmio_mx);
+    auto it = g_mmio.find(A(0));
+    if (it != g_mmio.end())
+    {
+        if (it->second->owned) free((void*)(uintptr_t)it->second->data);
+        delete it->second;
+        g_mmio.erase(it);
+    }
+    RET(0, 2);
+}
+void m_mmioRead(FnvCpu& s)
+{
+    Mmio* m = mmio(A(0));
+    if (!m) RET(0xffffffffu, 3);
+    uint32_t n = A(2);
+    if (m->pos >= m->size) n = 0;
+    else if (n > m->size - m->pos) n = m->size - m->pos;
+    memcpy(gbuf(A(1)), (const void*)(uintptr_t)(m->data + m->pos), n);
+    m->pos += n;
+    RET(n, 3);
+}
+// MMCKINFO: ckid, cksize, fccType, dwDataOffset, dwFlags
+void m_mmioDescend(FnvCpu& s)
+{
+    Mmio* m = mmio(A(0));
+    uint32_t ck = A(1), parent = A(2), flags = A(3);
+    if (!m) RET(265, 4);
+    uint32_t end = parent ? M32(parent + 12) + M32(parent + 4) : m->size;
+    if (end > m->size) end = m->size;
+    uint32_t want_id = (flags & 0x10) ? M32(ck) : (flags & 0x20) ? fcc("RIFF") : (flags & 0x40) ? fcc("LIST") : 0;
+    uint32_t want_type = (flags & 0x60) ? M32(ck + 8) : 0;
+    uint32_t pos = m->pos;
+    while (pos + 8 <= end)
+    {
+        const uint8_t* d = (const uint8_t*)(uintptr_t)m->data;
+        uint32_t id, size;
+        memcpy(&id, d + pos, 4);
+        memcpy(&size, d + pos + 4, 4);
+        bool riff = id == fcc("RIFF") || id == fcc("LIST");
+        uint32_t type = 0;
+        if (riff && pos + 12 <= end) memcpy(&type, d + pos + 8, 4);
+        if (!want_id || (id == want_id && (!want_type || type == want_type)))
+        {
+            M32(ck) = id;
+            M32(ck + 4) = size;
+            M32(ck + 8) = riff ? type : 0;
+            M32(ck + 12) = pos + 8;
+            M32(ck + 16) = 0;
+            m->pos = pos + 8 + (riff ? 4 : 0);
+            RET(0, 4);
+        }
+        pos += 8 + size + (size & 1);
+    }
+    RET(265, 4);                                                    // MMIOERR_CHUNKNOTFOUND
+}
+void m_mmioAscend(FnvCpu& s)
+{
+    Mmio* m = mmio(A(0));
+    if (!m) RET(265, 3);
+    uint32_t ck = A(1);
+    uint32_t size = M32(ck + 4);
+    m->pos = M32(ck + 12) + size + (size & 1);
+    RET(0, 3);
+}
+// MMIOINFO: dwFlags 0, fccIOProc 4, pIOProc 8, wErrorRet 12, htask 16, cchBuffer 20, pchBuffer 24, pchNext 28,
+// pchEndRead 32, pchEndWrite 36, lBufOffset 40, lDiskOffset 44, adwInfo 48, reserved 60/64, hmmio 68
+void m_mmioGetInfo(FnvCpu& s)
+{
+    Mmio* m = mmio(A(0));
+    if (!m) RET(258, 3);
+    uint32_t i = A(1);
+    memset(gbuf(i), 0, 72);
+    M32(i + 20) = m->size;
+    M32(i + 24) = m->data;
+    M32(i + 28) = m->data + m->pos;
+    M32(i + 32) = m->data + m->size;
+    M32(i + 36) = m->data + m->size;
+    M32(i + 44) = m->size;
+    M32(i + 68) = A(0);
+    RET(0, 3);
+}
+void m_mmioAdvance(FnvCpu& s)
+{
+    Mmio* m = mmio(A(0));
+    if (!m) RET(258, 3);
+    uint32_t i = A(1);
+    if (i)
+    {
+        uint32_t next = M32(i + 28);
+        if (next >= m->data && next <= m->data + m->size) m->pos = next - m->data;
+        M32(i + 28) = m->data + m->pos;
+        M32(i + 32) = m->data + m->size;
+    }
+    RET(0, 3);
+}
 
 // ---- WinSock: no network -------------------------------------------------------------------------------------------
 void w_WSAStartup(FnvCpu& s) { RET(10091, 2); }             // WSASYSNOTREADY
@@ -293,12 +474,119 @@ void x_XInputSetState(FnvCpu& s) { RET(1167, 2); }
 // ---- Steam API wrapper (cdecl): no client; interface getters return null ----------------------------------------
 void st_false(FnvCpu& s) { RETC(0); }
 
-// ---- libvorbisfile (cdecl): no Ogg decoding yet. Opening reports OV_ENOTVORBIS so the game skips the stream, and
-// the queries answer a valid stereo 44.1 kHz description (the game divides by the rate). ----------------------------
+// ---- libvorbisfile (cdecl): Ogg Vorbis voices ----------------------------------------------------------------------------
+// ov_open_callbacks reads the whole stream through the game's own callbacks; in the browser the page decodes it
+// (decodeAudioData, web/recomp/index.html fnvDecode) into 16-bit PCM at the page's 48 kHz, which ov_read then serves.
+// Without a decoder (node) opening reports OV_ENOTVORBIS and the game skips the line. ov_info always answers a valid
+// description (the game divides by the rate).
+struct OvFile
+{
+    uint32_t pcm = 0, frames = 0, channels = 2, rate = 44100, pos = 0;   // pcm: int16 interleaved (page malloc)
+    uint32_t info = 0;                                                  // guest vorbis_info
+    uint32_t datasource = 0, close_fn = 0;
+};
+std::mutex g_ov_mx;
+std::map<uint32_t, OvFile*> g_ov;
+bool g_ov_decoder;
 uint32_t g_vorbis_info[8] = {0, 2, 44100, 0, 0, 0, 0, 0};    // vorbis_info: version, channels, rate, bitrates
-void ov_open_callbacks_(FnvCpu& s) { RETC(0xFFFFFF7Cu); }   // -132
-void ov_info_(FnvCpu& s) { RETC((uint32_t)(uintptr_t)g_vorbis_info); }
-void ov_pcm_total_(FnvCpu& s) { s.edx = 0; RETC(0); }
+OvFile* ov(uint32_t vf)
+{
+    std::lock_guard<std::mutex> lk(g_ov_mx);
+    auto it = g_ov.find(vf);
+    return it == g_ov.end() ? nullptr : it->second;
+}
+
+void ov_open_callbacks_(FnvCpu& s)
+{
+    uint32_t ds = A(0), vf = A(1), initial = A(2), ibytes = A(3), read_fn = A(4), close_fn = A(6);
+    if (!g_ov_decoder || !read_fn) RETC(0xFFFFFF7Cu);                  // OV_ENOTVORBIS (-132)
+    std::string all;
+    if (initial && ibytes) all.append((const char*)(uintptr_t)initial, ibytes);
+    uint32_t chunk = (uint32_t)(uintptr_t)malloc(65536);
+    for (;;)
+    {
+        uint32_t args[4] = {chunk, 1, 65536, ds};
+        uint32_t n = fnv_guest_call(s, read_fn, args, 4);
+        if (!n || n > 65536) break;
+        all.append((const char*)(uintptr_t)chunk, n);
+    }
+    free((void*)(uintptr_t)chunk);
+#ifdef __EMSCRIPTEN__
+    // request: data, bytes, done, pcm, frames, channels, rate, ok
+    uint32_t* req = (uint32_t*)calloc(8, 4);
+    req[0] = (uint32_t)(uintptr_t)all.data();
+    req[1] = (uint32_t)all.size();
+    MAIN_THREAD_ASYNC_EM_ASM({ if (globalThis.fnvDecode) globalThis.fnvDecode($0); else HEAPU32[(($0 >>> 0) >>> 2) + 2] = 1; }, req);
+    for (int i = 0; i < 20000 && !__atomic_load_n(&req[2], __ATOMIC_ACQUIRE); ++i) usleep(500);
+    bool ok = __atomic_load_n(&req[2], __ATOMIC_ACQUIRE) && req[7];
+    OvFile* f = nullptr;
+    if (ok)
+    {
+        f = new OvFile;
+        f->pcm = req[3]; f->frames = req[4]; f->channels = req[5]; f->rate = req[6];
+        f->datasource = ds; f->close_fn = close_fn;
+        f->info = (uint32_t)(uintptr_t)calloc(8, 4);
+        M32(f->info + 4) = f->channels;
+        M32(f->info + 8) = f->rate;
+    }
+    free(req);
+    {
+        char m[200];
+        snprintf(m, sizeof m, "[vorbis] open vf %08x: %u bytes -> %s, %u frames %u ch %u Hz%c", vf, (unsigned)all.size(),
+                 f ? "ok" : "failed", f ? f->frames : 0, f ? f->channels : 0, f ? f->rate : 0, 10);
+        fnv_host_log(m);
+    }
+    if (!f) RETC(0xFFFFFF7Cu);
+    std::lock_guard<std::mutex> lk(g_ov_mx);
+    g_ov[vf] = f;
+    RETC(0);
+#else
+    RETC(0xFFFFFF7Cu);
+#endif
+}
+void ov_info_(FnvCpu& s)
+{
+    OvFile* f = ov(A(0));
+    RETC(f ? f->info : (uint32_t)(uintptr_t)g_vorbis_info);
+}
+void ov_pcm_total_(FnvCpu& s)
+{
+    OvFile* f = ov(A(0));
+    s.edx = 0;
+    RETC(f ? f->frames : 0);
+}
+// ov_read(vf, buffer, length, bigendianp, word, sgned, bitstream): 16-bit little-endian signed samples
+void ov_read_(FnvCpu& s)
+{
+    OvFile* f = ov(A(0));
+    if (A(6)) M32(A(6)) = 0;
+    if (!f) RETC(0);
+    uint32_t total = f->frames * f->channels * 2;
+    uint32_t n = A(2) & ~1u;
+    if (f->pos >= total) RETC(0);
+    if (n > total - f->pos) n = total - f->pos;
+    memcpy(gbuf(A(1)), (const void*)(uintptr_t)(f->pcm + f->pos), n);
+    f->pos += n;
+    RETC(n);
+}
+void ov_clear_(FnvCpu& s)
+{
+    OvFile* f = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_ov_mx);
+        auto it = g_ov.find(A(0));
+        if (it != g_ov.end()) { f = it->second; g_ov.erase(it); }
+    }
+    if (f)
+    {
+        if (f->close_fn) { uint32_t args[1] = {f->datasource}; fnv_guest_call(s, f->close_fn, args, 1); }
+        free((void*)(uintptr_t)f->pcm);
+        free((void*)(uintptr_t)f->info);
+        delete f;
+    }
+    RETC(0);
+}
+void ov_seekable_(FnvCpu& s) { RETC(ov(A(0)) ? 1 : 0); }     // decoded whole: the game sizes its buffer from ov_pcm_total only when seekable
 void ov_zero_(FnvCpu& s) { RETC(0); }
 
 // ---- d3d9 module function ---------------------------------------------------------------------------------------------
@@ -324,8 +612,8 @@ const PalEntry kUser[] = {
     {"CoInitialize", o_CoInitialize}, {"CoInitializeEx", o_CoInitializeEx}, {"CoUninitialize", o_CoUninitialize},
     {"CoCreateInstance", o_CoCreateInstance}, {"CoFreeUnusedLibraries", o_CoFreeUnusedLibraries},
     {"CoTaskMemAlloc", o_CoTaskMemAlloc}, {"CoTaskMemFree", o_CoTaskMemFree},
-    {"mmioOpenA", m_mmioOpenA}, {"mmioClose", m_mmioClose}, {"mmioDescend", m_mmio_fail4},
-    {"mmioAscend", m_mmio_fail3}, {"mmioAdvance", m_mmio_fail3}, {"mmioGetInfo", m_mmio_fail3}, {"mmioRead", m_mmioRead},
+    {"mmioOpenA", m_mmioOpenA}, {"mmioClose", m_mmioClose}, {"mmioDescend", m_mmioDescend},
+    {"mmioAscend", m_mmioAscend}, {"mmioAdvance", m_mmioAdvance}, {"mmioGetInfo", m_mmioGetInfo}, {"mmioRead", m_mmioRead},
     {"WSAStartup", w_WSAStartup}, {"WSAGetLastError", w_WSAGetLastError}, {"socket", w_socket},
     {"closesocket", w_err1}, {"accept", w_err3}, {"bind", w_err3}, {"connect", w_err3}, {"listen", w_err2},
     {"ioctlsocket", w_err3}, {"recv", w_err4}, {"send", w_err4}, {"select", w_err5}, {"setsockopt", w_err5},
@@ -340,12 +628,13 @@ const PalEntry kUser[] = {
     {"SteamAPI_UnregisterCallback", st_false}, {"SteamAPI_RunCallbacks", st_false}, {"SteamAPI_Shutdown", st_false},
     {"SteamApps", st_false}, {"SteamFriends", st_false}, {"SteamUser", st_false}, {"SteamUserStats", st_false},
     {"ov_open_callbacks", ov_open_callbacks_}, {"ov_info", ov_info_}, {"ov_pcm_total", ov_pcm_total_},
-    {"ov_read", ov_zero_}, {"ov_clear", ov_zero_}, {"ov_seekable", ov_zero_},
+    {"ov_read", ov_read_}, {"ov_clear", ov_clear_}, {"ov_seekable", ov_seekable_},
     {"SteamUtils", st_false}, {"D3DPERF_SetOptions", d_D3DPERF_SetOptions},
     {nullptr, nullptr}};
 } // namespace
 
 const PalEntry* pal_user_entries() { return kUser; }
+void pal_vorbis_enable_decoder() { g_ov_decoder = true; }
 
 void pal_user_set_screen(int w, int h) { g_screen_w = w; g_screen_h = h; }
 void pal_user_post(uint32_t msg, uint32_t wp, uint32_t lp)

@@ -23,7 +23,7 @@ EMXX = [os.environ.get('PYTHON', 'python'), str(EMSDK / 'upstream/emscripten/em+
 ENV = dict(os.environ, EM_CONFIG=str(EMSDK / '.emscripten'))
 HEADERS = [ROOT / 'port/recomp/fnv_recomp.h', ROOT / 'port/recomp/fnv_recomp_host.h', ROOT / 'port/runtime/fnv_lift_ops.h',
            ROOT / 'port/recomp/pal.h', ROOT / 'port/recomp/pal_com.h', OUT / 'import_table.inc', OUT / 'com_tables.inc',
-           ROOT / 'port/recomp/pal_d3d9.h', OUT / 'd3d9_caps.inc']
+           ROOT / 'port/recomp/pal_d3d9.h', ROOT / 'port/recomp/pal_sound.h', OUT / 'd3d9_caps.inc']
 PORT = ['fnv_recomp_rt.cpp', 'fnv_intrinsics.cpp', 'pal_kernel.cpp', 'pal_fs_std.cpp', 'pal_fs_web.cpp', 'pal_com.cpp', 'pal_user.cpp', 'pal_input.cpp',
         'pal_dsound.cpp', 'pal_d3d9.cpp', 'pal_d3dx.cpp', 'pal_dshow.cpp', 'host_web.cpp']
 CFLAGS = [os.environ.get('FNV_WEB_OPT', '-O2'), '-fno-strict-aliasing', '-fwrapv', '-fno-delete-null-pointer-checks', '-fno-strict-float-cast-overflow', '-c', '-w', '-pthread', '-std=c++17', '-I' + str(ROOT / 'port/recomp')] +     (['-DFNV_CALL_TRACE'] if os.environ.get('FNV_CALL_TRACE') else [])
@@ -35,7 +35,8 @@ LDFLAGS = ['-O1', '-pthread', '-sGLOBAL_BASE=22020096', '-sINITIAL_MEMORY=322122
 TARGETS = {
     'node': ('web', 'pal_fs_web.cpp', ['-sNODERAWFS=1', '-sENVIRONMENT=node,worker']),
     'browser': ('web_browser', 'pal_fs_std.cpp', ['-sENVIRONMENT=web,worker', '-sPROXY_TO_PTHREAD=1',
-                '-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,HEAPF32']),
+                '-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,HEAPF32',
+                '-sEXPORTED_FUNCTIONS=_main,_malloc,_free,_fnv_sound_debug,_fnv_dump_threads']),
 }
 
 

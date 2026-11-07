@@ -5,6 +5,11 @@
 
 #include <string.h>
 
+#include <string>
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include <chrono>
 #include <mutex>
 
@@ -18,9 +23,24 @@ double now_s()
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
+bool g_sink;                                 // a music player is attached (browser)
+
+// the page's player (web/recomp/index.html fnvMusic): 1 play from position, 2 pause, 3 stop, 4 volume, 5 seek
+void sink(uintptr_t id, int cmd, const std::string& file, int32_t volume, double pos)
+{
+#ifdef __EMSCRIPTEN__
+    if (!g_sink) return;
+    MAIN_THREAD_EM_ASM({
+        if (globalThis.fnvMusic) globalThis.fnvMusic($0, $1, UTF8ToString($2), $3, $4);
+    }, (uint32_t)id, cmd, file.c_str(), volume, pos);
+#endif
+}
+
 struct Graph
 {
     uint32_t filter = 0;
+    std::string file;                        // the track (pal_media_last_open when the graph was made)
+    double duration = 0;                     // from the page once it has decoded the file (0: not known yet)
     int state = 0;                           // 0 stopped, 1 paused, 2 running
     double pos = 0, started = 0;             // position at the last state change, and when it started running
     bool completed = false, reported = false;
@@ -30,7 +50,8 @@ struct Graph
     double position()
     {
         double p = state == 2 ? pos + now_s() - started : pos;
-        if (p >= kTrackSeconds) { p = kTrackSeconds; completed = true; }
+        double len = duration > 0 ? duration : kTrackSeconds;
+        if (p >= len) { p = len; completed = true; }
         return p;
     }
 };
@@ -65,9 +86,13 @@ void mc_set(FnvCpu& s, int st)
     Graph* g = G(s);
     std::lock_guard<std::mutex> lk(g->mx);
     g->pos = g->position();
-    if (st == 0) g->pos = g->pos >= kTrackSeconds ? 0 : g->pos;
+    if (st == 0) g->pos = g->completed ? 0 : g->pos;
+    int was = g->state;
     g->state = st;
     g->started = now_s();
+    if (st == 2 && was != 2) sink((uintptr_t)g, 1, g->file, g->volume, g->pos);
+    else if (st == 1 && was == 2) sink((uintptr_t)g, 2, g->file, g->volume, g->pos);
+    else if (st == 0 && was != 0) sink((uintptr_t)g, 3, g->file, g->volume, 0);
 }
 void mc_Run(FnvCpu& s) { mc_set(s, 2); RET(0, 1); }
 void mc_Pause(FnvCpu& s) { mc_set(s, 1); RET(0, 1); }
@@ -75,7 +100,12 @@ void mc_Stop(FnvCpu& s) { mc_set(s, 0); RET(0, 1); }
 void mc_GetState(FnvCpu& s) { M32(A(2)) = (uint32_t)G(s)->state; RET(0, 3); }
 
 // IBasicAudio
-void ba_put_Volume(FnvCpu& s) { G(s)->volume = (int32_t)A(1); RET(0, 2); }
+void ba_put_Volume(FnvCpu& s)
+{
+    Graph* g = G(s);
+    if (g->volume != (int32_t)A(1)) { g->volume = (int32_t)A(1); sink((uintptr_t)g, 4, g->file, g->volume, 0); }
+    RET(0, 2);
+}
 void ba_get_Volume(FnvCpu& s) { M32(A(1)) = (uint32_t)G(s)->volume; RET(0, 2); }
 void ba_put_Balance(FnvCpu& s) { G(s)->balance = (int32_t)A(1); RET(0, 2); }
 void ba_get_Balance(FnvCpu& s) { M32(A(1)) = (uint32_t)G(s)->balance; RET(0, 2); }
@@ -83,7 +113,7 @@ void ba_get_Balance(FnvCpu& s) { M32(A(1)) = (uint32_t)G(s)->balance; RET(0, 2);
 // IMediaPosition (REFTIME = double seconds; by-value doubles take two stack words)
 void put_double(uint32_t p, double v) { memcpy((void*)(uintptr_t)p, &v, 8); }
 double arg_double(FnvCpu& s, int i) { double v; uint32_t w[2] = {A(i), A(i + 1)}; memcpy(&v, w, 8); return v; }
-void mp_get_Duration(FnvCpu& s) { put_double(A(1), kTrackSeconds); RET(0, 2); }
+void mp_get_Duration(FnvCpu& s) { Graph* g = G(s); put_double(A(1), g->duration > 0 ? g->duration : kTrackSeconds); RET(0, 2); }
 void mp_put_CurrentPosition(FnvCpu& s)
 {
     Graph* g = G(s);
@@ -91,6 +121,7 @@ void mp_put_CurrentPosition(FnvCpu& s)
     g->pos = arg_double(s, 1);
     g->started = now_s();
     g->completed = g->reported = false;
+    if (g->state == 2) sink((uintptr_t)g, 5, g->file, g->volume, g->pos);
     RET(0, 3);
 }
 void mp_get_CurrentPosition(FnvCpu& s) { Graph* g = G(s); std::lock_guard<std::mutex> lk(g->mx); put_double(A(1), g->position()); RET(0, 2); }
@@ -185,6 +216,21 @@ uint32_t pal_dshow_create(uint32_t clsid)
 {
     if (M32(clsid) != 0xe436ebb3u) return 0;
     Graph* g = new Graph;
+    g->file = pal_media_last_open();
     for (int i = 0; i < 6; ++i) g->obj[i] = com_new(graph_class(i), g);
     return g->obj[0];
+}
+
+void pal_dshow_enable_sink() { g_sink = true; }
+
+// the page reports a track's length once decoded
+extern "C"
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE
+#endif
+void fnv_music_duration(uint32_t id, double seconds)
+{
+    Graph* g = (Graph*)(uintptr_t)id;
+    std::lock_guard<std::mutex> lk(g->mx);
+    g->duration = seconds;
 }

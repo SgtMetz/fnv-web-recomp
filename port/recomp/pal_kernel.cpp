@@ -730,6 +730,7 @@ void k_GetFileType(FnvCpu& s)
     Obj* o = get(A(0));
     RET(!o ? 0 : o->type == OBJ_FILE ? 1 : 2, 1);
 }
+thread_local std::string t_last_media;
 void k_CreateFileA(FnvCpu& s)
 {
     std::string p = host_path(gstr(A(0)));
@@ -757,6 +758,7 @@ void k_CreateFileA(FnvCpu& s)
     }
     PalFile* f = pal_fs_open(p.c_str(), mode);
     if (!f) { set_err(exists ? 32 : 3); RET(0xffffffffu, 7); }
+    if (p.size() > 4 && !strcasecmp_portable(p.c_str() + p.size() - 4, ".mp3")) t_last_media = pal_fs_resolve(p.c_str());
     Obj* o = new Obj;
     o->type = OBJ_FILE;
     o->f = f;
@@ -1154,4 +1156,5 @@ const PalEntry kKernel[] = {
     {nullptr, nullptr}};
 } // namespace
 
+const char* pal_media_last_open() { return t_last_media.c_str(); }
 const PalEntry* pal_kernel_entries() { return kKernel; }

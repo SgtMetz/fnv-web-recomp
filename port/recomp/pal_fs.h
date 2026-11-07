@@ -27,3 +27,4 @@ bool pal_fs_remove(const char* path);
 bool pal_fs_rename(const char* from, const char* to);
 std::string pal_fs_cwd();
 void pal_fs_chdir(const char* path);
+std::string pal_fs_resolve(const char* path);   // the backend's own spelling (web: the server path)

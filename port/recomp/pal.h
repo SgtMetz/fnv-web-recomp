@@ -17,7 +17,12 @@ const PalEntry* pal_input_entries();    // pal_input.cpp: DirectInput8
 void pal_input_script(const char* script);                       // FNV_INPUT_SCRIPT key taps
 void pal_input_key(int dik, bool down);                         // host input: DIK_* scan code
 void pal_input_mouse(int dx, int dy, int dz, int button, bool down);   // button -1: movement only
-const PalEntry* pal_sound_entries();    // pal_dsound.cpp: DirectSound 8
+const PalEntry* pal_sound_entries();
+// music: the last .mp3 this thread opened through CreateFileA (pal_kernel.cpp). The game's music thread opens the
+// track with its own reader right before it builds the DirectShow graph (pal_dshow.cpp), which plays that file.
+const char* pal_media_last_open();
+void pal_dshow_enable_sink();
+void pal_vorbis_enable_decoder();      // browser: ov_* decode through the page (pal_user.cpp)            // browser: graphs drive web/recomp/index.html's music player    // pal_dsound.cpp: DirectSound 8
 const PalEntry* pal_d3d9_entries();     // pal_d3d9.cpp: Direct3DCreate9
 const PalEntry* pal_d3dx_entries();     // pal_d3dx.cpp: D3DX
 // pal_user.cpp: the host's screen size, input messages for the main window, its handle

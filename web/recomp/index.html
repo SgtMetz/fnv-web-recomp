@@ -53,7 +53,7 @@ window.Module = {
   print: (m) => log(m),
   printErr: (m) => log(m, true),
   onAbort: (m) => { status.textContent = 'aborted'; log('abort: ' + m, true); },
-  onRuntimeInitialized: () => { log(`runtime ready in ${((performance.now() - t0) / 1000).toFixed(1)} s`); pump(); },
+  onRuntimeInitialized: () => { log(`runtime ready in ${((performance.now() - t0) / 1000).toFixed(1)} s`); pump(); startAudio(); },
 };
 
 // the D3D9 command ring (port/recomp/pal_d3d9.h D3dRing: data, size, write, read, frames_sent, frames_done, enabled)
@@ -63,15 +63,15 @@ async function pump() {
   pumpInfo.calls++;
   const M = window.Module;
   if (!ring) ring = M._fnv_ring();
-  const H32 = M.HEAPU32, H8 = M.HEAPU8, b = ring >> 2;
+  const H32 = M.HEAPU32, H8 = M.HEAPU8, b = ring >>> 2;
   const deadline = performance.now() + 14;
   try {
     for (;;) {
       const data = Atomics.load(H32, b), rd = Atomics.load(H32, b + 3), wr = Atomics.load(H32, b + 2);
       if (!data || rd === wr) break;
-      const p = data + rd, op = H32[p >> 2], len = H32[(p >> 2) + 1];
+      const p = data + rd, op = H32[p >>> 2], len = H32[(p >>> 2) + 1];
       if (op === 0xffff) { Atomics.store(H32, b + 3, 0); continue; }
-      const w = H32.subarray((p >> 2) + 2, (p >> 2) + 2 + (len >> 2)), bytes = H8.subarray(p + 8, p + 8 + len);
+      const w = H32.subarray((p >>> 2) + 2, (p >>> 2) + 2 + (len >>> 2)), bytes = H8.subarray(p + 8, p + 8 + len);
       pumpInfo.packets++; pumpInfo.op = op;
       const presented = await renderer.exec(op, w, bytes);
       Atomics.store(H32, b + 3, rd + 8 + len);
@@ -86,7 +86,8 @@ async function pump() {
   if (now - lastT > 1000) {
     fps = (renderer.frames - lastFrames) * 1000 / (now - lastT);
     lastFrames = renderer.frames; lastT = now;
-    status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped`;
+    const snd = audio.ctx ? (audio.ctx.state === 'running' ? `sound ${(audio.peak * 100).toFixed(0)}%` : 'sound: click to start') : '';
+    status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped · ${snd}`;
   }
   // the game waits on the renderer, and a hidden or embedded page may get no animation frames: whichever of the
   // next frame and a short timer comes first runs the pump
@@ -95,6 +96,100 @@ async function pump() {
   requestAnimationFrame(go);
   setTimeout(go, 20);
 }
+
+// sound: the PAL's mixer ring (port/recomp/pal_sound.h) through an AudioWorklet. Browsers start audio only after a
+// user gesture, so a suspended context is resumed on the first click or key press; until then the mixer keeps time.
+const audio = window.fnvAudio = { ctx: null, peak: 0, underruns: 0 };
+async function startAudio() {
+  try {
+    if (!audio.ctx) {
+      audio.ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+      await audio.ctx.audioWorklet.addModule('./audio-worklet.js');
+      const node = new AudioWorkletNode(audio.ctx, 'fnv-audio', { outputChannelCount: [2] });
+      node.port.onmessage = (e) => { audio.peak = e.data.peak; audio.underruns = e.data.underruns; };
+      node.port.postMessage({ buffer: window.Module.HEAPU8.buffer, ring: window.Module._fnv_audio() });
+      node.connect(audio.ctx.destination);
+      audio.node = node;
+    }
+    if (audio.ctx.state !== 'running') await audio.ctx.resume();
+  } catch (e) {
+    log('audio: ' + e, true);
+  }
+}
+for (const ev of ['click', 'keydown']) canvas.addEventListener(ev, () => { if (audio.ctx && audio.ctx.state !== 'running') audio.ctx.resume(); });
+
+// music: the game's DirectShow graphs (port/recomp/pal_dshow.cpp) name an MP3 track; the browser decodes and plays it.
+// cmd 1 play from pos, 2 pause, 3 stop, 4 volume (hundredths of a dB), 5 seek
+// voices: libvorbisfile in the PAL hands over a whole Ogg stream; decode it here into 16-bit PCM in the wasm heap.
+// request words: data, bytes, done, pcm, frames, channels, rate, ok (port/recomp/pal_user.cpp ov_open_callbacks_)
+audio.decodes = 0;
+window.fnvDecode = async (req) => {
+  const M = window.Module, w = (req >>> 0) >>> 2;   // heap addresses above 2 GB arrive as negative numbers
+  const finish = (ok) => { M.HEAPU32[w + 7] = ok ? 1 : 0; Atomics.store(M.HEAPU32, w + 2, 1); };
+  try {
+    const bytes = M.HEAPU8.slice(M.HEAPU32[w], M.HEAPU32[w] + M.HEAPU32[w + 1]);   // HEAPU32 values are unsigned
+    const ctx = audio.ctx || new OfflineAudioContext(2, 1, 48000);
+    const buf = await ctx.decodeAudioData(bytes.buffer);
+    const ch = Math.min(2, buf.numberOfChannels), n = buf.length;
+    const p = M._malloc(n * ch * 2) >>> 0;
+    const out = new Int16Array(M.HEAPU8.buffer, p, n * ch);
+    for (let c = 0; c < ch; c++) {
+      const d = buf.getChannelData(c);
+      for (let i = 0; i < n; i++) out[i * ch + c] = Math.max(-32768, Math.min(32767, Math.round(d[i] * 32767)));
+    }
+    M.HEAPU32[w + 3] = p; M.HEAPU32[w + 4] = n; M.HEAPU32[w + 5] = ch; M.HEAPU32[w + 6] = buf.sampleRate;
+    audio.decodes++;
+    finish(true);
+  } catch (e) {
+    log('voice decode: ' + e, true);
+    finish(false);
+  }
+};
+
+const tracks = new Map();
+audio.tracks = tracks;
+const decoded = new Map();      // path -> Promise<AudioBuffer>
+function trackBuffer(path) {
+  if (!decoded.has(path)) {
+    decoded.set(path, (async () => {
+      const q = encodeURIComponent(path);
+      const st = await (await fetch('/fs/stat?p=' + q)).json();
+      const bytes = await (await fetch(`/fs/read?p=${q}&o=0&n=${st.size}`)).arrayBuffer();
+      return audio.ctx.decodeAudioData(bytes);
+    })());
+  }
+  return decoded.get(path);
+}
+window.fnvMusic = (id, cmd, path, volume, pos) => {
+  id >>>= 0;
+  if (!audio.ctx || !path) return;
+  let t = tracks.get(id);
+  if (!t) {
+    t = { gain: audio.ctx.createGain(), src: null, offset: 0, startedAt: 0, playing: false, path };
+    t.gain.connect(audio.ctx.destination);
+    tracks.set(id, t);
+  }
+  const stopSrc = () => { if (t.src) { try { t.src.stop(); } catch {} t.src.disconnect(); t.src = null; } };
+  const setVol = (v) => { t.gain.gain.value = v <= -10000 ? 0 : Math.pow(10, Math.min(0, v) / 2000); };
+  const start = async (from) => {
+    const buf = await trackBuffer(path);
+    t.duration = buf.duration;
+    window.Module._fnv_music_duration(id, buf.duration);
+    if (!t.playing) return;
+    stopSrc();
+    t.src = audio.ctx.createBufferSource();
+    t.src.buffer = buf;
+    t.src.connect(t.gain);
+    t.offset = Math.min(from, buf.duration);
+    t.startedAt = audio.ctx.currentTime;
+    t.src.start(0, t.offset);
+  };
+  if (cmd === 1) { setVol(volume); t.playing = true; start(pos).catch((e) => log('music ' + path + ': ' + e, true)); log('music: ' + path); }
+  else if (cmd === 2) { t.playing = false; stopSrc(); }
+  else if (cmd === 3) { t.playing = false; stopSrc(); tracks.delete(id); t.gain.disconnect(); }
+  else if (cmd === 4) setVol(volume);
+  else if (cmd === 5 && t.playing) start(pos);
+};
 
 // input: DirectInput scan codes, mouse deltas under pointer lock
 const DIK = { Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8, Digit8: 9, Digit9: 10,

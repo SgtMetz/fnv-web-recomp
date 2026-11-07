@@ -25,6 +25,7 @@
 #include "pal.h"
 #include "pal_d3d9.h"
 #include "pal_fs.h"
+#include "pal_sound.h"
 
 extern "C" char __global_base;                 // wasm-ld: start of Emscripten's static data
 
@@ -83,6 +84,8 @@ uint32_t galloc(uint32_t size)
     return (uint32_t)(uintptr_t)p;
 }
 
+HostThread* g_all_threads[64];                   // for fnv_dump_threads
+
 HostThread* new_thread(uint32_t stack_size)
 {
     // thread state in static storage, away from the heap the game allocates from (corruption hunting)
@@ -90,6 +93,7 @@ HostThread* new_thread(uint32_t stack_size)
     static std::atomic<int> s_nthreads;
     int slot = s_nthreads++;
     HostThread* ht = slot < 64 ? &s_threads[slot] : (HostThread*)aligned_alloc(64, sizeof(HostThread));
+    if (slot < 64) g_all_threads[slot] = ht;
     memset(ht, 0, sizeof(HostThread));
     ht->stack_lo = galloc(stack_size);
     ht->stack_hi = ht->stack_lo + stack_size;
@@ -487,6 +491,7 @@ void start_ring_dump(const char* path)
 
 // the page's hooks (web/recomp/index.html): the command ring, and input as DirectInput sees it
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_ring() { return (uint32_t)(uintptr_t)pal_d3d_ring(); }
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_audio() { return (uint32_t)(uintptr_t)pal_sound_ring(); }
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_key(int dik, int down) { pal_input_key(dik, down != 0); }
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_mouse(int dx, int dy, int dz, int button, int down) { pal_input_mouse(dx, dy, dz, button, down != 0); }
 
@@ -514,7 +519,13 @@ int main(int argc, char** argv)
     logf("[web] fixed-address reservation area %08x-%08x\n", g_fixed_lo, g_fixed_hi);
     std::string dir = g_exe_path.substr(0, g_exe_path.find_last_of('/'));
     pal_fs_chdir(dir.c_str());
-    if (g_browser) pal_d3d_enable_ring(128u << 20);         // web/recomp/renderer.js consumes it on the page's thread
+    if (g_browser)
+    {
+        pal_d3d_enable_ring(128u << 20);                    // web/recomp/renderer.js consumes it on the page's thread
+        pal_sound_enable(16384, 4096);                      // web/recomp/audio-worklet.js plays it (~85 ms ahead)
+        pal_dshow_enable_sink();                            // music: the page plays the tracks the graphs run
+        pal_vorbis_enable_decoder();                        // voices: the page decodes Ogg Vorbis
+    }
     else if (chdir(dir.c_str())) logf("[web] cannot enter %s\n", dir.c_str());
     if (const char* rd = getenv("FNV_RING_DUMP")) start_ring_dump(rd);
     if (const char* sc = getenv("FNV_INPUT_SCRIPT")) pal_input_script(sc);
@@ -523,6 +534,30 @@ int main(int argc, char** argv)
     // reaches the uncaughtException hook (pre-js) while the instance is intact and fnv_dump_state can report it
     game_main(nullptr);
     return 0;
+}
+
+// debugging (page console: Module._fnv_dump_threads()): where every game thread is, as return addresses on its stack
+extern "C" EMSCRIPTEN_KEEPALIVE void fnv_dump_threads()
+{
+    for (int i = 0; i < 64; ++i)
+    {
+        HostThread* ht = g_all_threads[i];
+        if (!ht) continue;
+        FnvCpu& s = ht->cpu;
+        std::string line = "[web] thread " + std::to_string(i) + ":";
+        char b[16];
+        for (uint32_t p = s.esp, shown = 0; p >= ht->stack_lo && p + 4 <= ht->stack_hi && shown < 14; p += 4)
+        {
+            uint32_t v = M32(p);
+            if (v >= g_image_lo + 0x1005 && v < 0x00fdf000u && M8(v - 5) == 0xe8)
+            {
+                snprintf(b, sizeof b, " %08x", v);
+                line += b;
+                ++shown;
+            }
+        }
+        logf("%s%c", line.c_str(), 10);
+    }
 }
 
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_dump_state()

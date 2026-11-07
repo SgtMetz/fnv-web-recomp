@@ -145,6 +145,7 @@ std::string norm(const char* p)
 }
 } // namespace
 
+std::string pal_fs_resolve(const char* path) { return norm(path); }
 void pal_fs_chdir(const char* path)
 {
     std::string n = norm(path);
