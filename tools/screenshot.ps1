@@ -1,6 +1,6 @@
 # Save a PNG of the relinked game's main window (PrintWindow, so it works when the window is covered).
 # usage: powershell -File tools/screenshot.ps1 [-Out out/shot.png]
-param([string]$Out = "E:\Games\Claude fnv\out\shot.png", [switch]$Stats)
+param([string]$Out = "E:\Games\Claude fnv\out\shot.png", [switch]$Stats, [string]$Proc = "FalloutNV_relinked")
 Add-Type -AssemblyName System.Drawing
 Add-Type @"
 using System; using System.Text; using System.Runtime.InteropServices;
@@ -23,7 +23,7 @@ public class FnvWin {
     return best; }
 }
 "@
-$p = Get-Process FalloutNV_relinked -ErrorAction SilentlyContinue | Select-Object -First 1
+$p = Get-Process $Proc -ErrorAction SilentlyContinue | Select-Object -First 1
 if (-not $p) { "no process"; exit 1 }
 $h = [FnvWin]::Find([uint32]$p.Id)
 if ($h -eq [IntPtr]::Zero) { "no window"; exit 1 }
