@@ -15,6 +15,7 @@ Only addresses, names and counts are written (to out/, git-ignored). No bytes of
 
 usage: python tools/relink.py --exe <FalloutNV.exe> [--decomp <fnv_decomp-main>] [--out out/relink_census.json]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import bisect
 import json
@@ -101,7 +102,7 @@ class Image:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--exe', required=True)
-    ap.add_argument('--decomp', default=r'E:\Games\fnv_decomp-main')
+    ap.add_argument('--decomp', default=DECOMP_DIR)
     ap.add_argument('--out', default='out/relink_census.json')
     a = ap.parse_args()
 

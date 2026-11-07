@@ -8,6 +8,7 @@ out/obj/ (git-ignored). Sources in the decomp are never modified; port-side fixe
 
 usage: python tools/compile_census.py [--decomp DIR] [--jobs N] [--only TEXT] [--limit N]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import json
 import os
@@ -63,7 +64,7 @@ def bucket(err):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--decomp', default=r'E:\Games\fnv_decomp-main')
+    ap.add_argument('--decomp', default=DECOMP_DIR)
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
     ap.add_argument('--only', default='')
     ap.add_argument('--limit', type=int, default=0)

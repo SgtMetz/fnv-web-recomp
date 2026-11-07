@@ -6,6 +6,7 @@ decomp tolerates a difference (MSVC restores esp from ebp), clang-compiled calle
 
 usage: python tools/pop_check.py  -> out/pop_mismatch.json {"0xaddr": {"actual": N, "declared": {name: N}}}
 """
+from decomp_path import DECOMP_DIR
 import bisect
 import json
 import re
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import msmangle  # noqa: E402
 
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 LINE = re.compile(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*?)\s*(?:<.*>)?\s*$')
 
 

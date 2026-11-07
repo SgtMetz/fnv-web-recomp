@@ -12,6 +12,7 @@ Output: out/fnv_map.json  {unit index: {mangled name: "0xADDR"}} plus a summary 
 
 usage: python tools/fnv_map.py [--jobs N] [--only TEXT]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import json
 import os
@@ -26,7 +27,7 @@ import compile_census as cc  # noqa: E402
 import overlay as ov  # noqa: E402
 
 ROOT = cc.ROOT
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 FNV = re.compile(r'//\s*@fnv\s+(0x[0-9a-fA-F]+)')
 KINDS = None
 

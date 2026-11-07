@@ -18,6 +18,7 @@ extra function only costs speed).
 usage: python tools/copy_dtor_scan.py [--jobs N] [--only substr]  -> out/copy_dtor.json
        {"units": {source: {type: [first-use lines]}}, "functions": {"0xaddr": [types]}}
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import json
 import os
@@ -32,7 +33,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 import compile_census as cc  # noqa: E402
 import overlay  # noqa: E402
 
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 WARN = re.compile(r"^(?P<file>.*?)\((?P<line>\d+),\d+\) ?: warning: definition of implicit copy "
                   r"(?:constructor|assignment operator) for '(?P<type>[^']+)' is deprecated")
 NOTE = re.compile(r"^(?P<file>.*?)\((?P<line>\d+),\d+\) ?: note: in implicit copy "

@@ -15,6 +15,7 @@ time until the unit compiles or no rule applies:
 
 usage: python tools/overlay.py [--only TEXT] [--rounds N] [--jobs N]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import json
 import os
@@ -29,11 +30,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import compile_census as cc  # noqa: E402
 
 ROOT = cc.ROOT
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 OUT = ROOT / 'out/src'
 SSE_BLOCK = ROOT / 'port/compat/fnv_sse_block.h'
 MSVC_XMM = ROOT / 'port/compat/fnv_msvc_xmm.h'
 OWN_M128 = re.compile(r'\b(union|struct)\s*(__declspec\((?:[^()]|\([^()]*\))*\)\s*|_CRT_ALIGN\(\d+\)\s*)*__m128\b')
+# an anonymous `typedef union {...} __m128, Alias;` left after unification (its members are not the standard ones)
+OWN_M128_ANON = re.compile(r'\}\s*__m128\s*(,\s*\w+\s*)*;')
 DIAG = re.compile(r'^(?P<file>.*?)\((?P<line>\d+),(?P<col>\d+)\) ?:(?P<ranges>(?:\{\d+:\d+-\d+:\d+\})*):? ?'
                   r'(?P<kind>error|note): (?P<msg>.*)$')
 RANGE = re.compile(r'\{(\d+):(\d+)-(\d+):(\d+)\}')
@@ -45,7 +48,10 @@ SSE_DEF = re.compile(r'union\s+(__declspec\([^)]*\)\s*|_CRT_ALIGN\(\d+\)\s*)*__m
 
 
 FIXIT = re.compile(r'^fix-it:"(?P<file>.*?)":\{(?P<l1>\d+):(?P<c1>\d+)-(?P<l2>\d+):(?P<c2>\d+)\}:"(?P<text>.*)"$')
-MODERN = ['-fms-compatibility-version=19.44', '/std:c++17']
+# /Zc:threadSafeInit- /Zc:tlsGuards-: VC2008 had no thread-safe function statics and no on-demand TLS init guards. Without it the modern mode emits magic-static
+# guards (__Init_thread_epoch, __tls_guard SECREL references) that the relink cannot bind (88 units on the updated
+# decomp, which pulls the modern STL into many more units)
+MODERN = ['-fms-compatibility-version=19.44', '/std:c++17', '/Zc:threadSafeInit-', '/Zc:tlsGuards-']
 HELPERS = ROOT / 'port/compat/fnv_overlay_helpers.h'
 
 
@@ -55,6 +61,9 @@ def compile_unit(unit, src, sse, obj='NUL', modern=False):
     extra = ['/I' + str((DECOMP / unit['source']).parent), '/I' + str(SSE_BLOCK.parent),
              '/clang:-fdiagnostics-parseable-fixits', '/clang:-fdiagnostics-print-source-range-info',
              '/FI' + str(HELPERS)]
+    vfs = hdr_dir(src) / 'vfs.yaml'
+    if vfs.exists():
+        extra += ['/clang:-ivfsoverlay', '/clang:' + str(vfs)]
     if sse:
         extra.append('/FI' + str(SSE_BLOCK))
     if sse == 'types':
@@ -83,6 +92,96 @@ def same_file(a, b):
         return Path(a).resolve() == Path(b).resolve()
     except OSError:
         return False
+
+
+# ---- per-unit header copies -----------------------------------------------------------------------------------------
+# A header deep in the include graph is found through its includer's folder first, so a copy next to the unit does not
+# win. Patched copies live in out/src/NNNN/hdr/ and replace the decomp's file for that unit only, through clang's
+# virtual file system overlay (-ivfsoverlay, file names kept as the original so diagnostics point at the same path).
+# The decomp's headers are never modified.
+
+def hdr_dir(src):
+    return Path(src).parent / 'hdr'
+
+
+def decomp_header(f):
+    """The decomp header a diagnostic names (resolved), or None for the unit itself, SDK and compiler headers."""
+    try:
+        p = Path(f).resolve()
+    except OSError:
+        return None
+    try:
+        p.relative_to(DECOMP.resolve())
+    except ValueError:
+        return None
+    return p if p.suffix.lower() in ('.h', '.hpp', '.inl') and p.exists() else None
+
+
+def header_copy_path(src, real):
+    import hashlib
+    return hdr_dir(src) / ('%s_%s' % (hashlib.sha1(str(real).lower().encode()).hexdigest()[:8], real.name))
+
+
+def header_lines(src, real):
+    copy = header_copy_path(src, real)
+    return (copy if copy.exists() else real).read_text(errors='replace').split('\n')
+
+
+def save_header(src, real, lines):
+    d = hdr_dir(src)
+    d.mkdir(exist_ok=True)
+    header_copy_path(src, real).write_text('\n'.join(lines))
+    mapping = json.loads((d / 'map.json').read_text()) if (d / 'map.json').exists() else {}
+    mapping[str(real)] = str(header_copy_path(src, real))
+    (d / 'map.json').write_text(json.dumps(mapping, indent=1))
+    roots = [{'type': 'file', 'name': k, 'external-contents': v} for k, v in sorted(mapping.items())]
+    (d / 'vfs.yaml').write_text(json.dumps({'version': 0, 'case-sensitive': 'false', 'use-external-names': False,
+                                            'roots': roots}, indent=1))
+
+
+IFNE_ERR = re.compile(r"implicit instantiation of undefined template|use of undeclared identifier|"
+                      r"incomplete type '[^']+' named in nested name specifier|no member named '\w+' in")
+IFNE_MEMBER = re.compile(r'__if_not_exists\s*\(\s*(?:::)?[\w:<>, *]+?::~?\w+\s*\)')
+
+
+def header_fixes(diags, src, record):
+    """Errors inside decomp headers, fixed in this unit's copy of the header:
+       * `__if_not_exists(T::member)` where T is undeclared or an incomplete (template) class: VC2008 reads that as
+         "not there" and keeps the block; clang errors. Test a name that is never declared, so the block is kept.
+         Only lines clang rejects change; where T is complete the test still works as written.
+       * a `static` member declared with the name and parameters of a base class virtual (VC2008 accepted the hiding,
+         C++ makes it an override): the one-line declaration is commented out. Only applied when nothing in the
+         decomp defines it (checked: NiShadeProperty::GetType, 2026-11-06), so no call can bind to it.
+       * a one-line redeclaration of an SSE intrinsic that clang's headers already declared constexpr: dropped, the
+         compiler's own declaration is used."""
+    edits = {}
+    for d in diags:
+        if d['kind'] != 'error':
+            continue
+        real = decomp_header(d['file'])
+        if real is None:
+            continue
+        lines = edits.get(real) or header_lines(src, real)
+        i = d['line'] - 1
+        if i >= len(lines):
+            continue
+        line, new, rule = lines[i], None, None
+        if IFNE_ERR.search(d['msg']) and IFNE_MEMBER.search(line):
+            k = sum(1 for c in record if c['rule'] == 'ifexists-header') + 1
+            new, rule = IFNE_MEMBER.sub('__if_not_exists(__fnv_never_declared_h%d)' % k, line, count=1), 'ifexists-header'
+        elif re.match(r"'static' member function '(\w+)' overrides a virtual function", d['msg']) and \
+                re.match(r'^\s*static\s[^;{}]*\(\s*[^;{}]*\)\s*;\s*$', line):
+            new, rule = '// [overlay static-hides-virtual] ' + line, 'static-hides-virtual'
+        elif re.match(r"non-constexpr declaration of '_mm_\w+' follows constexpr declaration", d['msg']) and \
+                re.match(r'^\s*(extern\s+"C"\s+)?[\w\s*]+\b_mm_\w+\s*\([^;{}]*\)\s*;\s*$', line):
+            new, rule = '// [overlay intrinsic-redecl] ' + line, 'intrinsic-redecl'
+        if new is not None and new != line:
+            lines[i] = new
+            edits[real] = lines
+            record.append(dict(rule=rule, header=real.name, line=d['line']))
+    for real, lines in edits.items():
+        save_header(src, real, lines)
+    return bool(edits)
 
 
 def namespace_depths(lines):
@@ -155,6 +254,7 @@ def rename_from(lines, name, starts):
 SIMD_TYPES = {'__m128': 'm128_', '__m128i': 'm128i_', '__m64': 'm64_'}
 SIMD_DEF = re.compile(r'(\btypedef\s+)?\b(union|struct)\s*(__declspec\((?:[^()]|\([^()]*\))*\)\s*|_CRT_ALIGN\(\d+\)\s*)*'
                       r'(__m128i|__m128|__m64)\b\s*\{')
+SIMD_ANON = re.compile(r'\btypedef\s+(union|struct)\s*(__declspec\((?:[^()]|\([^()]*\))*\)\s*|_CRT_ALIGN\(\d+\)\s*)*\{')
 
 
 def unify_simd_types(text):
@@ -181,6 +281,41 @@ def unify_simd_types(text):
             continue
         line = text.count('\n', 0, m.start())
         repl = ('typedef ::%s %s;' % (name, name)) if depth_at[line] else ''
+        out.append(text[pos:m.start()])
+        out.append('/* [overlay sse] own %s removed */ %s' % (name, repl) + '\n' * text.count('\n', m.start(), end))
+        pos = end
+        n += 1
+    out.append(text[pos:])
+    text = ''.join(out)
+    # the updated decomp (2026-11-06) also writes them anonymously, with extra names after the body:
+    # `typedef union __declspec(...) { float m128_f32[4]; ... } __m128, LocalM128;` -> typedefs of the global type
+    out, pos = [], 0
+    depth_at = namespace_depths(text.splitlines())
+    for m in SIMD_ANON.finditer(text):
+        if m.start() < pos:
+            continue
+        i, depth = m.end() - 1, 0
+        while i < len(text):
+            depth += {'{': 1, '}': -1}.get(text[i], 0)
+            if depth == 0:
+                break
+            i += 1
+        t = re.match(r'\}\s*([\w\s,*]*?)\s*;', text[i:])
+        if not t:
+            continue
+        names = [x.strip() for x in t.group(1).split(',') if x.strip()]
+        simd = [x for x in names if x in SIMD_TYPES]
+        if len(simd) != 1 or any(not re.fullmatch(r'\w+', x) for x in names):
+            continue
+        name = simd[0]
+        members = re.findall(r'(\w+)\s*(?:\[[^\]]*\])?\s*;', text[m.end():i])
+        end = i + t.end()
+        if not members or not all(x.startswith(SIMD_TYPES[name]) for x in members):
+            all_ok = False
+            continue
+        line = text.count('\n', 0, m.start())
+        keep = [x for x in names if x != name or depth_at[line]]
+        repl = ' '.join('typedef ::%s %s;' % (name, x) for x in keep)
         out.append(text[pos:m.start()])
         out.append('/* [overlay sse] own %s removed */ %s' % (name, repl) + '\n' * text.count('\n', m.start(), end))
         pos = end
@@ -710,9 +845,12 @@ def small_msvc_leniencies(lines, diags, src, record):
         m = re.match(r"cannot initialize a variable of type '([^']+)' with an rvalue of type '[^']+'", d['msg'])
         if m and 'fnv_dyncast<' in line:
             new = line.replace('= fnv_dyncast<', '= (%s)(void*)fnv_dyncast<' % m.group(1), 1)
-        elif 'forward declaration of class cannot have a nested name specifier' in d['msg'] and \
+        elif re.search(r'forward declaration of (class|struct) cannot have a nested name specifier', d['msg']) and \
                 re.match(r'^\s*(class|struct)\s+::\w+\s*;\s*$', line):
             new = '// [overlay fwd] ' + line
+        elif re.match(r"declaration of 'operator (new|delete)(\[\])?' has a different language linkage", d['msg']) \
+                and re.match(r'^\s*extern\s+"C"\s+[^{}]*\boperator\s+(new|delete)\b[^{}]*\)\s*;\s*$', line):
+            new = '// [overlay extern-c-operator] ' + line     # the C++ declaration already in scope binds the same
         elif d['msg'].startswith('no matching function for call to') and any(
                 n['kind'] == 'note' and re.search(r"no known conversion from 'const char\[\d+\]' to 'void \*'", n['msg'])
                 for n in diags[k + 1:k + 6]):
@@ -789,7 +927,8 @@ def fix_round(lines, diags, src, record, unit=None):
     changed |= incomplete_dynamic_casts(lines, diags, src, record)
     changed |= small_msvc_leniencies(lines, diags, src, record)
     changed |= sdk_conflict_renames(lines, diags, src, record)
-    ours = [d for d in diags if same_file(d['file'], src)]
+    changed |= header_fixes(diags, src, record)
+    ours =[d for d in diags if same_file(d['file'], src)]
     # qualify: N::X where N doesn't declare X but the global scope does (VC2008 resolved these)
     for d in ours:
         m = re.match(r"no member named '(\w+)' in namespace '[\w:]+'; did you mean simply '\1'\?", d['msg'])
@@ -874,11 +1013,15 @@ def process_uncached(index, unit, rounds):
         text, unified, all_ok = unify_simd_types(text)
         # nonstandard copies that remain are fine inside a namespace; only one at file scope blocks the global types
         depth = namespace_depths(text.splitlines())
-        global_own = any(not depth[text.count('\n', 0, m.start())] for m in OWN_M128.finditer(text))
+        global_own = any(not depth[text.count('\n', 0, m.start())] for m in OWN_M128.finditer(text)) or \
+            any(not depth[text.count('\n', 0, m.start())] for m in OWN_M128_ANON.finditer(text))
         sse = 'own' if global_own else 'types'
     out = overlay_path(index, unit)
     out.parent.mkdir(parents=True, exist_ok=True)
-    record = [dict(rule='sse', mode=sse, unified=unified)] if sse else []
+    if hdr_dir(out).exists():                    # header copies from an earlier run would leak into this one
+        import shutil
+        shutil.rmtree(hdr_dir(out))
+    record =[dict(rule='sse', mode=sse, unified=unified)] if sse else []
     # __if_not_exists(T::T) ("class T is not declared yet") errors in clang when T is undeclared; test T itself
     text, n = re.subn(r'__if_not_exists\s*\(\s*(::)?(\w+)::\2\s*\)', r'__if_not_exists(\1\2)', text)
     if n:

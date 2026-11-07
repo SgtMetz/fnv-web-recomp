@@ -13,6 +13,7 @@ The result is cumulative like ctor_refs.json (a lifted caller no longer looks co
 usage: python tools/noreturn_scan.py  -> out/noreturn_callers.json {"0xcaller": ["0xcallee", ...]}
 (reads the last link: out/link/fnv_game.map, fnv_game.dll, lifted.json, and out/exe_text.asm)
 """
+from decomp_path import DECOMP_DIR
 import bisect
 import json
 import re
@@ -25,7 +26,7 @@ sys.path.insert(0, str(ROOT / 'tools'))
 from relink import Image  # noqa: E402
 from ctor_refs import relinked_starts  # noqa: E402
 
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 
 
 def returning(spans):

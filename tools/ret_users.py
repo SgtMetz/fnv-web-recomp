@@ -10,6 +10,7 @@ followed directly by `ret` passes the value through: it counts when the containi
 
 usage: python tools/ret_users.py --exe <FalloutNV.exe>   -> out/ret_used.json  {"0x00658c10": "eax" | "st0"}
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import bisect
 import json
@@ -20,7 +21,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OBJDUMP = r'C:\Program Files\LLVM\bin\llvm-objdump.exe'
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 
 EAX = ('eax', 'ax', 'al', 'ah')
 LINE = re.compile(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*?)\s*(?:<.*>)?\s*$')

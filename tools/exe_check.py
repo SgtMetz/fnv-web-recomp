@@ -1,8 +1,9 @@
 """Spike 1: fingerprint check of a FalloutNV.exe against the decomp's build/image_check.json.
 Prints probe pass/fail and PE header facts only; never writes bytes of the image."""
+from decomp_path import DECOMP_DIR
 import hashlib, json, struct, sys
 from pathlib import Path
-DECOMP = Path(sys.argv[2] if len(sys.argv) > 2 else r'E:\Games\fnv_decomp-main')
+DECOMP = Path(sys.argv[2] if len(sys.argv) > 2 else DECOMP_DIR)
 sys.path.insert(0, str(DECOMP / 'tools'))
 from compare import Pe
 pe = Pe(sys.argv[1])

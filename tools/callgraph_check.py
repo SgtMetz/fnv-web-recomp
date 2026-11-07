@@ -8,6 +8,7 @@ binding error (clang inlining can only remove calls, and calls to CRT/compat/tra
 
 usage: python tools/callgraph_check.py --exe <FalloutNV.exe> [--only 0xADDR,...] [--out out/callgraph_diff.json]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import bisect
 import json
@@ -52,7 +53,7 @@ def main():
     a = ap.parse_args()
     exe, dll = Image(a.exe), Image(a.dll)
     rexe, rdll = reader(exe), reader(dll)
-    units = json.loads((Path(r'E:\Games\fnv_decomp-main') / 'build/units.json').read_text())['units']
+    units = json.loads((Path(DECOMP_DIR) / 'build/units.json').read_text())['units']
     size = {int(f['address'], 16): f['size'] for u in units for f in u['functions']}
 
     # fnv_addr_table: exported data, {original, relinked} pairs until {0, 0}

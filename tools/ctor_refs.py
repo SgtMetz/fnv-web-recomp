@@ -16,6 +16,7 @@ F's relinked body references C neither by a rel32 call/jump nor as an absolute 3
 usage: python tools/ctor_refs.py --exe <FalloutNV.exe>  -> out/ctor_refs.json {"0xF": ["0xC", ...]}
 (reads the last link: out/link/fnv_game.map, fnv_game.dll, lifted.json)
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import bisect
 import json
@@ -29,7 +30,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 from relink import Image  # noqa: E402
 
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 
 
 def relinked_starts():

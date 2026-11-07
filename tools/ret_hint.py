@@ -5,13 +5,14 @@ writes eax / pushes an x87 value. Indirect callers (vtables) cannot be seen by t
 
 usage: python tools/ret_hint.py  -> out/ret_hint.json {"0x00d5f970": "eax" | "st0"}
 """
+from decomp_path import DECOMP_DIR
 import bisect
 import json
 import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 LINE = re.compile(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*?)\s*(?:<.*>)?\s*$')
 NOISE_MN = ('pop', 'leave', 'nop', 'int3')
 

@@ -16,6 +16,7 @@ references declared with another pop to popfix thunks.
 
 usage: python tools/tail_pops.py  -> prints the flagged functions; out/tail_pop_mismatch.json
 """
+from decomp_path import DECOMP_DIR
 import json
 import re
 import sys
@@ -25,7 +26,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / 'tools'))
 import msmangle  # noqa: E402
 
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 LINE = re.compile(r'^\s*([0-9a-f]+):\s+(\S+)\s*(.*?)\s*(?:<.*>)?\s*$')
 STORE_THIS = re.compile(r'^dword ptr \[esp \+ 0x4\], ')
 ADJUSTOR = re.compile(r'@@[GHOPWX](?:[0-9]|[A-P]+@)(?=[A-Z])')

@@ -347,6 +347,11 @@
    "symbol": "_fnv_invalid_parameter_orig",
    "source": "disasm",
    "evidence": "_invalid_parameter(expr, func, file, line, reserved): calls the handler or _invoke_watson (0xec7b08); port/compat/fnv_crt_orig.cpp logs and returns so the CRT function fails with EINVAL"
+  },
+  "0x00ec330b": {
+   "symbol": "??1_Lockit@std@@QAE@XZ",
+   "source": "name",
+   "evidence": "pairs with the _Lockit(int) constructor at 0x00ec32e3: the native ctor takes the UCRT lock (the locale lock for kind 0), so the dtor must be native too. The old decomp named it ??1_Lockit@std@@ (bound by name); the updated decomp (2026-11-06) calls it staging_std::_Lockit, and the original dtor then ran, leaving the UCRT locale lock held (deadlock with the loader lock at the first shell call)"
   }
  }
 }

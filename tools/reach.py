@@ -25,6 +25,7 @@ Output: out/reach.json (summary, per-unit worklist, every problem with depth and
 
 usage: python tools/reach.py --exe <FalloutNV.exe> [--out out/reach.json]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import array
 import bisect
@@ -36,12 +37,12 @@ from collections import Counter, defaultdict, deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, r'E:\Games\fnv_decomp-main\tools')
+sys.path.insert(0, DECOMP_DIR + r'\tools')
 import lift_stubs  # noqa: E402
 from relink import Image  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 LINK = ROOT / 'out/link'
 WINMAIN = 0x0086A850
 XC_TABLE = (0x00FDF4A4, 0x010113C0)

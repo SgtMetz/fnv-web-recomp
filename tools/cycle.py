@@ -6,6 +6,7 @@ reach, with the trap/exception that blocked them. Logs: out/link/cycle_run.log, 
 
 usage: python tools/cycle.py --exe <FalloutNV.exe> [--skip-overlay] [--timeout SECONDS]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import json
 import re
@@ -58,7 +59,7 @@ def main():
             code = 'timeout'
     text = log.read_text(encoding='utf-8', errors='replace')
 
-    units = json.loads((Path(r'E:\Games\fnv_decomp-main') / 'build/units.json').read_text())['units']
+    units = json.loads((Path(DECOMP_DIR) / 'build/units.json').read_text())['units']
     owner = {int(f['address'], 16): u['source'] for u in units for f in u['functions']}
     objs = {int(p.name[:4]) for p in (ROOT / 'out/obj').glob('*.obj')}
     compiled = {units[i]['source'] for i in objs}

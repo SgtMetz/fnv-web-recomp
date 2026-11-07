@@ -1,3 +1,4 @@
+from decomp_path import DECOMP_DIR
 import json
 import re
 import subprocess
@@ -7,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PYTHON = ROOT / 'local/venv/Scripts/python.exe'
 EXE = Path(r'E:\Games\Fallout New Vegas\FalloutNV.exe')
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 TARGETS = ROOT / 'out/startup_lift_targets.json'
 MAX_RUNS = 12
 

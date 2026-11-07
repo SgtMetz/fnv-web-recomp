@@ -6,6 +6,7 @@ __thiscall/__stdcall/__fastcall pop their stack arguments, whose sizes come from
 whenever a parameter's size is not certain (a class or union passed by value, unusual encodings), so a caller never
 guesses. Checked against the original `ret N` of every recipe function (see `python tools/msmangle.py --exe ...`).
 """
+from decomp_path import DECOMP_DIR
 import re
 
 STATIC = set('CDKLSTYZ')       # <class><cc><return>
@@ -305,7 +306,7 @@ if __name__ == '__main__':
     from collections import Counter
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    sys.path.insert(0, r'E:\Games\fnv_decomp-main\tools')
+    sys.path.insert(0, DECOMP_DIR + r'\tools')
     import link_build
     from relink import Image
     ap = argparse.ArgumentParser()
@@ -313,7 +314,7 @@ if __name__ == '__main__':
     a = ap.parse_args()
     img = Image(a.exe)
     text = next(s for s in img.sections if s['name'] == '.text')
-    units = json.loads((Path(r'E:\Games\fnv_decomp-main') / 'build/units.json').read_text())['units']
+    units = json.loads((Path(DECOMP_DIR) / 'build/units.json').read_text())['units']
     funcs = {int(f['address'], 16): (f['symbol'], int(f['address'], 16) + f['size']) for u in units
              for f in u['functions']}
     pops = link_build.original_pops(a.exe, text, {k: v[1] for k, v in funcs.items()})

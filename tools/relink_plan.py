@@ -16,6 +16,7 @@ Reads every object in out/obj (one per unit, from compile_census.py / overlay.py
 
 usage: python tools/relink_plan.py --exe <FalloutNV.exe> [--out out/relink_plan.json]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import bisect
 import json
@@ -28,11 +29,11 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, r'E:\Games\fnv_decomp-main\tools')
+sys.path.insert(0, DECOMP_DIR + r'\tools')
 from relink import Image  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-DECOMP = Path(r'E:\Games\fnv_decomp-main')
+DECOMP = Path(DECOMP_DIR)
 NM = r'C:\Program Files\LLVM\bin\llvm-nm.exe'
 VS = Path(r'C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC')
 KITS = Path(r'C:\Program Files (x86)\Windows Kits\10\Lib')

@@ -8,6 +8,7 @@ the function wrote it is an input. Pushes of callee-saved registers (prologue sa
 
 usage: python tools/reg_inputs.py --exe <FalloutNV.exe>   (prints the flagged functions)
 """
+from decomp_path import DECOMP_DIR
 import re
 from collections import defaultdict
 
@@ -289,7 +290,7 @@ if __name__ == '__main__':
     ap.add_argument('--exe', required=True)
     ap.add_argument('--ecx', action='store_true', help='ECX-input callees reached through ECX-less names')
     a = ap.parse_args()
-    units = json.loads((Path(r'E:\Games\fnv_decomp-main') / 'build/units.json').read_text())['units']
+    units = json.loads((Path(DECOMP_DIR) / 'build/units.json').read_text())['units']
     if a.ecx:
         callees, sites = ecx_free_callers(a.exe, (0x00401000, 0x00FDE58B), units)
         print(len(callees), 'callees,', len({s[0] for s in sites}), 'callers,', len(sites), 'sites;',

@@ -16,6 +16,7 @@ The link result and its unresolved/duplicate symbols are summarised in out/link/
 
 usage: python tools/link_build.py --exe <FalloutNV.exe> [--jobs N]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import bisect
 import hashlib
@@ -30,7 +31,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-sys.path.insert(0, r'E:\Games\fnv_decomp-main\tools')
+sys.path.insert(0, DECOMP_DIR + r'\tools')
 import relink_plan as rp  # noqa: E402
 from relink import Image  # noqa: E402
 
@@ -56,6 +57,10 @@ EXCLUDE = {
     'src/fallout_shared/tesscript.cpp':
         'declares the original __tls_index slot (DAT_0126fd98) as a __declspec(thread) variable; no correct binding '
         'exists in a clang-built DLL (SECREL to a non-TLS address)',
+    'src/fallout_shared/tesscriptfunctions.cpp':
+        'declares g_debugTextTls (0x01271ffc, in .data just below .tls) as an extern __declspec(thread) variable: '
+        'SECREL to a non-TLS address, as tesscript.cpp. The unit first compiles on the updated decomp (2026-11-06); '
+        'before, its functions were lifted anyway',
 }
 # a mangled function or variable whose own name is FUN_/DAT_<8 hex digits>, in any scope, or the plain C name
 ADDR_NAME = re.compile(r'^(?:\?|_)(FUN|DAT)_([0-9a-fA-F]{8})(?:@|$)')
@@ -124,8 +129,12 @@ class CoffPatch:
             h = 20 + (sec - 1) * 40
             size, raw = struct.unpack_from('<II', self.data, h + 16)
             text = bytes(self.data[raw:raw + size]).decode('latin1')
-            for m in re.finditer(r'/INCLUDE:("?)([^" ]+)\1', text, re.I):
-                if m.group(2) in names:
+            # Every /EXPORT goes too: the updated decomp marks a few inline functions __declspec(dllexport)
+            # (ResetColorSlots, UpdateHighlight). Under /Zc:dllexportInlines- clang emits no body but keeps the
+            # directive, which then names an undefined symbol. The loader only looks up the port's own fnv_* exports
+            # (port/runtime), never one from a decomp unit, so nothing depends on them.
+            for m in re.finditer(r'/(INCLUDE|EXPORT):("?)([^", ]+)\2(?:,DATA)?', text, re.I):
+                if m.group(3) in names or m.group(1).upper() == 'EXPORT':
                     self.data[raw + m.start():raw + m.end()] = b' ' * (m.end() - m.start())
                     n += 1
         return n
@@ -191,12 +200,16 @@ def ctx_pool(ctx, jobs):
 
 
 CRT_REGION = (0x00EC3000, 0x00EDE000)     # the statically linked VC2008 CRT in FalloutNV.exe
+# Named by the updated decomp (2026-11-06) but kept original: binding by name would change behavior the old build had.
+# 0x00ec78e0 std::exception::exception(): the native ctor writes the native vtable into objects the original
+# (lifted) code throws and catches with its own RTTI.
+CRT_ALIAS_SKIP = {0x00EC78E0}
 
 
 def crt_alias(name, addr, libsyms):
     """Modern CRT symbol for a decomp name of a VC2008 CRT function, by name only, inside the CRT region:
     `__malloc` (extern "C" _malloc) -> `_malloc`, `?_strlen@@YAIPBD@Z` -> `_strlen`. FUN_ names never match."""
-    if not CRT_REGION[0] <= addr < CRT_REGION[1] or 'FUN_' in name:
+    if not CRT_REGION[0] <= addr < CRT_REGION[1] or 'FUN_' in name or addr in CRT_ALIAS_SKIP:
         return None
     m = re.match(r'^\?(_*\w+?)@@', name)
     base = m.group(1) if m else re.sub(r'@\d+$', '', name)
@@ -1370,6 +1383,18 @@ def main():
     # bool/char-declared bodies whose original passes a full 32-bit EAX through (see narrow_mismatches)
     if not os.environ.get('FNV_NO_NARROWLIFT'):
         ctx['lift_replace'] |= {a_ for a_ in narrow_mismatches(units) if owner.get(a_) is not None}
+    # Functions whose clang code changed with the decomp update (port/compat/decomp_update_lift.json, tools/
+    # decomp_diff.py): lifted from the original until each one is checked (0xaf7eb0 Archive::Archive jumped to a
+    # garbage address on the first BSA open)
+    diff_p = ROOT / 'port/compat/decomp_update_lift.json'
+    if diff_p.exists() and not os.environ.get('FNV_NO_DIFFLIFT'):
+        ctx['lift_replace'] |= {int(a_, 16) for a_ in json.loads(diff_p.read_text())['addresses']
+                                if owner.get(int(a_, 16)) is not None}
+    # Compiled functions where clang emitted a trap or that fall off their end (tools/clang_traps.py, from out/obj):
+    # undefined behavior the decomp uses to make MSVC match (0xaa1420 NiMemObject::operator new[])
+    traps_p = ROOT / 'out/clang_traps.json'
+    if traps_p.exists() and not os.environ.get('FNV_NO_TRAPLIFT'):
+        ctx['lift_replace'] |= {int(a_, 16) for a_ in json.loads(traps_p.read_text()) if owner.get(int(a_, 16)) is not None}
     ctx['popfix'] = {} if os.environ.get('FNV_NO_POPFIX') else popfix_map()
     for tok_ in os.environ.get('FNV_FORCE_LIFT', '').split(','):       # A/B tests: lift these recipe functions from the original
         if tok_.strip():

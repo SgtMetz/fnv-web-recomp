@@ -14,6 +14,7 @@ wheel) and counts:
 
 usage: python tools/vcall_census.py [--decomp DIR] [--jobs N] [--limit N] [--out out/vcall_census.json]
 """
+from decomp_path import DECOMP_DIR
 import argparse
 import json
 import multiprocessing as mp
@@ -135,7 +136,7 @@ def one(src):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--decomp', default=r'E:\Games\fnv_decomp-main')
+    ap.add_argument('--decomp', default=DECOMP_DIR)
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
     ap.add_argument('--limit', type=int, default=0)
     ap.add_argument('--out', default='out/vcall_census.json')

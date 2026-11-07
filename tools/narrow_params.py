@@ -12,6 +12,7 @@ the slot through esp or an ebp frame flags it. Lifting a false positive only cos
 
 usage: python tools/narrow_params.py  -> prints counts and the first flagged functions
 """
+from decomp_path import DECOMP_DIR
 import bisect
 import json
 import re
@@ -126,7 +127,7 @@ def scan(units):
 
 
 def main():
-    units = json.loads((Path(r'E:\Games\fnv_decomp-main') / 'build/units.json').read_text())['units']
+    units = json.loads((Path(DECOMP_DIR) / 'build/units.json').read_text())['units']
     flagged = scan(units)
     print('%d functions read a narrow-declared parameter as a dword' % len(flagged))
     for a in sorted(flagged)[:40]:
