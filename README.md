@@ -114,10 +114,3 @@ Current:
 Historical, kept for context: `docs/PHASE2_PLAN.md`, `docs/NVRS_EVALUATION.md`, and `docs/history/` (the Phase 0
 report, the original roadmap, and the 2026-11-03 handoff). These describe the relink path that preceded the
 recompiler.
-
-## Open work
-
-- **Performance:** the remaining cost per draw is the WebGPU calls themselves, so the next steps are fewer bind-group
-  switches and render bundles. A flag-liveness pass in the recompiler would speed up the game thread.
-- **Gameplay coverage beyond Doc Mitchell's house:** leaving Goodsprings, saving and loading, the Pip-Boy, combat.
-- **The native host still loads the DLC:** its file access goes straight to the install.
