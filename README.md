@@ -100,6 +100,7 @@ headless. The log goes to `out/recomp/run.log`.
 | Path | Contents |
 | --- | --- |
 | `tools/recomp*.py`, `tools/gen_*.py` | **Active.** The recompiler, the builds (`recomp_bundle.py`: the deployment bundle), and the generated tables. |
+
 | `server/` | **Active.** `serve.mjs`, the web server for both development and deployment, and `README.md`, the deployment guide. |
 | `port/recomp/` | **Active.** Runtime and PAL: `fnv_recomp_rt.cpp` (CPU state, calls), `pal_kernel/user/fs/com/input.cpp`, `pal_d3d9.cpp` (writes the D3D9 command ring), `pal_dsound.cpp`, `pal_dshow.cpp`, and the hosts `host_win32.cpp` and `host_web.cpp`. |
 | `web/recomp/` | **Active.** The browser page: `index.html` (worker start-up, ring pump, audio), `renderer.js` (WebGPU D3D9 renderer), `audio-worklet.js`, `debug.js`, and `replay.html` (plays a captured ring). |
