@@ -14,4 +14,3 @@ local/
 *.dds
 __pycache__/
 node_modules/
-.wrangler/

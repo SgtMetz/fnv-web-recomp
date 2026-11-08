@@ -41,7 +41,6 @@ No nv-rs code was copied, so its licence does not apply to this project. The eva
 - [Capstone](https://www.capstone-engine.org) disassembles the exe for the recompiler.
 - [vkd3d](https://gitlab.winehq.org/wine/vkd3d) and [Tint](https://dawn.googlesource.com/dawn) (from Dawn)
   translate the game's Direct3D 9 shaders to WGSL.
-- [Cloudflare Workers and R2](https://developers.cloudflare.com/workers/) host the private deployment.
 
 ## The game
 
