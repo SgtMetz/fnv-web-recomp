@@ -33,19 +33,6 @@ files. The full list is in [CREDITS.md](CREDITS.md), and the site shows it at `/
 | `fnv_decomp-main-updated\` | The community decompilation, used as the reference for names and understanding (`@fnv 0xADDR` annotations). Tools find it through `tools/decomp_path.py` (`FNV_DECOMP` overrides it). |
 | `nv-rs-main\` | Another project (GPL-3.0). It was the source of two design ideas, and no code was copied. See `docs/PHASE2_PLAN.md` and `docs/NVRS_EVALUATION.md`. |
 
-## Rules for anyone working here
-
-- **Never commit anything derived from the exe or the game data.** `out/` (generated) and `local/` (toolchains,
-  venv) are git-ignored for that reason.
-- **Never touch the real `Documents\My Games\FalloutNV`.** The builds use a private copy in `out/fnv_docs`, which the
-  web host serves as `/docs`.
-- **The server binds to 127.0.0.1 by default.** Everything it serves comes from your copy of the game, so a
-  deployment must never be public. It has no access control yet: see `server/README.md`.
-- **Git:**
-  - Stage explicit paths, never `git add -A`.
-  - Don't switch branches. Other sessions may share this checkout.
-  - Commit as `git -c user.name=SgtMetz -c user.email=69877075+SgtMetz@users.noreply.github.com commit`.
-- **Record results in `PROGRESS.md`:** add a dated entry with what was measured, what was fixed, and the evidence.
 
 ## Build and run the browser version
 
