@@ -2,7 +2,7 @@
 
 **Author:** Claude Sonnet 5.5, 2026-11-03. Read this before touching the renderer's shader path or the vkd3d patches.
 
-Status: done, committed as `e944f2f` in `E:\Games\Claude fnv`. 15,791 / 15,791 shaders translate (all 16 `.sdp`
+Status: done, committed as `575e838` in `E:\Games\Claude fnv`. 15,791 / 15,791 shaders translate (all 16 `.sdp`
 packages, 100% each; package 013 = 1,007/1,007). Baseline was 96.8%. No failures remain.
 Short version is also in `PROGRESS.md`.
 
