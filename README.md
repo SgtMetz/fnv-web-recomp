@@ -57,6 +57,10 @@ exist, so you only rerun a step when its inputs change.
 **Run:** start the server in development mode (`node server/serve.mjs --dev --game "E:/Games/Fallout New Vegas"`) and open `http://localhost:8093/`. `--dlc` turns
 the DLC on.
 
+On a touch screen (or with `?touch=1`) the page adds touch controls once the game is ready: a joystick on the left
+for W/A/S/D, a drag elsewhere to look (a short tap is a click), and buttons for Fire, Aim, Use, Jump, Reload, Crouch,
+Pip-Boy, VATS and Menu.
+
 Before the game loads, the page asks how to start. `?start=normal` or `?start=quick` in the address skips the
 question.
 - **Normal:** the main menu, after about 60 s.

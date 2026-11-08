@@ -36,6 +36,29 @@
   #boot .detail { margin-top: 5px; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   #boot .stall { color: #e7b267; }
   #boot.failed .fill { background: #c55; }
+  /* touch controls (phones and tablets, or ?touch=1): a joystick on the left, swipe to look, buttons on the right */
+  #touch { position: absolute; inset: 0; touch-action: none; user-select: none; -webkit-user-select: none; }
+  #touch[hidden] { display: none; }
+  #stick { position: absolute; width: 120px; height: 120px; margin: -60px 0 0 -60px; border-radius: 50%;
+    border: 2px solid rgba(224, 160, 64, .45); background: rgba(20, 19, 15, .35); pointer-events: none; }
+  #stick.idle { opacity: .55; }
+  #knob { position: absolute; left: 50%; top: 50%; width: 52px; height: 52px; margin: -26px 0 0 -26px; border-radius: 50%;
+    background: rgba(224, 160, 64, .55); border: 2px solid rgba(255, 210, 140, .7); }
+  #tbtns { position: absolute; right: 10px; bottom: 10px; display: grid; grid-template-columns: repeat(3, 54px); gap: 8px; }
+  #tbtns button { width: 54px; height: 54px; border-radius: 50%; padding: 0; border: 1px solid rgba(224, 160, 64, .6);
+    background: rgba(20, 19, 15, .5); color: #f2d39c; font: 600 11px system-ui, sans-serif; touch-action: none; }
+  #tbtns button.on { background: rgba(224, 160, 64, .6); color: #000; }
+  #tbtns button.fire { border-color: rgba(255, 120, 90, .8); }
+  @media (max-width: 700px), (max-height: 450px) {
+    #tbtns { grid-template-columns: repeat(3, 44px); gap: 6px; }
+    #tbtns button { width: 44px; height: 44px; font-size: 10px; }
+    #stick { width: 96px; height: 96px; margin: -48px 0 0 -48px; }
+    #knob { width: 42px; height: 42px; margin: -21px 0 0 -21px; }
+  }
+  /* the built-in controls replace any touch bar the hosting page adds under the game */
+  html.touch #touch-controls, html.touch #touch-hint { display: none !important; }
+  /* and the game gets the screen's height (less the header): the controls sit over and beside it */
+  html.touch #screen { max-height: calc(100dvh - 56px) !important; }
 </style>
 </head>
 <body>
@@ -51,6 +74,14 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
       <div class="phase"><span id="bootPhase">Starting</span><span id="bootPct"></span></div>
       <div class="track"><div class="fill" id="bootFill"></div></div>
       <div class="detail" id="bootDetail"></div>
+    </div>
+    <div id="touch" hidden aria-label="Touch controls">
+      <div id="stick" class="idle"><div id="knob"></div></div>
+      <div id="tbtns">
+        <button data-key="15">Pip-Boy</button><button data-key="47">VATS</button><button data-key="1">Menu</button>
+        <button data-key="19">Reload</button><button data-key="29">Crouch</button><button data-key="57">Jump</button>
+        <button data-key="18">Use</button><button data-mouse="1">Aim</button><button data-mouse="0" class="fire">Fire</button>
+      </div>
     </div>
     <div id="start" hidden>
       <div class="box">
@@ -410,6 +441,91 @@ canvas.addEventListener('mousedown', (e) => { if (document.pointerLockElement ==
 canvas.addEventListener('mouseup', (e) => { if (document.pointerLockElement === canvas) window.Module._fnv_mouse?.(0, 0, 0, e.button === 2 ? 1 : e.button === 1 ? 2 : 0, 0); });
 canvas.addEventListener('wheel', (e) => { e.preventDefault(); window.Module._fnv_mouse?.(0, 0, e.deltaY < 0 ? 120 : -120, -1, 0); }, { passive: false });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// ---- touch controls ---------------------------------------------------------------------------------------------------
+// On a touch screen (or with ?touch=1), once the game is ready: a joystick on the left half of the game (it starts where
+// the thumb lands) presses W/A/S/D, a drag anywhere else turns the view (or moves the menu cursor) and a short tap there
+// is a left click, and the buttons press their keys or mouse buttons. The game polls DirectInput state, so a tap is
+// held for 80 ms to be seen by at least one poll.
+const touchUI = matchMedia('(pointer: coarse)').matches || new URLSearchParams(location.search).get('touch') === '1';
+if (touchUI) {
+  document.documentElement.classList.add('touch');
+  const pad = document.getElementById('touch'), stick = document.getElementById('stick'), knob = document.getElementById('knob');
+  const keyTo = (dik, down) => window.Module?._fnv_key?.(dik, down ? 1 : 0);
+  const mouseTo = (dx, dy, button, down) => window.Module?._fnv_mouse?.(dx, dy, 0, button, down ? 1 : 0);
+  const wakeAudio = () => { if (audio.ctx && audio.ctx.state !== 'running') audio.ctx.resume(); };
+  const DIK = { up: 17, left: 30, down: 31, right: 32 };     // W A S D
+  const held = new Set();
+  const setMove = (want) => {
+    for (const k of [...held]) if (!want.has(k)) { keyTo(k, false); held.delete(k); }
+    for (const k of want) if (!held.has(k)) { keyTo(k, true); held.add(k); }
+  };
+  const rest = () => {
+    const r = pad.getBoundingClientRect(), small = r.width < 700 || r.height < 450;
+    stick.style.left = (small ? 70 : 90) + 'px'; stick.style.top = (r.height - (small ? 70 : 90)) + 'px';
+    knob.style.transform = ''; stick.classList.add('idle');
+  };
+  let move = null, look = null;
+  pad.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('button')) return;
+    e.preventDefault(); wakeAudio();
+    const r = pad.getBoundingClientRect(), x = e.clientX - r.left, y = e.clientY - r.top;
+    try { pad.setPointerCapture(e.pointerId); } catch {}
+    if (!move && x < r.width * 0.45) {
+      move = { id: e.pointerId, x, y, radius: stick.offsetWidth / 2 };
+      stick.style.left = x + 'px'; stick.style.top = y + 'px'; stick.classList.remove('idle');
+    } else if (!look) {
+      look = { id: e.pointerId, x: e.clientX, y: e.clientY, travel: 0, t: performance.now() };
+    }
+  });
+  pad.addEventListener('pointermove', (e) => {
+    if (move && e.pointerId === move.id) {
+      const r = pad.getBoundingClientRect();
+      let dx = e.clientX - r.left - move.x, dy = e.clientY - r.top - move.y;
+      const len = Math.hypot(dx, dy), max = move.radius;
+      if (len > max) { dx *= max / len; dy *= max / len; }
+      knob.style.transform = `translate(${dx}px, ${dy}px)`;
+      const t = max * 0.35, want = new Set();
+      if (dy < -t) want.add(DIK.up); if (dy > t) want.add(DIK.down);
+      if (dx < -t) want.add(DIK.left); if (dx > t) want.add(DIK.right);
+      setMove(want);
+    } else if (look && e.pointerId === look.id) {
+      const dx = e.clientX - look.x, dy = e.clientY - look.y;
+      look.x = e.clientX; look.y = e.clientY; look.travel += Math.abs(dx) + Math.abs(dy);
+      mouseTo(Math.round(dx * 2), Math.round(dy * 2), -1, false);
+    }
+  });
+  const end = (e) => {
+    if (move && e.pointerId === move.id) { move = null; setMove(new Set()); rest(); }
+    else if (look && e.pointerId === look.id) {
+      if (e.type === 'pointerup' && look.travel < 12 && performance.now() - look.t < 350) {
+        mouseTo(0, 0, 0, true); setTimeout(() => mouseTo(0, 0, 0, false), 80);
+      }
+      look = null;
+    }
+  };
+  for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) pad.addEventListener(ev, end);
+  for (const b of pad.querySelectorAll('button')) {
+    let downAt = 0;
+    const press = (down) => {
+      b.classList.toggle('on', down);
+      if (b.dataset.key) keyTo(+b.dataset.key, down); else mouseTo(0, 0, +b.dataset.mouse, down);
+    };
+    b.addEventListener('pointerdown', (e) => { e.preventDefault(); e.stopPropagation(); wakeAudio(); try { b.setPointerCapture(e.pointerId); } catch {} downAt = performance.now(); press(true); });
+    const up = () => {
+      if (!b.classList.contains('on')) return;
+      const wait = Math.max(0, 80 - (performance.now() - downAt));   // a quick tap still spans a poll
+      setTimeout(() => press(false), wait);
+      b.classList.remove('on');
+    };
+    for (const ev of ['pointerup', 'pointercancel', 'lostpointercapture']) b.addEventListener(ev, up);
+    b.addEventListener('contextmenu', (e) => e.preventDefault());
+  }
+  pad.addEventListener('contextmenu', (e) => e.preventDefault());
+  window.addEventListener('blur', () => { move = look = null; setMove(new Set()); rest(); });
+  window.addEventListener('resize', () => { if (!move) rest(); });
+  window.addEventListener('fnv-progress', (e) => { if (e.detail.ready && pad.hidden) { pad.hidden = false; rest(); } });
+}
 
 // start mode, chosen before the game loads: ?start=normal|quick, or the panel over the canvas. Quick sets FNV_START,
 // which port/recomp/pal_start.cpp turns into a new game outside Doc Mitchell's house with the default character.
