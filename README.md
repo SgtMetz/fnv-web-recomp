@@ -75,6 +75,10 @@ question.
   - The console's own text isn't drawn yet. Its output lines are a linked list at `ConsoleManager` (`*0x011d8ce8`)
     + 4, with nodes `{next, prev, char* text, u16 length}`. They are kept only while the console is open (the ~ key).
 - `window.fnvPump` shows the command-ring pump counters.
+- `window.fnvBoot` is the start-up progress behind the loading bar: download, compile, then the game's own loading
+  (kilobytes its file layer fetched, `Module._fnv_boot()`, and the stage: main started, main menu, in the world, on
+  the porch). The page also sends it as a `fnv-progress` event, and as a `{type: 'fnv-progress'}` postMessage to a
+  page that embeds it in an iframe.
 - `Module._fnv_dump_threads()` prints game-thread stacks.
 - `Module._fnv_sound_debug()` lists the playing sound buffers.
 - To find a function, map an address to the decomp with `grep -rn "@fnv 0x00XXXXXX" ../fnv_decomp-main-updated/src`,

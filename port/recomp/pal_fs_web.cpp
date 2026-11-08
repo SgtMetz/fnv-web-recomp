@@ -6,6 +6,7 @@
 //   - reads go in 1 MB blocks through one block cache for all threads (in wasm memory): a block another thread is
 //     already fetching is waited for, not fetched again;
 //   - a read of an install file names the file's mtime (v=), so the browser's HTTP cache keeps it across sessions.
+#include "pal.h"
 #include "pal_fs.h"
 
 #include <emscripten.h>
@@ -234,6 +235,12 @@ std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size
     lk.unlock();
     int64_t want = std::min(kBlock, size - blk * kBlock);
     b->data.resize((size_t)want);
+    {
+        // start-up progress: name the file before the fetch, so a slow one shows what is loading
+        size_t n = std::min(path.size(), sizeof g_pal_boot.file - 1);
+        memcpy(g_pal_boot.file, path.data(), n);
+        g_pal_boot.file[n] = 0;
+    }
     int got = js_fs_fetch(path.c_str(), (double)(blk * kBlock), (int)want, b->data.data());
     lk.lock();
     auto it = g_blocks.find(key);
@@ -247,6 +254,8 @@ std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size
     {
         b->data.resize((size_t)got);
         if (listed) g_bc_bytes += (size_t)got;
+        g_pal_boot.fetches++;
+        g_pal_boot.kb += (uint32_t)((got + 1023) / 1024);
     }
     b->ready = true;
     b->used = ++g_bc_tick;

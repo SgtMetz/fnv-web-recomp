@@ -396,6 +396,7 @@ void* game_main(void*)
 {
     t_ht = g_main_ht = new_thread(16u << 20);
     run_tls_callbacks(t_ht, 1);
+    pal_boot_stage(kBootMain);
     logf("[web] calling the original entry point %08x\n", g_entry);
     uint32_t r = fnv_guest_call(t_ht->cpu, g_entry, nullptr, 0);
     logf("[web] entry point returned %u\n", r);
@@ -491,6 +492,7 @@ void start_ring_dump(const char* path)
 
 // the page's hooks (web/recomp/index.html): the command ring, and input as DirectInput sees it
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_ring() { return (uint32_t)(uintptr_t)pal_d3d_ring(); }
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_boot() { return (uint32_t)(uintptr_t)&g_pal_boot; }   // PalBoot (pal.h)
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_audio() { return (uint32_t)(uintptr_t)pal_sound_ring(); }
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_key(int dik, int down) { pal_input_key(dik, down != 0); }
 // debugging: Module.ccall('fnv_console', null, ['string'], ['player.additem f 100']) runs a console line

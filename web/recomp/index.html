@@ -24,6 +24,16 @@
   #start button:hover, #start button:focus-visible { border-color: var(--accent); outline: none; }
   #start button b { display: block; color: var(--fg); font-weight: 600; }
   #start button span { color: var(--dim); }
+  #boot { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 18px 16px; background: linear-gradient(transparent, rgba(0, 0, 0, .85) 35%);
+    transition: opacity .6s; pointer-events: none; }
+  #boot[hidden] { display: none; }
+  #boot.done { opacity: 0; }
+  #boot .phase { display: flex; justify-content: space-between; gap: 12px; color: var(--fg); margin-bottom: 6px; }
+  #boot .track { height: 6px; background: #2a271f; border-radius: 3px; overflow: hidden; }
+  #boot .fill { height: 100%; width: 0; background: var(--accent); transition: width .3s linear; }
+  #boot .detail { margin-top: 5px; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #boot .stall { color: #e7b267; }
+  #boot.failed .fill { background: #c55; }
 </style>
 </head>
 <body>
@@ -31,6 +41,11 @@
   <div id="bar"><b>FalloutNV.exe (recompiled to WebAssembly)</b><span id="status">starting…</span><a href="credits.html" target="_blank" rel="noopener" style="margin-left:auto;color:var(--dim)">Credits</a></div>
   <div id="stage">
     <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+    <div id="boot" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Loading the game">
+      <div class="phase"><span id="bootPhase">Starting</span><span id="bootPct"></span></div>
+      <div class="track"><div class="fill" id="bootFill"></div></div>
+      <div class="detail" id="bootDetail"></div>
+    </div>
     <div id="start" hidden>
       <div class="box">
         <h1>How do you want to start?</h1>
@@ -75,9 +90,128 @@ window.Module = {
   fnvEnv: env,
   print: (m) => log(m),
   printErr: (m) => log(m, true),
-  onAbort: (m) => { status.textContent = 'aborted'; log('abort: ' + m, true); },
-  onRuntimeInitialized: () => { log(`runtime ready in ${((performance.now() - t0) / 1000).toFixed(1)} s`); pump(); startAudio(); },
+  onAbort: (m) => { status.textContent = 'aborted'; log('abort: ' + m, true); boot.fail('The game stopped: ' + m); },
+  onRuntimeInitialized: () => { log(`runtime ready in ${((performance.now() - t0) / 1000).toFixed(1)} s`); boot.runtime = true; pump(); startAudio(); },
 };
+
+// ---- start-up progress ------------------------------------------------------------------------------------------------
+// A loading bar over the canvas until the game is ready (the main menu, or Doc's porch for a quick start), so a slow
+// device does not look hung. Three parts:
+//   download  the wasm's bytes, counted as instantiateStreaming reads them (the fetch wrapper below);
+//   compile   from the last byte until the game's main thread starts (no progress events: the bar creeps, the time shows);
+//   load      the game's own start-up: g_pal_boot (port/recomp/pal.h, Module._fnv_boot) counts the kilobytes the
+//             file layer fetches, against what the last start on this browser needed (localStorage) or a default,
+//             and says when the main menu is up and when a quick start reaches the porch.
+// The state is window.fnvBoot and a 'fnv-progress' event on window; an embedding page gets it as a postMessage
+// {type: 'fnv-progress', ...}. Nothing changing for 20 s shows a note, and the log below has the details.
+const boot = window.fnvBoot = {
+  phase: 'download', fraction: 0, text: 'Starting', detail: '', ready: false, failed: false, stalled: false,
+  download: { got: 0, total: 0, done: false }, runtime: false, stage: 0, kb: 0, fetches: 0, file: '',
+  frames: 0, elapsed: 0, mode: 'normal',
+  fail(m) { this.failed = true; this.failText = m; tickBoot(); },
+};
+const W_DOWNLOAD = 0.15, W_COMPILE = 0.05;   // shares of the bar; the game's loading gets the rest
+const DEFAULT_KB = { normal: 141000, quick: 1073000 };   // kilobytes fetched until ready, measured on the GOG 1.4.0.525 install
+const bootEl = { root: document.getElementById('boot'), phase: document.getElementById('bootPhase'),
+  pct: document.getElementById('bootPct'), fill: document.getElementById('bootFill'), detail: document.getElementById('bootDetail') };
+const expectedKb = () => +localStorage.getItem('fnv.boot.kb.' + boot.mode) || DEFAULT_KB[boot.mode] || 0;
+const mb = (bytes) => (bytes / 1048576).toFixed(bytes < 10485760 ? 1 : 0);
+const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
+const utf8 = new TextDecoder();
+let bootT0 = 0, lastChange = 0, lastSig = '', compileT0 = 0, bootTimer = 0;
+
+// count the wasm's bytes as the streaming compile reads them. A compressed response's Content-Length is the
+// compressed size, so then the uncompressed size comes from the bundle's VERSION.json (absent in development).
+const realFetch = window.fetch.bind(window);
+window.fetch = async (input, init) => {
+  const res = await realFetch(input, init);
+  const url = typeof input === 'string' ? input : input.url;
+  if (!/fnv_web\.wasm(\?|$)/.test(url) || !res.ok || !res.body) return res;
+  const enc = res.headers.get('content-encoding');
+  boot.download.total = !enc || enc === 'identity' ? +res.headers.get('content-length') || 0 : 0;
+  if (!boot.download.total) realFetch('/VERSION.json', { cache: 'no-store' }).then((r) => r.ok ? r.json() : null)
+    .then((v) => { if (v && v.wasm_bytes) boot.download.total = v.wasm_bytes; }).catch(() => {});
+  const count = new TransformStream({
+    transform(chunk, c) { boot.download.got += chunk.byteLength; c.enqueue(chunk); },
+    flush() { boot.download.done = true; compileT0 = performance.now(); },
+  });
+  return new Response(res.body.pipeThrough(count), { status: res.status, statusText: res.statusText, headers: res.headers });
+};
+
+function tickBoot() {
+  const now = performance.now();
+  boot.elapsed = (now - bootT0) / 1000;
+  const M = window.Module;
+  if (boot.runtime && M._fnv_boot) {
+    const H32 = M.HEAPU32, b = M._fnv_boot() >>> 2;
+    boot.stage = H32[b]; boot.fetches = H32[b + 1]; boot.kb = H32[b + 2];
+    const f = M.HEAPU8.slice(b * 4 + 16, b * 4 + 16 + 112);
+    const end = f.indexOf(0);
+    boot.file = utf8.decode(f.subarray(0, end < 0 ? f.length : end)).replace(/^.*[\/\\]/, '');
+  }
+  boot.frames = renderer.frames;
+  const readyStage = boot.mode === 'quick' ? 4 : 2;
+  const dl = boot.download;
+  let frac, text, detail;
+  if (!boot.runtime && !dl.done) {
+    boot.phase = 'download';
+    frac = dl.total ? W_DOWNLOAD * Math.min(1, dl.got / dl.total) : 0;
+    text = 'Downloading the game';
+    detail = dl.total ? `${mb(dl.got)} / ${mb(dl.total)} MB` : dl.got ? `${mb(dl.got)} MB` : 'Connecting';
+  } else if (!boot.stage) {
+    boot.phase = 'compile';
+    const s = compileT0 ? (now - compileT0) / 1000 : 0;
+    frac = W_DOWNLOAD + W_COMPILE * (1 - Math.exp(-s / 20));
+    text = 'Compiling the game';
+    detail = `${s.toFixed(0)} s. Slow devices can take a minute or more here.`;
+  } else {
+    boot.phase = 'load';
+    const want = expectedKb();
+    const share = want ? Math.min(0.98, boot.kb / want) : 1 - Math.exp(-boot.kb / 400000);
+    frac = W_DOWNLOAD + W_COMPILE + (1 - W_DOWNLOAD - W_COMPILE) * share;
+    text = boot.stage >= 3 ? (boot.mode === 'quick' ? 'Going outside' : 'Loading the world')
+      : boot.stage >= 2 ? "Starting a new game in Doc Mitchell's house"
+      : 'Loading game data';
+    detail = `${mb(boot.kb * 1024)} MB read` + (boot.file ? ` · ${boot.file}` : '') + (boot.frames ? ` · ${boot.frames} frames` : '');
+  }
+  if (boot.stage >= readyStage && !boot.ready) {
+    boot.ready = true;
+    if (boot.kb) localStorage.setItem('fnv.boot.kb.' + boot.mode, String(boot.kb));
+    log(`ready in ${boot.elapsed.toFixed(1)} s (${boot.mode}): ${boot.kb} KB in ${boot.fetches} fetches`);
+  }
+  if (boot.ready) { frac = 1; text = 'Ready'; }
+  if (boot.failed) text = boot.failText;
+  boot.fraction = Math.max(boot.fraction, frac);   // never moves back
+  // a stall: nothing at all has changed for 20 s (compiling has no events, so its time is shown instead)
+  const sig = `${dl.got}|${boot.runtime}|${boot.stage}|${boot.kb}|${boot.frames}`;
+  if (sig !== lastSig) { lastSig = sig; lastChange = now; }
+  boot.stalled = !boot.ready && !boot.failed && boot.phase !== 'compile' && now - lastChange > 20000;
+  boot.text = text; boot.detail = detail;
+  const pct = Math.floor(boot.fraction * 100);
+  bootEl.phase.textContent = text;
+  bootEl.pct.textContent = boot.failed ? '' : `${pct}% · ${clock(boot.elapsed)}`;
+  bootEl.fill.style.width = (boot.fraction * 100).toFixed(1) + '%';
+  bootEl.root.setAttribute('aria-valuenow', String(pct));
+  bootEl.detail.textContent = boot.stalled ? `No progress for ${Math.round((now - lastChange) / 1000)} s · ${detail}` : detail;
+  bootEl.detail.classList.toggle('stall', boot.stalled);
+  bootEl.root.classList.toggle('failed', boot.failed);
+  if (!boot.ready) status.textContent = `${text} · ${pct}%`;
+  const info = { phase: boot.phase, fraction: boot.fraction, text, detail, ready: boot.ready, failed: boot.failed,
+    stalled: boot.stalled, elapsed: boot.elapsed, stage: boot.stage, kb: boot.kb, download: { ...dl } };
+  window.dispatchEvent(new CustomEvent('fnv-progress', { detail: info }));
+  if (window.parent !== window) window.parent.postMessage({ type: 'fnv-progress', ...info }, '*');
+  if (boot.ready || boot.failed) {
+    clearInterval(bootTimer);
+    if (boot.ready) { bootEl.root.classList.add('done'); setTimeout(() => { bootEl.root.hidden = true; }, 700); }
+  }
+}
+function startBoot(mode) {
+  boot.mode = mode;
+  bootT0 = lastChange = performance.now();
+  bootEl.root.hidden = false;
+  bootTimer = setInterval(tickBoot, 250);
+  tickBoot();
+}
 
 // the D3D9 command ring (port/recomp/pal_d3d9.h D3dRing: data, size, write, read, frames_sent, frames_done, enabled)
 let ring = 0, lastFrames = 0, lastT = performance.now(), fps = 0;
@@ -134,7 +268,7 @@ async function pump() {
     fps = (renderer.frames - lastFrames) * 1000 / (now - lastT);
     lastFrames = renderer.frames; lastT = now;
     const snd = audio.ctx ? (audio.ctx.state === 'running' ? `sound ${(audio.peak * 100).toFixed(0)}%` : 'sound: click to start') : '';
-    status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped · ${snd}`;
+    if (boot.ready) status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped · ${snd}`;
   }
   // the game waits on the renderer, and a hidden or embedded page may get no animation frames: whichever of the
   // next frame and a short timer comes first runs the pump
@@ -282,6 +416,7 @@ const startMode = startParam === 'quick' || startParam === 'normal' ? startParam
   document.getElementById('startNormal').focus();
 });
 if (startMode === 'quick') env.FNV_START = 'quick';
+startBoot(startMode);
 log('start: ' + (startMode === 'quick' ? "outside Doc Mitchell's house (default character)" : 'main menu'));
 status.textContent = 'starting…';
 

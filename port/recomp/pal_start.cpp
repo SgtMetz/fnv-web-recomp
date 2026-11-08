@@ -124,6 +124,12 @@ void run_line(FnvCpu& s, const char* line)
 std::mutex g_queue_mx;
 std::deque<std::string> g_queue;     // console lines from the host (pal_console_line), run at the next poll
 
+PalBoot g_pal_boot;
+void pal_boot_stage(uint32_t stage)
+{
+    if (stage > g_pal_boot.stage) g_pal_boot.stage = stage;
+}
+
 void pal_start_quick() { g_state = kWaitMenu; }
 void pal_console_line(const char* line)
 {
@@ -147,9 +153,12 @@ void pal_start_tick(FnvCpu& s)
         run_line(s, line.c_str());
         s.eax = eax; s.ecx = ecx; s.edx = edx;
     }
-    if (g_state == kOff || g_state == kDone) return;
     uint32_t player = M32(kPlayer);
     uint32_t cell = player ? M32(player + kRefParentCell) : 0;
+    // start-up progress: the main menu is up, then the player is in a cell
+    if (M32(kStartMenu) && player && !cell) pal_boot_stage(kBootMenu);
+    else if (cell && g_pal_boot.stage >= kBootMenu) pal_boot_stage(kBootWorld);
+    if (g_state == kOff || g_state == kDone) return;
     if (g_state == kWaitMenu)
     {
         if (held(M32(kStartMenu) && player && !cell, 2500))
@@ -181,6 +190,7 @@ void pal_start_tick(FnvCpu& s)
             for (const char* line : kOnPorch) run_line(s, line);
             s.eax = eax; s.ecx = ecx; s.edx = edx;
             g_state = kDone;
+            pal_boot_stage(kBootPorch);
         }
     }
 }

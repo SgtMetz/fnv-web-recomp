@@ -21,6 +21,17 @@ void pal_input_mouse(int dx, int dy, int dz, int button, bool down);   // button
 void pal_start_quick();
 void pal_start_tick(FnvCpu& s);         // main thread, once per keyboard poll
 void pal_console_line(const char* line);   // run a console line on the main thread at the next poll (debugging)
+
+// Start-up progress, for the page's loading bar (host_web.cpp fnv_boot). The game thread writes it and the page
+// only reads it, so a torn read just shows a stale value for one poll.
+//   stage   kBoot* below, only ever increases
+//   fetches blocks the file layer fetched from the server (pal_fs_web.cpp; cache hits are not counted)
+//   kb      kilobytes in those blocks
+//   file    the file of the last fetch, NUL-terminated
+enum { kBootMain = 1, kBootMenu = 2, kBootWorld = 3, kBootPorch = 4 };
+struct PalBoot { volatile uint32_t stage, fetches, kb, reserved; char file[112]; };
+extern PalBoot g_pal_boot;
+void pal_boot_stage(uint32_t stage);   // raises g_pal_boot.stage to `stage` (never lowers it)
 const PalEntry* pal_sound_entries();
 // music: the last .mp3 this thread opened through CreateFileA (pal_kernel.cpp). The game's music thread opens the
 // track with its own reader right before it builds the DirectShow graph (pal_dshow.cpp), which plays that file.
