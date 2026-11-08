@@ -22,24 +22,33 @@
 #include <unordered_map>
 #include <vector>
 
-// one synchronous request, retried: a dropped connection must not kill the game thread that asked. Defined once per
-// worker (fs_init below).
-EM_JS(void, js_fs_init, (int mobile), {
+// one synchronous request, retried: a dropped or stalled connection (common on phones) must not kill or hang the game
+// thread that asked. Each try has a timeout; a network error, a timeout or a server error (5xx, 408, 429) waits a
+// little longer each time and tries again, and counts in g_pal_boot.retries (the loading bar shows it). Defined once
+// per worker (fs_init below).
+EM_JS(void, js_fs_init, (int mobile, uint32_t* retries), {
     // the phone version (FNV_ARCHIVES=mobile, web/recomp/index.html): /game/data/<name>.bsa is read from
     // /game/data/mobile/<name>.bsa when the index has one (tools/mobile_archives.py: smaller textures and sounds)
     globalThis.fnvMobile = !!mobile;
+    globalThis.fnvRetries = retries;
     globalThis.fnvXhr = function (method, url, body, binary) {
-        for (var attempt = 0; attempt < 20; attempt++) {
+        for (var attempt = 0; attempt < 40; attempt++) {
+            var x = null;
             try {
-                var x = new XMLHttpRequest();
+                x = new XMLHttpRequest();
                 x.open(method, url, false);
                 if (binary) x.responseType = 'arraybuffer';
+                x.timeout = 30000;
                 x.send(body);
-                return x;
+                var st = x.status;
+                if (st != 0 && st < 500 && st != 408 && st != 429) return x;
             } catch (e) {
-                var until = Date.now() + 250;
-                while (Date.now() < until) {}
             }
+            Atomics.add(HEAPU32, fnvRetries >>> 2, 1);
+            if (attempt == 0 || attempt % 10 == 9)
+                console.warn('[fs] ' + method + ' ' + url.substring(0, 160) + ': ' + (x && x.status ? 'status ' + x.status : 'no answer') + ', trying again');
+            var until = Date.now() + Math.min(250 * (attempt + 1), 3000);
+            while (Date.now() < until) {}
         }
         return { status: 0 };
     };
@@ -152,7 +161,7 @@ bool fs_mobile()
 }
 void fs_init()
 {
-    if (!t_init) { js_fs_init(fs_mobile()); t_init = true; }
+    if (!t_init) { js_fs_init(fs_mobile(), (uint32_t*)&g_pal_boot.retries); t_init = true; }
 }
 
 std::string norm(const char* p)

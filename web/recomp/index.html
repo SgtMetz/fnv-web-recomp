@@ -16,7 +16,10 @@
   /* the live page (the bundle, tools/recomp_bundle.py) has no log; ?debug in the address brings it back */
   html:not(.dev) #log { display: none; }
   #stage { position: relative; }
-  #start { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .82); }
+  #start { position: absolute; inset: 0; display: flex; background: rgba(0, 0, 0, .82); overflow: auto; }
+  #start .box { margin: auto; }
+  /* a phone's game area is shorter than the panel: the panel takes the whole screen and scrolls */
+  @media (max-width: 700px), (max-height: 450px) { #start { position: fixed; z-index: 5; background: #0d0d0d; } #start .box { margin: auto 10px; } }
   #start[hidden] { display: none; }
   #start .box { max-width: 520px; padding: 20px 24px; border: 1px solid #3a3528; background: #14130f; }
   #start h1 { margin: 0 0 4px; font-size: 17px; color: var(--accent); font-weight: 600; }
@@ -26,6 +29,11 @@
   #start button:hover, #start button:focus-visible { border-color: var(--accent); outline: none; }
   #start button b { display: block; color: var(--fg); font-weight: 600; }
   #start button span { color: var(--dim); }
+  #start .quality { display: flex; gap: 8px; align-items: stretch; margin: 0 0 6px; }
+  #start .quality > span { align-self: center; min-width: 52px; color: var(--fg); }
+  #start .quality button { flex: 1; margin: 0; padding: 7px 10px; }
+  #start .quality button[aria-checked="true"] { border-color: var(--accent); background: #2a2516; }
+  #start .quality button span { display: block; font-size: 12px; }
   #boot { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 18px 16px; background: linear-gradient(transparent, rgba(0, 0, 0, .85) 35%);
     transition: opacity .6s; pointer-events: none; }
   #boot[hidden] { display: none; }
@@ -87,6 +95,11 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
       <div class="box">
         <h1>How do you want to start?</h1>
         <p>Choose before the game loads. To skip this, add ?start=normal or ?start=quick to the address.</p>
+        <div class="quality" role="radiogroup" aria-label="Quality">
+          <span>Quality</span>
+          <button id="qHigh" role="radio" data-q="high"><b>High</b><span>Full textures and sounds</span></button>
+          <button id="qLow" role="radio" data-q="low"><b>Low</b><span>About a third of the download; blurrier</span></button>
+        </div>
         <button id="startNormal"><b>Start normally</b><span>Main menu, then New Game, Continue or Load as usual.</span></button>
         <button id="startQuick"><b>Start outside Doc Mitchell's house</b><span>A new game with every default taken: Courier, SPECIAL 5s,
           default face, tag skills Guns, Speech and Sneak, no traits, casual mode, Pip-Boy on. The opening is done and
@@ -122,15 +135,19 @@ log('WebGPU features: ' + features.join(', '));
 const env = {};
 for (const [k, v] of new URLSearchParams(location.search)) if (k.startsWith('FNV_')) env[k] = v;
 
-// the phone version, on a phone or tablet (?mobile=1 or ?mobile=0 overrides): smaller texture and sound archives
-// (tools/mobile_archives.py: textures up to 256 pixels, sounds at half rate), read in place of the full ones by
-// port/recomp/pal_fs_web.cpp where the server has them. Less to download and much less GPU memory; blurrier.
-const mobileParam = new URLSearchParams(location.search).get('mobile');
-const MOBILE = mobileParam === '1' ? true : mobileParam === '0' ? false
-  : navigator.userAgentData ? navigator.userAgentData.mobile || /Android/i.test(navigator.userAgentData.platform || '')
+// quality: High reads the game's own archives; Low reads smaller copies of the texture and sound archives
+// (tools/mobile_archives.py: textures up to 256 pixels, sounds at half rate) in their place where the server has them,
+// and fetches smaller blocks (port/recomp/pal_fs_web.cpp, FNV_ARCHIVES=mobile). Low is about a third of the download
+// and much less GPU memory; blurrier. Phones and tablets start on Low, everything else on High; the start panel
+// changes it (remembered on this browser), and ?quality=low|high (or the older ?mobile=1|0) sets it for one visit.
+const query = new URLSearchParams(location.search);
+const PHONE = navigator.userAgentData ? navigator.userAgentData.mobile || /Android/i.test(navigator.userAgentData.platform || '')
   : /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
-if (MOBILE) env.FNV_ARCHIVES = 'mobile';
-log(MOBILE ? 'phone version: small textures and sounds' : 'desktop version');
+const qualityParam = query.get('quality') || { 1: 'low', 0: 'high' }[query.get('mobile')];
+let quality = qualityParam === 'low' || qualityParam === 'high' ? qualityParam
+  : localStorage.getItem('fnv.quality') === 'low' || localStorage.getItem('fnv.quality') === 'high' ? localStorage.getItem('fnv.quality')
+  : PHONE ? 'low' : 'high';
+let LOW = quality === 'low';      // set for good when the game starts (below)
 
 const t0 = performance.now();
 window.Module = {
@@ -154,20 +171,21 @@ window.Module = {
 // {type: 'fnv-progress', ...}. Nothing changing for 20 s shows a note, and the log below has the details.
 const boot = window.fnvBoot = {
   phase: 'download', fraction: 0, text: 'Starting', detail: '', ready: false, failed: false, stalled: false,
-  download: { got: 0, total: 0, scale: 1, done: false }, runtime: false, stage: 0, kb: 0, fetches: 0, file: '',
-  frames: 0, elapsed: 0, mode: 'normal',
+  download: { got: 0, total: 0, scale: 1, done: false }, runtime: false, stage: 0, kb: 0, fetches: 0, retries: 0, file: '',
+  frames: 0, elapsed: 0, mode: 'normal', quality,
   fail(m) { this.failed = true; this.failText = m; tickBoot(); },
 };
 const W_DOWNLOAD = 0.15, W_COMPILE = 0.05;   // shares of the bar; the game's loading gets the rest
 // kilobytes fetched until ready, measured on the GOG 1.4.0.525 install (desktop, and the phone version's archives)
-const DEFAULT_KB = MOBILE ? { normal: 91000, quick: 358000 } : { normal: 141000, quick: 1073000 };
+const DEFAULT_KB = () => LOW ? { normal: 91000, quick: 358000 } : { normal: 141000, quick: 1073000 };
 const bootEl = { root: document.getElementById('boot'), phase: document.getElementById('bootPhase'),
   pct: document.getElementById('bootPct'), fill: document.getElementById('bootFill'), detail: document.getElementById('bootDetail') };
-const kbKey = () => 'fnv.boot.kb.' + boot.mode + (MOBILE ? '.mobile' : '');
-const expectedKb = () => +localStorage.getItem(kbKey()) || DEFAULT_KB[boot.mode] || 0;
+const kbKey = () => 'fnv.boot.kb.' + boot.mode + (LOW ? '.mobile' : '');
+const expectedKb = () => +localStorage.getItem(kbKey()) || DEFAULT_KB()[boot.mode] || 0;
 const mb = (bytes) => (bytes / 1048576).toFixed(bytes < 10485760 ? 1 : 0);
 const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const utf8 = new TextDecoder();
+let retriesSeen = 0, retriesAt = 0;
 let bootT0 = 0, lastChange = 0, lastSig = '', compileT0 = 0, bootTimer = 0;
 
 // count the wasm's bytes as the streaming compile reads them, as downloaded (compressed) megabytes. When the server
@@ -197,7 +215,7 @@ function tickBoot() {
   const M = window.Module;
   if (boot.runtime && M._fnv_boot) {
     const H32 = M.HEAPU32, b = M._fnv_boot() >>> 2;
-    boot.stage = H32[b]; boot.fetches = H32[b + 1]; boot.kb = H32[b + 2];
+    boot.stage = H32[b]; boot.fetches = H32[b + 1]; boot.kb = H32[b + 2]; boot.retries = H32[b + 3];
     const f = M.HEAPU8.slice(b * 4 + 16, b * 4 + 16 + 112);
     const end = f.indexOf(0);
     boot.file = utf8.decode(f.subarray(0, end < 0 ? f.length : end)).replace(/^.*[\/\\]/, '');
@@ -229,6 +247,10 @@ function tickBoot() {
     // game data: what the file layer has fetched, out of what this start needed last time on this browser (or the
     // default); the total grows with the count when a start needs more than that
     detail = `${mb(boot.kb * 1024)} / ${mb(Math.max(want, boot.kb) * 1024)} MB downloaded` + (boot.file ? ` · ${boot.file}` : '');
+    // requests sent again (timeouts, dropped connections, server errors): shown while recent, so a bad connection
+    // reads as one rather than as a hang
+    if (boot.retries !== retriesSeen) { retriesSeen = boot.retries; retriesAt = now; }
+    if (boot.retries && now - retriesAt < 60000) detail += ` · weak connection, ${boot.retries} request${boot.retries > 1 ? 's' : ''} retried`;
   }
   if (boot.stage >= readyStage && !boot.ready) {
     boot.ready = true;
@@ -239,7 +261,7 @@ function tickBoot() {
   if (boot.failed) text = boot.failText;
   boot.fraction = Math.max(boot.fraction, frac);   // never moves back
   // a stall: nothing at all has changed for 20 s (compiling has no events, so its time is shown instead)
-  const sig = `${dl.got}|${boot.runtime}|${boot.stage}|${boot.kb}|${boot.frames}`;
+  const sig = `${dl.got}|${boot.runtime}|${boot.stage}|${boot.kb}|${boot.frames}|${boot.retries}`;
   if (sig !== lastSig) { lastSig = sig; lastChange = now; }
   boot.stalled = !boot.ready && !boot.failed && boot.phase !== 'compile' && now - lastChange > 20000;
   boot.text = text; boot.detail = detail;
@@ -253,7 +275,8 @@ function tickBoot() {
   bootEl.root.classList.toggle('failed', boot.failed);
   if (!boot.ready) status.textContent = `${text} · ${pct}%`;
   const info = { phase: boot.phase, fraction: boot.fraction, text, detail, ready: boot.ready, failed: boot.failed,
-    stalled: boot.stalled, elapsed: boot.elapsed, stage: boot.stage, kb: boot.kb, download: { ...dl } };
+    stalled: boot.stalled, elapsed: boot.elapsed, stage: boot.stage, kb: boot.kb, retries: boot.retries, quality,
+    download: { ...dl } };
   window.dispatchEvent(new CustomEvent('fnv-progress', { detail: info }));
   if (window.parent !== window) window.parent.postMessage({ type: 'fnv-progress', ...info }, '*');
   if (boot.ready || boot.failed) {
@@ -552,12 +575,20 @@ const startMode = startParam === 'quick' || startParam === 'normal' ? startParam
   const panel = document.getElementById('start');
   panel.hidden = false;
   status.textContent = 'choose how to start';
+  const qButtons = [document.getElementById('qHigh'), document.getElementById('qLow')];
+  const showQuality = () => { for (const b of qButtons) b.setAttribute('aria-checked', String(b.dataset.q === quality)); };
+  for (const b of qButtons) b.addEventListener('click', () => { quality = b.dataset.q; localStorage.setItem('fnv.quality', quality); showQuality(); });
+  showQuality();
   const pick = (m) => { panel.hidden = true; canvas.focus(); resolve(m); };
   document.getElementById('startNormal').addEventListener('click', () => pick('normal'));
   document.getElementById('startQuick').addEventListener('click', () => pick('quick'));
   document.getElementById('startNormal').focus();
 });
 if (startMode === 'quick') env.FNV_START = 'quick';
+LOW = quality === 'low';
+boot.quality = quality;
+if (LOW) env.FNV_ARCHIVES = 'mobile';
+log(LOW ? 'quality: low (small textures and sounds)' : 'quality: high');
 startBoot(startMode);
 log('start: ' + (startMode === 'quick' ? "outside Doc Mitchell's house (default character)" : 'main menu'));
 status.textContent = 'starting…';

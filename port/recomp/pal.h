@@ -29,7 +29,8 @@ void pal_console_line(const char* line);   // run a console line on the main thr
 //   kb      kilobytes in those blocks
 //   file    the file of the last fetch, NUL-terminated
 enum { kBootMain = 1, kBootMenu = 2, kBootWorld = 3, kBootPorch = 4 };
-struct PalBoot { volatile uint32_t stage, fetches, kb, reserved; char file[112]; };
+// retries: requests the browser file layer had to send again (timed out, dropped, or a server error)
+struct PalBoot { volatile uint32_t stage, fetches, kb, retries; char file[112]; };
 extern PalBoot g_pal_boot;
 void pal_boot_stage(uint32_t stage);   // raises g_pal_boot.stage to `stage` (never lowers it)
 const PalEntry* pal_sound_entries();

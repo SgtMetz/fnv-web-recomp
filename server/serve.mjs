@@ -28,6 +28,8 @@
 //   --dlc                  load the DLC (FNV_DLC=1 too). Off by default: the game enables any plugin whose
 //                          Data\<name>.NAM exists, so the server answers as if no .nam file existed
 //   --delay <ms>           add latency to every /fs request (to test how the game behaves on a remote server)
+//   --flaky <percent>      that share of /fs/read requests fails, half with a 503 and half by never answering (to
+//                          test the file layer's timeouts and retries, port/recomp/pal_fs_web.cpp)
 //
 // There is no access control yet. Every file the browser loads is derived from the player's own copy of the game,
 // so a deployment must not be public (server/README.md).
@@ -49,6 +51,7 @@ const HOST = opt('--host', '127.0.0.1');
 const PORT = +opt('--port', 8093);
 const DLC = args.includes('--dlc') || process.env.FNV_DLC === '1';
 const DELAY = +opt('--delay', 0);
+const FLAKY = +opt('--flaky', 0) / 100;
 const MOBILE = path.resolve(opt('--mobile', path.join(ROOT, 'out/mobile')));
 const TLS = opt('--tls-cert') && opt('--tls-key') ? { cert: fs.readFileSync(opt('--tls-cert')), key: fs.readFileSync(opt('--tls-key')) } : null;
 if (!DEV && !DIST) {
@@ -140,6 +143,11 @@ setInterval(() => {
 async function fsApi(req, res, op, q) {
   rate.n++; rate.ops[op] = (rate.ops[op] || 0) + 1;
   if (DELAY) await new Promise((r) => setTimeout(r, DELAY));
+  if (FLAKY && op === 'read' && Math.random() < FLAKY) {
+    if (Math.random() < 0.5) { res.writeHead(503).end('flaky'); return; }
+    req.socket.setTimeout(0);
+    return;                                  // never answered: the client's timeout has to notice
+  }
   if (op === 'index') {
     res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-cache' }).end(gameIndexJson);
     return;
