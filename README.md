@@ -61,7 +61,7 @@ On a touch screen (or with `?touch=1`) the page adds touch controls once the gam
 for W/A/S/D, a drag elsewhere to look (a short tap is a click), and buttons for Fire, Aim, Use, Jump, Reload, Crouch,
 Pip-Boy, VATS and Menu.
 
-Before the game loads, the page asks how to start. `?start=normal` or `?start=quick` in the address skips the
+Before the game loads, the page asks for a quality, then how to start. `?start=normal` or `?start=quick` in the address skips the
 question.
 - **Normal:** the main menu, after about 60 s.
 - **Quick:** a new game on Doc Mitchell's porch with every default taken, about 60 s after the choice. The opening is

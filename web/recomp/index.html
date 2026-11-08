@@ -29,11 +29,8 @@
   #start button:hover, #start button:focus-visible { border-color: var(--accent); outline: none; }
   #start button b { display: block; color: var(--fg); font-weight: 600; }
   #start button span { color: var(--dim); }
-  #start .quality { display: flex; gap: 8px; align-items: stretch; margin: 0 0 6px; }
-  #start .quality > span { align-self: center; min-width: 52px; color: var(--fg); }
-  #start .quality button { flex: 1; margin: 0; padding: 7px 10px; }
-  #start .quality button[aria-checked="true"] { border-color: var(--accent); background: #2a2516; }
-  #start .quality button span { display: block; font-size: 12px; }
+  #start [role="radiogroup"] button[aria-checked="true"] { border-color: var(--accent); background: #2a2516; }
+  #start [hidden] { display: none; }
   #boot { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 18px 16px; background: linear-gradient(transparent, rgba(0, 0, 0, .85) 35%);
     transition: opacity .6s; pointer-events: none; }
   #boot[hidden] { display: none; }
@@ -93,17 +90,22 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
     </div>
     <div id="start" hidden>
       <div class="box">
-        <h1>How do you want to start?</h1>
-        <p>Choose before the game loads. To skip this, add ?start=normal or ?start=quick to the address.</p>
-        <div class="quality" role="radiogroup" aria-label="Quality">
-          <span>Quality</span>
-          <button id="qHigh" role="radio" data-q="high"><b>High</b><span>Full textures and sounds</span></button>
-          <button id="qLow" role="radio" data-q="low"><b>Low</b><span>About a third of the download; blurrier</span></button>
+        <div id="stepQuality">
+          <h1>Choose a quality</h1>
+          <p>Before the game loads. Your last choice is highlighted.</p>
+          <div role="radiogroup" aria-label="Quality">
+            <button id="qHigh" role="radio" data-q="high"><b>High</b><span>Full textures and sounds</span></button>
+            <button id="qLow" role="radio" data-q="low"><b>Low</b><span>About a third of the download; blurrier</span></button>
+          </div>
         </div>
+        <div id="stepStart" hidden>
+        <h1>How do you want to start?</h1>
+        <p>Choose where the game begins.</p>
         <button id="startNormal"><b>Start normally</b><span>Main menu, then New Game, Continue or Load as usual.</span></button>
         <button id="startQuick"><b>Start outside Doc Mitchell's house</b><span>A new game with every default taken: Courier, SPECIAL 5s,
           default face, tag skills Guns, Speech and Sneak, no traits, casual mode, Pip-Boy on. The opening is done and
           "Back in the Saddle" is next.</span></button>
+        </div>
       </div>
     </div>
   </div>
@@ -574,15 +576,19 @@ const startParam = new URLSearchParams(location.search).get('start');
 const startMode = startParam === 'quick' || startParam === 'normal' ? startParam : await new Promise((resolve) => {
   const panel = document.getElementById('start');
   panel.hidden = false;
-  status.textContent = 'choose how to start';
+  status.textContent = 'choose quality and how to start';
   const qButtons = [document.getElementById('qHigh'), document.getElementById('qLow')];
-  const showQuality = () => { for (const b of qButtons) b.setAttribute('aria-checked', String(b.dataset.q === quality)); };
-  for (const b of qButtons) b.addEventListener('click', () => { quality = b.dataset.q; localStorage.setItem('fnv.quality', quality); showQuality(); });
-  showQuality();
+  const stepQ = document.getElementById('stepQuality'), stepS = document.getElementById('stepStart');
+  for (const b of qButtons) b.setAttribute('aria-checked', String(b.dataset.q === quality));
+  for (const b of qButtons) b.addEventListener('click', () => {
+    quality = b.dataset.q; localStorage.setItem('fnv.quality', quality);
+    stepQ.hidden = true; stepS.hidden = false;
+    document.getElementById('startNormal').focus();
+  });
   const pick = (m) => { panel.hidden = true; canvas.focus(); resolve(m); };
   document.getElementById('startNormal').addEventListener('click', () => pick('normal'));
   document.getElementById('startQuick').addEventListener('click', () => pick('quick'));
-  document.getElementById('startNormal').focus();
+  (quality === 'low' ? qButtons[1] : qButtons[0]).focus();
 });
 if (startMode === 'quick') env.FNV_START = 'quick';
 LOW = quality === 'low';
