@@ -30,8 +30,10 @@ BUILD = ['fnv_web.js', 'fnv_web.wasm']
 BROTLI = r"""
 const fs = require('fs'), zlib = require('zlib');
 for (const f of process.argv.slice(1)) {
-  const out = zlib.brotliCompressSync(fs.readFileSync(f), { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 9,
-    [zlib.constants.BROTLI_PARAM_SIZE_HINT]: fs.statSync(f).size } });
+  // the strongest setting with a 16 MB window: the wasm is 13.6 MB instead of 17.2 MB at quality 9 (about 4 minutes,
+  // once per bundle, against every player's first download)
+  const out = zlib.brotliCompressSync(fs.readFileSync(f), { params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 11,
+    [zlib.constants.BROTLI_PARAM_LGWIN]: 24, [zlib.constants.BROTLI_PARAM_SIZE_HINT]: fs.statSync(f).size } });
   fs.writeFileSync(f + '.br', out);
 }
 """
