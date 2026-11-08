@@ -493,6 +493,8 @@ void start_ring_dump(const char* path)
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_ring() { return (uint32_t)(uintptr_t)pal_d3d_ring(); }
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_audio() { return (uint32_t)(uintptr_t)pal_sound_ring(); }
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_key(int dik, int down) { pal_input_key(dik, down != 0); }
+// debugging: Module.ccall('fnv_console', null, ['string'], ['player.additem f 100']) runs a console line
+extern "C" EMSCRIPTEN_KEEPALIVE void fnv_console(const char* line) { pal_console_line(line); }
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_mouse(int dx, int dy, int dz, int button, int down) { pal_input_mouse(dx, dy, dz, button, down != 0); }
 
 int main(int argc, char** argv)
@@ -529,6 +531,7 @@ int main(int argc, char** argv)
     else if (chdir(dir.c_str())) logf("[web] cannot enter %s\n", dir.c_str());
     if (const char* rd = getenv("FNV_RING_DUMP")) start_ring_dump(rd);
     if (const char* sc = getenv("FNV_INPUT_SCRIPT")) pal_input_script(sc);
+    if (const char* st = getenv("FNV_START")) if (!strcmp(st, "quick")) pal_start_quick();
     if (const char* w = getenv("FNV_START_DELAY")) usleep(1000u * (unsigned)atoi(w));   // race test: let the pool load
     // node: the game's main thread runs on the runtime's main thread (blocking is allowed there), so a wasm trap
     // reaches the uncaughtException hook (pre-js) while the instance is intact and fnv_dump_state can report it

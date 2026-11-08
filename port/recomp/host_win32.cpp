@@ -659,7 +659,7 @@ bool map_exe(const char* path)
                         v = fnv_host_register(e->name, e->fn);
                         ++pal;
                     }
-            if (!v && !(names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32) && getenv("FNV_INPUT_SCRIPT") && !strcmp(nm, "DirectInput8Create"))
+            if (!v && !(names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32) && (getenv("FNV_INPUT_SCRIPT") || getenv("FNV_START")) && !strcmp(nm, "DirectInput8Create"))
                 for (const PalEntry* e = pal_input_entries(); e->name && !v; ++e)   // scripted input: the PAL devices
                     if (!strcmp(e->name, nm)) v = fnv_host_register(e->name, e->fn);
             if (!v && !(names[k].u1.Ordinal & IMAGE_ORDINAL_FLAG32))
@@ -813,6 +813,7 @@ int main(int argc, char** argv)
     g_trace_imports = getenv("FNV_TRACE_IMPORTS") != nullptr;
     g_pal = getenv("FNV_PAL") != nullptr;
     if (const char* sc = getenv("FNV_INPUT_SCRIPT")) pal_input_script(sc);
+    if (const char* st = getenv("FNV_START")) if (!strcmp(st, "quick")) pal_start_quick();
     if (!exe) { logf("usage: fnv_recomp.exe --exe <FalloutNV.exe>\n"); return 2; }
     GetFullPathNameA(exe, MAX_PATH, g_exe_path, nullptr);
     char gamedir[MAX_PATH];

@@ -17,6 +17,10 @@ const PalEntry* pal_input_entries();    // pal_input.cpp: DirectInput8
 void pal_input_script(const char* script);                       // FNV_INPUT_SCRIPT key taps
 void pal_input_key(int dik, bool down);                         // host input: DIK_* scan code
 void pal_input_mouse(int dx, int dy, int dz, int button, bool down);   // button -1: movement only
+// pal_start.cpp: FNV_START=quick begins a new game outside Doc Mitchell's house with the default character
+void pal_start_quick();
+void pal_start_tick(FnvCpu& s);         // main thread, once per keyboard poll
+void pal_console_line(const char* line);   // run a console line on the main thread at the next poll (debugging)
 const PalEntry* pal_sound_entries();
 // music: the last .mp3 this thread opened through CreateFileA (pal_kernel.cpp). The game's music thread opens the
 // track with its own reader right before it builds the DirectShow graph (pal_dshow.cpp), which plays that file.

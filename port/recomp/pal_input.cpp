@@ -47,6 +47,7 @@ void d_GetCapabilities(FnvCpu& s)
 }
 void d_GetDeviceState(FnvCpu& s)
 {
+    if (!dev(s)->mouse) pal_start_tick(s);     // the main thread's input poll: a safe point for console lines
     uint32_t cb = A(1), out = A(2);
     std::lock_guard<std::mutex> lk(g_mx);
     memset(gbuf(out), 0, cb);

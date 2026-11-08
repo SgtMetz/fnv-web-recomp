@@ -13,12 +13,35 @@
   #bar b { color: var(--accent); font-weight: 600; }
   #log { white-space: pre-wrap; font: 11.5px ui-monospace, Consolas, monospace; color: var(--dim); max-height: 28vh; overflow: auto; margin-top: 6px; }
   #log .err { color: #e77; }
+  #stage { position: relative; }
+  #start { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .82); }
+  #start[hidden] { display: none; }
+  #start .box { max-width: 520px; padding: 20px 24px; border: 1px solid #3a3528; background: #14130f; }
+  #start h1 { margin: 0 0 4px; font-size: 17px; color: var(--accent); font-weight: 600; }
+  #start p { margin: 0 0 14px; color: var(--dim); }
+  #start button { display: block; width: 100%; margin: 8px 0 0; padding: 10px 14px; text-align: left; cursor: pointer;
+    font: inherit; color: var(--fg); background: #1e1c16; border: 1px solid #3a3528; border-radius: 4px; }
+  #start button:hover, #start button:focus-visible { border-color: var(--accent); outline: none; }
+  #start button b { display: block; color: var(--fg); font-weight: 600; }
+  #start button span { color: var(--dim); }
 </style>
 </head>
 <body>
 <div id="wrap">
   <div id="bar"><b>FalloutNV.exe (recompiled to WebAssembly)</b><span id="status">starting…</span></div>
-  <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+  <div id="stage">
+    <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+    <div id="start" hidden>
+      <div class="box">
+        <h1>How do you want to start?</h1>
+        <p>Choose before the game loads. To skip this, add ?start=normal or ?start=quick to the address.</p>
+        <button id="startNormal"><b>Start normally</b><span>Main menu, then New Game, Continue or Load as usual.</span></button>
+        <button id="startQuick"><b>Start outside Doc Mitchell's house</b><span>A new game with every default taken: Courier, SPECIAL 5s,
+          default face, tag skills Guns, Speech and Sneak, no traits, casual mode, Pip-Boy on. The opening is done and
+          "Back in the Saddle" is next.</span></button>
+      </div>
+    </div>
+  </div>
   <div id="log"></div>
 </div>
 <script type="module">
@@ -245,6 +268,22 @@ canvas.addEventListener('mousedown', (e) => { if (document.pointerLockElement ==
 canvas.addEventListener('mouseup', (e) => { if (document.pointerLockElement === canvas) window.Module._fnv_mouse?.(0, 0, 0, e.button === 2 ? 1 : e.button === 1 ? 2 : 0, 0); });
 canvas.addEventListener('wheel', (e) => { e.preventDefault(); window.Module._fnv_mouse?.(0, 0, e.deltaY < 0 ? 120 : -120, -1, 0); }, { passive: false });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// start mode, chosen before the game loads: ?start=normal|quick, or the panel over the canvas. Quick sets FNV_START,
+// which port/recomp/pal_start.cpp turns into a new game outside Doc Mitchell's house with the default character.
+const startParam = new URLSearchParams(location.search).get('start');
+const startMode = startParam === 'quick' || startParam === 'normal' ? startParam : await new Promise((resolve) => {
+  const panel = document.getElementById('start');
+  panel.hidden = false;
+  status.textContent = 'choose how to start';
+  const pick = (m) => { panel.hidden = true; canvas.focus(); resolve(m); };
+  document.getElementById('startNormal').addEventListener('click', () => pick('normal'));
+  document.getElementById('startQuick').addEventListener('click', () => pick('quick'));
+  document.getElementById('startNormal').focus();
+});
+if (startMode === 'quick') env.FNV_START = 'quick';
+log('start: ' + (startMode === 'quick' ? "outside Doc Mitchell's house (default character)" : 'main menu'));
+status.textContent = 'starting…';
 
 const s = document.createElement('script');
 s.src = '/build/fnv_web.js';

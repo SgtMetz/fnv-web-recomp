@@ -61,8 +61,15 @@ shaders (`out/shaders`, `out/shader_manifest`) come from the pipeline in `docs/S
 exist, so you only rerun a step when its inputs change.
 
 **Run:** start the dev server (launch config `recomp` in `.claude/launch.json`, or
-`node tools/recomp_serve.mjs --game "E:/Games/Fallout New Vegas"`) and open `http://localhost:8093/`. The main menu
-appears after about 60 s. `--dlc` turns the DLC on.
+`node tools/recomp_serve.mjs --game "E:/Games/Fallout New Vegas"`) and open `http://localhost:8093/`. `--dlc` turns
+the DLC on.
+
+Before the game loads, the page asks how to start. `?start=normal` or `?start=quick` in the address skips the
+question.
+- **Normal:** the main menu, after about 60 s.
+- **Quick:** a new game on Doc Mitchell's porch with every default taken, about 60 s after the choice. The opening is
+  complete and "Back in the Saddle" is active. `port/recomp/pal_start.cpp` does this through the game's console
+  path, and its header lists exactly what it sets.
 
 **Debug in the page console:**
 - `const d = await import('/debug.js')`, then:
@@ -70,6 +77,10 @@ appears after about 60 s. `--dlc` turns the DLC on.
   - `d.keys([...DIK codes])`, `d.mouse(dx, dy)` and `d.click()` send input.
   - `d.snap('name')` saves a screenshot to `out/recomp/name.png`.
 - `renderer.traceFrame()` captures a frame's draws.
+- `Module.ccall('fnv_console', null, ['string'], ['GetStage 00104C1C'])` runs a console line on the main thread.
+  - Name base forms and quests by form ID: only references keep their editor IDs at runtime.
+  - The console's own text isn't drawn yet. Its output lines are a linked list at `ConsoleManager` (`*0x011d8ce8`)
+    + 4, with nodes `{next, prev, char* text, u16 length}`. They are kept only while the console is open (the ~ key).
 - `window.fnvPump` shows the command-ring pump counters.
 - `Module._fnv_dump_threads()` prints game-thread stacks.
 - `Module._fnv_sound_debug()` lists the playing sound buffers.

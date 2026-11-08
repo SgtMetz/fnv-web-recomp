@@ -33,7 +33,8 @@ export function status() {
   return document.getElementById('status').textContent;
 }
 
-// main menu -> New -> Yes (the menu takes about a minute to appear after the page loads)
+// main menu -> New -> Yes (the menu takes about a minute to appear after the page loads). Load the page with
+// ?start=normal: without it the page waits for the start-mode choice. (?start=quick needs none of this.)
 export async function newGame(menuWaitMs = 65000) {
   await sleep(menuWaitMs);
   await keys([0xd0, 0xd0], 1200);
