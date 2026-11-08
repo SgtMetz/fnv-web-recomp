@@ -54,5 +54,6 @@ understanding and debugging.
 
 ## Performance notes (to measure, not assumed)
 
-The lifter computes flags eagerly. A per-function flag-liveness pass removes most of that. Memory accesses through a
+The lifter computes flags eagerly. Each body keeps the registers and flags it uses in locals (`FnvLocal`, written
+back at calls, returns and traps), so clang drops the dead flag work and keeps registers out of memory. Memory accesses through a
 distinct struct type let clang's type-based alias analysis keep `FnvCpu` fields in registers across guest stores.

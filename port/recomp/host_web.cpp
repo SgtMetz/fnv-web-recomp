@@ -563,6 +563,30 @@ extern "C" EMSCRIPTEN_KEEPALIVE void fnv_dump_threads()
     }
 }
 
+// profiling (web/recomp/debug.js profile()): the return addresses on the main game thread's guest stack, innermost
+// first, as call sites (E8 rel32, FF 15 [abs], FF /2 through a register or [reg+disp]). Called from the page's thread
+// while the game runs: the stack may change under the walk, which only costs a wrong sample now and then.
+extern "C" uint64_t* fnv_present_stats();
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_perf() { return (uint32_t)(uintptr_t)fnv_present_stats(); }
+
+extern "C" EMSCRIPTEN_KEEPALIVE int fnv_sample(uint32_t* out, int max)
+{
+    HostThread* ht = g_main_ht;
+    if (!ht) return 0;
+    uint32_t esp = __atomic_load_n(&ht->cpu.esp, __ATOMIC_RELAXED);
+    int n = 0;
+    for (uint32_t p = esp; p >= ht->stack_lo && p + 4 <= ht->stack_hi && n < max; p += 4)
+    {
+        uint32_t v = M32(p);
+        if (v < g_image_lo + 0x1006 || v >= 0x00fdf000u) continue;
+        uint8_t b6 = M8(v - 6), b5 = M8(v - 5), b3 = M8(v - 3), b2 = M8(v - 2);
+        bool call = b5 == 0xe8 || (b6 == 0xff && (M8(v - 5) & 0x38) == 0x10) || (b3 == 0xff && (M8(v - 2) & 0xf8) == 0x50) ||
+                    (b2 == 0xff && (M8(v - 1) & 0xf8) == 0xd0);
+        if (call) out[n++] = v;
+    }
+    return n;
+}
+
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_dump_state()
 {
     report_rdata_changes();

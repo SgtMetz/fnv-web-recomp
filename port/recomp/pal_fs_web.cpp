@@ -3,7 +3,8 @@
 // My Games\FalloutNV, writable). Built to stay usable with network latency:
 //   - stat and list under /game come from one index of the install (/fs/index, fetched once per thread), not one
 //     request each (start-up makes thousands);
-//   - reads go in 1 MB blocks, with a read-ahead cache per thread;
+//   - reads go in 1 MB blocks through one block cache for all threads (in wasm memory): a block another thread is
+//     already fetching is waited for, not fetched again;
 //   - a read of an install file names the file's mtime (v=), so the browser's HTTP cache keeps it across sessions.
 #include "pal_fs.h"
 
@@ -11,8 +12,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <atomic>
+#include <condition_variable>
+#include <memory>
 #include <mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 // one synchronous request, retried: a dropped connection must not kill the game thread that asked. Defined once per
 // worker (fs_init below).
@@ -76,50 +83,22 @@ EM_JS(int, js_fs_stat, (const char* path, uint32_t* out), {
     return 1;
 });
 
-EM_JS(int, js_fs_read, (const char* path, double off, int len, uint8_t* dst, double size), {
+// one block of a file, straight into dst (a buffer in the shared cache below); its length, or -1
+EM_JS(int, js_fs_fetch, (const char* path, double off, int len, uint8_t* dst), {
     var p = UTF8ToString(path);
-    var B = 1048576;
-    var g = globalThis;
     var hit = fnvGameLookup(p);
     var ver = hit && hit.file ? '&v=' + hit.file[1] : '';
-    if (!g.fnvCache) { g.fnvCache = new Map(); g.fnvCacheBytes = 0; }
-    var done = 0;
-    while (done < len) {
-        var pos = off + done;
-        if (pos >= size) break;
-        var blk = Math.floor(pos / B);
-        var key = p + '#' + blk;
-        var data = g.fnvCache.get(key);
-        if (!data) {
-                    var want = Math.min(B, size - blk * B);
-            var x = fnvXhr('GET', '/fs/read?p=' + encodeURIComponent(p) + '&o=' + (blk * B) + '&n=' + want + ver, null, true);
-            if (x.status != 200) break;
-            data = new Uint8Array(x.response);
-            g.fnvCache.set(key, data);
-            g.fnvCacheBytes += data.length;
-            if (g.fnvCacheBytes > 96 * 1048576) {          // drop the oldest blocks
-                for (var k of g.fnvCache.keys()) {
-                    g.fnvCacheBytes -= g.fnvCache.get(k).length;
-                    g.fnvCache.delete(k);
-                    if (g.fnvCacheBytes < 64 * 1048576) break;
-                }
-            }
-        }
-        var start = pos - blk * B;
-        var n = Math.min(len - done, data.length - start);
-        if (n <= 0) break;
-        HEAPU8.set(data.subarray(start, start + n), dst + done);
-        done += n;
-    }
-    return done;
+    var x = fnvXhr('GET', '/fs/read?p=' + encodeURIComponent(p) + '&o=' + off + '&n=' + len + ver, null, true);
+    if (x.status != 200) return -1;
+    var data = new Uint8Array(x.response);
+    var n = Math.min(len, data.length);
+    HEAPU8.set(data.subarray(0, n), dst);
+    return n;
 });
 
 EM_JS(int, js_fs_write, (const char* path, double off, int len, const uint8_t* src), {
     var p = UTF8ToString(path);
     var x = fnvXhr('POST', '/fs/write?p=' + encodeURIComponent(p) + '&o=' + off, HEAPU8.slice(src, src + len), false);
-    if (globalThis.fnvCache)                                // the written range is stale in every block cache here
-        for (var k of Array.from(globalThis.fnvCache.keys()))
-            if (k.startsWith(p + '#')) { globalThis.fnvCacheBytes -= globalThis.fnvCache.get(k).length; globalThis.fnvCache.delete(k); }
     return x.status == 200 ? len : 0;
 });
 
@@ -191,6 +170,93 @@ std::string norm(const char* p)
 }
 } // namespace
 
+// ---- the shared block cache ------------------------------------------------------------------------------------
+namespace {
+constexpr int64_t kBlock = 1 << 20;
+constexpr size_t kCacheMax = 256u << 20, kCacheLow = 192u << 20;
+struct Block { std::vector<uint8_t> data; bool ready = false, failed = false; uint64_t used = 0; };
+std::mutex g_bc_mx;
+std::condition_variable g_bc_cv;
+std::unordered_map<std::string, std::shared_ptr<Block>> g_blocks;
+size_t g_bc_bytes;
+uint64_t g_bc_tick;
+
+void bc_evict_locked()
+{
+    if (g_bc_bytes <= kCacheMax) return;
+    std::vector<std::pair<uint64_t, std::string>> order;
+    for (auto& kv : g_blocks)
+        if (kv.second->ready) order.emplace_back(kv.second->used, kv.first);
+    std::sort(order.begin(), order.end());
+    for (auto& o : order)
+    {
+        if (g_bc_bytes <= kCacheLow) break;
+        auto it = g_blocks.find(o.second);
+        g_bc_bytes -= it->second->data.size();
+        g_blocks.erase(it);
+    }
+}
+
+// a path's blocks are stale (it was written, truncated, removed or renamed)
+void bc_invalidate(const std::string& path)
+{
+    std::string pre = path + '#';
+    std::lock_guard<std::mutex> lk(g_bc_mx);
+    for (auto it = g_blocks.begin(); it != g_blocks.end();)
+    {
+        if (it->first.compare(0, pre.size(), pre) == 0)
+        {
+            if (it->second->ready) g_bc_bytes -= it->second->data.size();
+            it = g_blocks.erase(it);
+        }
+        else ++it;
+    }
+}
+
+std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size)
+{
+    std::string key = path + '#' + std::to_string(blk);
+    std::unique_lock<std::mutex> lk(g_bc_mx);
+    for (;;)
+    {
+        auto it = g_blocks.find(key);
+        if (it == g_blocks.end()) break;
+        std::shared_ptr<Block> b = it->second;
+        if (b->ready)
+        {
+            b->used = ++g_bc_tick;
+            return b->failed ? nullptr : b;
+        }
+        g_bc_cv.wait(lk);                                  // another thread is fetching it
+    }
+    auto b = std::make_shared<Block>();
+    g_blocks[key] = b;
+    lk.unlock();
+    int64_t want = std::min(kBlock, size - blk * kBlock);
+    b->data.resize((size_t)want);
+    int got = js_fs_fetch(path.c_str(), (double)(blk * kBlock), (int)want, b->data.data());
+    lk.lock();
+    auto it = g_blocks.find(key);
+    bool listed = it != g_blocks.end() && it->second == b;
+    if (got < 0)
+    {
+        b->failed = true;
+        if (listed) g_blocks.erase(it);                    // a later read tries again
+    }
+    else
+    {
+        b->data.resize((size_t)got);
+        if (listed) g_bc_bytes += (size_t)got;
+    }
+    b->ready = true;
+    b->used = ++g_bc_tick;
+    bc_evict_locked();
+    lk.unlock();
+    g_bc_cv.notify_all();
+    return b->failed ? nullptr : b;
+}
+} // namespace
+
 std::string pal_fs_resolve(const char* path) { return norm(path); }
 void pal_fs_chdir(const char* path)
 {
@@ -210,7 +276,9 @@ PalFile* pal_fs_open(const char* path, const char* mode)
     bool write = strchr(mode, 'w') || strchr(mode, '+');
     if (mode[0] == 'w')
     {
-        if (!js_fs_op("truncate", p.c_str(), nullptr)) return nullptr;
+        bool ok = js_fs_op("truncate", p.c_str(), nullptr);
+        bc_invalidate(p);
+        if (!ok) return nullptr;
         return new PalFile{p, 0, 0, true};
     }
     if (!exists) return nullptr;
@@ -220,9 +288,20 @@ size_t pal_fs_read(void* buf, size_t n, PalFile* f)
 {
     if (f->pos >= f->size) return 0;
     fs_init();
-    int got = js_fs_read(f->path.c_str(), (double)f->pos, (int)n, (uint8_t*)buf, (double)f->size);
-    f->pos += got;
-    return (size_t)got;
+    size_t done = 0;
+    while (done < n && f->pos < f->size)
+    {
+        int64_t blk = f->pos / kBlock;
+        std::shared_ptr<Block> b = bc_get(f->path, blk, f->size);
+        if (!b) break;
+        int64_t start = f->pos - blk * kBlock;
+        int64_t k = std::min<int64_t>((int64_t)(n - done), (int64_t)b->data.size() - start);
+        if (k <= 0) break;
+        memcpy((uint8_t*)buf + done, b->data.data() + start, (size_t)k);
+        done += (size_t)k;
+        f->pos += k;
+    }
+    return done;
 }
 size_t pal_fs_write(const void* buf, size_t n, PalFile* f)
 {
@@ -230,6 +309,7 @@ size_t pal_fs_write(const void* buf, size_t n, PalFile* f)
     if (!f->writable) return 0;
     fs_init();
     int put = js_fs_write(f->path.c_str(), (double)f->pos, (int)n, (const uint8_t*)buf);
+    bc_invalidate(f->path);
     f->pos += put;
     if (f->pos > f->size) f->size = f->pos;
     return (size_t)put;
@@ -268,8 +348,23 @@ bool pal_fs_list(const char* dir, std::vector<std::string>& names)
     return true;
 }
 bool pal_fs_mkdir(const char* path) { ++g_changes; return js_fs_op("mkdir", norm(path).c_str(), nullptr); }
-bool pal_fs_remove(const char* path) { ++g_changes; return js_fs_op("remove", norm(path).c_str(), nullptr); }
-bool pal_fs_rename(const char* from, const char* to) { ++g_changes; return js_fs_op("rename", norm(from).c_str(), norm(to).c_str()); }
+bool pal_fs_remove(const char* path)
+{
+    ++g_changes;
+    std::string p = norm(path);
+    bool ok = js_fs_op("remove", p.c_str(), nullptr);
+    bc_invalidate(p);
+    return ok;
+}
+bool pal_fs_rename(const char* from, const char* to)
+{
+    ++g_changes;
+    std::string a = norm(from), b = norm(to);
+    bool ok = js_fs_op("rename", a.c_str(), b.c_str());
+    bc_invalidate(a);
+    bc_invalidate(b);
+    return ok;
+}
 std::string pal_fs_cwd()
 {
     std::lock_guard<std::mutex> lk(g_cwd_mx);

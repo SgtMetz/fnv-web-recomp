@@ -237,6 +237,7 @@ async function handle(req, res) {
   res.setHeader('Cross-Origin-Embedder-Policy', 'require-corp');
   res.setHeader('Cross-Origin-Resource-Policy', 'same-origin');
   res.setHeader('X-Content-Type-Options', 'nosniff');
+  if (DEV) res.setHeader('Document-Policy', 'js-profiling');   // debug.js jsProfile(): the JS Self-Profiling API
   const url = new URL(req.url, 'http://localhost');
   let p;
   try { p = decodeURIComponent(url.pathname); } catch { res.writeHead(400).end(); return; }

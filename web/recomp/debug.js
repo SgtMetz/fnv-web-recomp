@@ -49,3 +49,48 @@ export async function intoGame(menuWaitMs = 65000, popups = 0) {
   await sleep(20000);
   for (let i = 0; i < popups; i++) await keys([0x1c], 3500);
 }
+
+// sampling profile of the main game thread (Module._fnv_sample: the call sites on its guest stack, innermost first),
+// for ms milliseconds: {samples, stacks: {"a b c": count}} with addresses in hex. Map them to functions with
+// python tools/recomp_profile.py <file.json>.
+export async function profile(ms = 10000, depth = 24) {
+  const M = window.Module, buf = M._malloc(depth * 4), stacks = {};
+  let samples = 0;
+  const end = performance.now() + ms;
+  while (performance.now() < end) {
+    const n = M._fnv_sample(buf, depth);
+    const k = Array.from(M.HEAPU32.subarray(buf >>> 2, (buf >>> 2) + n), (v) => v.toString(16)).join(' ');
+    stacks[k] = (stacks[k] || 0) + 1;
+    samples++;
+    await sleep(1);
+  }
+  M._free(buf);
+  return { samples, stacks };
+}
+
+// game-thread frame pacing over ms milliseconds (port/recomp/pal_d3d9.cpp dv_Present): fps, the frame time, and the
+// part of it the game spends on its own work (the rest is waiting for the renderer)
+export async function perf(ms = 5000) {
+  const M = window.Module, w = M._fnv_perf() >>> 2;
+  const read = () => [0, 1, 2].map((i) => M.HEAPU32[w + 2 * i] + M.HEAPU32[w + 2 * i + 1] * 4294967296);
+  const a = read();
+  await sleep(ms);
+  const b = read(), frames = b[0] - a[0];
+  return { fps: frames * 1000 / ms, frameMs: (b[1] - a[1]) / frames / 1000, gameMs: (b[1] - a[1] - (b[2] - a[2])) / frames / 1000,
+    waitMs: (b[2] - a[2]) / frames / 1000 };
+}
+
+// JS profile of the page's thread (the renderer pump) for ms milliseconds, with the dev server's Document-Policy
+// header: the self time of the top functions, as [name:line, percent]
+export async function jsProfile(ms = 5000, top = 30) {
+  const p = new Profiler({ sampleInterval: 1, maxBufferSize: 100000 });
+  await sleep(ms);
+  const t = await p.stop();
+  const self = new Map();
+  for (const s of t.samples) {
+    const f = s.stackId == null ? null : t.frames[t.stacks[s.stackId].frameId];
+    const k = f ? `${f.name || '(anon)'}:${f.line || 0}` : '(idle)';
+    self.set(k, (self.get(k) || 0) + 1);
+  }
+  return [...self].sort((a, b) => b[1] - a[1]).slice(0, top).map(([k, n]) => [k, +(100 * n / t.samples.length).toFixed(1)]);
+}

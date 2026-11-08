@@ -569,7 +569,8 @@ export class Renderer {
     // debugging: renderer.debugPs = {name substring: 'vec4<f32>(...)'} replaces the colour those shaders write
     for (const [k, v] of Object.entries(this.debugPs || {}))
       if (ps.name.includes(k)) code = code.replace(/(\n\s*main_inner\([^;]*\);)/, `$1\n  o0 = ${v};`);
-    if (alpha) {
+    // alpha test on the first colour output; a shader that writes no colour (the sky's sun occlusion test) has none
+    if (alpha && /\bo0\b/.test(code)) {
       const [func, ref] = alpha;
       const op = { 1: 'false', 2: 'a < r', 3: 'a == r', 4: 'a <= r', 5: 'a > r', 6: 'a != r', 7: 'a >= r', 8: 'true' }[func] || 'true';
       code = code.replace(/(\n\s*main_inner\([^;]*\);)/, `$1\n  { let a = o0.w; let r = ${(ref / 255).toFixed(6)}; if (!(${op})) { discard; } }`);
@@ -821,7 +822,7 @@ export class Renderer {
         let off;
         if (l && l.ver === this.constVer[st] && l.n >= c.vec4_count) off = l.off;
         else { off = this.uniformPut(sh.stage ? this.psConst : this.vsConst, c.vec4_count * 16); last[st] = { ver: this.constVer[st], n: c.vec4_count, off }; }
-        if (bound[g] !== bg || ps_.bgOff[g] !== off) { this.bgOffset[0] = off; pass.setBindGroup(g, bg, this.bgOffset); bound[g] = bg; ps_.bgOff[g] = off; }
+        if (bound[g] !== bg || ps_.bgOff[g] !== off) { this.bgOffset[0] = off; pass.setBindGroup(g, bg, this.bgOffset, 0, 1); bound[g] = bg; ps_.bgOff[g] = off; }
       } else if (bound[g] !== bg) { pass.setBindGroup(g, bg); bound[g] = bg; }
     }
     // vertex buffers

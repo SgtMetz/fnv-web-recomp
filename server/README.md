@@ -122,16 +122,16 @@ A first session reads about 950 distinct MB of the archives, so on a real link b
 from the browser's HTTP cache, provided it is large enough.
 
 Two knobs to tune:
-- the block size `B` in `js_fs_read` (`pal_fs_web.cpp`);
-- the per-thread cache of 96 MB.
+- the block size `kBlock` (`pal_fs_web.cpp`);
+- the block cache that all game threads share: 256 MB, trimmed to 192 MB (`kCacheMax`, `kCacheLow`).
 
 ## Known limits (not done yet)
 
 - No access control (see above).
 - One data folder for everyone: every visitor shares the same settings and saves. Per-user data would need accounts
   or the browser-side storage in `web/` (OPFS).
-- Every game thread fetches its own copy of the index (about 42 KB) and keeps its own block cache. Concurrent
-  threads sometimes fetch the same block twice: about a quarter of the reads in the measurement above.
+- Every game thread fetches its own copy of the index (about 42 KB). The blocks themselves are shared: a block
+  that one thread is fetching is waited for by the others, not fetched twice.
 - `debug.js` ships in the bundle, but its screenshot endpoint (`/snap`) exists only with `--dev`.
 
 ## Testing locally

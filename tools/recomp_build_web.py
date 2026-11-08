@@ -32,10 +32,15 @@ LDFLAGS = ['-O1', '-pthread', '-sGLOBAL_BASE=22020096', '-sINITIAL_MEMORY=322122
            '-sEXIT_RUNTIME=1', '-sSUPPORT_LONGJMP=emscripten', '-sMALLOC=' + os.environ.get('FNV_WEB_MALLOC', 'dlmalloc'), '-sWASM_BIGINT=1',
            '-sERROR_ON_UNDEFINED_SYMBOLS=1', '--profiling-funcs',
            '--pre-js', str(ROOT / 'port/recomp/web_pre.js')]
+# FNV_WEB_LTO=1: ThinLTO, so small functions inline across shards (callers and callees are spread over 64 files)
+LTO = os.environ.get('FNV_WEB_LTO') == '1'
+if LTO:
+    CFLAGS.append('-flto=thin')
+    LDFLAGS += ['-flto=thin', '-Wl,--lto-O2', '-Wl,--thinlto-jobs=%d' % (os.cpu_count() or 8)]
 TARGETS = {
     'node': ('web', 'pal_fs_web.cpp', ['-sNODERAWFS=1', '-sENVIRONMENT=node,worker']),
     'browser': ('web_browser', 'pal_fs_std.cpp', ['-sENVIRONMENT=web,worker', '-sPROXY_TO_PTHREAD=1',
-                '-sEXPORTED_FUNCTIONS=_main,_malloc,_free,_fnv_sound_debug,_fnv_dump_threads,_fnv_console',
+                '-sEXPORTED_FUNCTIONS=_main,_malloc,_free,_fnv_sound_debug,_fnv_dump_threads,_fnv_console,_fnv_sample,_fnv_perf',
                 '-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPU32,HEAPF32,ccall']),
 }
 
@@ -60,7 +65,7 @@ def main():
     t0 = time.time()
     hdr = hashlib.sha1(b''.join(h.read_bytes() for h in HEADERS) + ' '.join(CFLAGS).encode()).hexdigest()
     srcs = [ROOT / 'port/recomp' / p for p in PORT] + sorted(OUT.glob('recomp_*.cpp'))
-    objdir = OUT / 'web_obj'
+    objdir = OUT / ('web_obj_lto' if LTO else 'web_obj')
     objdir.mkdir(parents=True, exist_ok=True)
     jobs = [(s, objdir / (s.stem + '.o'), hashlib.sha1(s.read_bytes()).hexdigest() + hdr) for s in srcs]
     failed = []

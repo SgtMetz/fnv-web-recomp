@@ -15,6 +15,10 @@
 #include "../../out/recomp/d3d9_caps.inc"
 
 uint32_t g_device_obj;          // the game's device (one per game)
+// frame pacing (web/recomp/debug.js perf()): frames, microseconds between Presents, microseconds of that spent
+// waiting for the renderer. Frame time minus wait is the game thread's own work per frame.
+volatile uint64_t g_present_stats[3];
+extern "C" uint64_t* fnv_present_stats() { return (uint64_t*)g_present_stats; }
 
 namespace {
 #define A(i) harg(s, (i))
@@ -570,8 +574,15 @@ void dv_Present(FnvCpu& s)
         emit(OP_PRESENT, {d->frame});
         __atomic_add_fetch(&g_ring.frames_sent, 1, __ATOMIC_RELEASE);
         // stay at most two frames ahead of the renderer
+        auto t0 = std::chrono::steady_clock::now();
         while (g_ring.frames_sent - __atomic_load_n(&g_ring.frames_done, __ATOMIC_ACQUIRE) > 2)
             std::this_thread::sleep_for(std::chrono::microseconds(500));
+        auto t1 = std::chrono::steady_clock::now();
+        static auto last = t1;
+        g_present_stats[0]++;
+        g_present_stats[1] += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - last).count();
+        g_present_stats[2] += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        last = t1;
     }
     if (d->frame == 1 || d->frame % 600 == 0)
     {
