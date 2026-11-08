@@ -13,7 +13,7 @@ address against the functions the decomp defines and the sections of the origina
 
 Only addresses, names and counts are written (to out/, git-ignored). No bytes of the exe are written.
 
-usage: python tools/relink.py --exe <FalloutNV.exe> [--decomp <fnv_decomp-main>] [--out out/relink_census.json]
+usage: python tools/relink.py --exe <FalloutNV.exe> [--decomp <decomp folder>] [--out out/relink_census.json]
 """
 from decomp_path import DECOMP_DIR
 import argparse

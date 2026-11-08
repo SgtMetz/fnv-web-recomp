@@ -57,7 +57,7 @@ register: oT4 -> location 4, colors 8+) without parsing WGSL. All 15,791 entries
   the D3D9 default diffuse (1,1,1,1) at location 8 when the VS does not write oD0; outputs are a struct `tint_symbol_1`.
   Locations come from D3D register numbers (colors offset 8; interpolators keep their register index).
 - vFace arrives as `@builtin(front_facing)` bool, converted to +/-1 float in the body.
-- Package choice: the port should report NVIDIA SM3 + FP16 caps so the game selects package 013 (see PHASE0_REPORT.md).
+- Package choice: the port should report NVIDIA SM3 + FP16 caps so the game selects package 013 (see history/PHASE0_REPORT.md).
 
 ## Browser compile check (done)
 `spikes/wgsl_check/` (launch config `wgsl-check`, port 8660) fetches every `out/shaders/*/*.wgsl.gen` from a local-only
