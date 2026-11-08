@@ -41,9 +41,10 @@ export async function newGame(menuWaitMs = 65000) {
   await keys([0x1c], 500);
 }
 
-// New Game, then dismiss the DLC item pop-ups
-export async function intoGame(menuWaitMs = 65000) {
+// New Game into the world. DLC is off unless the server runs with --dlc; then pass popups = 6 to dismiss the
+// DLC item pop-ups.
+export async function intoGame(menuWaitMs = 65000, popups = 0) {
   await newGame(menuWaitMs);
   await sleep(20000);
-  for (let i = 0; i < 6; i++) await keys([0x1c], 3500);
+  for (let i = 0; i < popups; i++) await keys([0x1c], 3500);
 }

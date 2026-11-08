@@ -9,7 +9,11 @@
 //   /shader/<sha1>     the translated WGSL and its manifest entry for a D3D9 shader (out/shaders, out/shader_manifest)
 //   /ring.bin          a captured command ring (FNV_RING_DUMP) for replay.html
 //
-// usage: node tools/recomp_serve.mjs [--game "E:/Games/Fallout New Vegas"] [--port 8093]
+// usage: node tools/recomp_serve.mjs [--game "E:/Games/Fallout New Vegas"] [--port 8093] [--dlc]
+//
+// DLC is off by default. The game turns a plugin on by itself when Data\<name>.NAM exists (how the Steam DLC and the
+// pre-order packs install), so without --dlc (or FNV_DLC=1) the server answers as if no .nam file existed and only
+// FalloutNV.esm loads. The install is never changed.
 import http from 'node:http';
 import fs from 'node:fs';
 import fsp from 'node:fs/promises';
@@ -22,6 +26,9 @@ const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[
 const GAME = path.resolve(opt('--game', process.env.FNV_GAME || 'E:/Games/Fallout New Vegas'));
 const DOCS = path.resolve(ROOT, 'out/fnv_docs');
 const PORT = +opt('--port', 8093);
+const DLC = args.includes('--dlc') || process.env.FNV_DLC === '1';
+// a DLC marker the game must not see: /game/Data/<name>.nam
+const hiddenDlc = (p) => !DLC && /^\/game\/data\/[^/]+\.nam$/i.test(p || '');
 const STATIC = [['/build/', path.join(ROOT, 'out/recomp/web_browser')], ['/', path.join(ROOT, 'web/recomp')]];
 const TYPES = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.wasm': 'application/wasm',
   '.css': 'text/css', '.json': 'application/json', '.bin': 'application/octet-stream' };
@@ -63,6 +70,7 @@ async function fsApi(req, res, op, q) {
   const key = op + ' ' + q.get('p');
   if (!seen.has(key)) { seen.add(key); console.log('[fs] ' + key); }
   const write = req.method === 'POST';
+  if (hiddenDlc(q.get('p'))) { res.writeHead(404).end('ENOENT'); return; }
   const p = hostPath(q.get('p'), write);
   if (!p) { res.writeHead(403).end(); return; }
   try {
@@ -70,7 +78,8 @@ async function fsApi(req, res, op, q) {
       const st = await fsp.stat(p);
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({ dir: st.isDirectory(), size: st.size, mtime: Math.floor(st.mtimeMs / 1000) }));
     } else if (op === 'list') {
-      const names = await fsp.readdir(p);                  // before writeHead: a missing folder must answer 404
+      let names = await fsp.readdir(p);                    // before writeHead: a missing folder must answer 404
+      if (!DLC && /^\/game\/data\/?$/i.test(q.get('p'))) names = names.filter((n) => !/\.nam$/i.test(n));
       res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(names));
     } else if (op === 'read') {
       const o = +q.get('o') || 0, n = Math.min(+q.get('n') || 0, 64 << 20);
@@ -146,7 +155,7 @@ const server = http.createServer(async (req, res) => {
   for (const [prefix, dir] of STATIC) if (p.startsWith(prefix)) return serveFile(res, path.join(dir, p.slice(prefix.length)), req);
   res.writeHead(404).end();
 });
-server.listen(PORT, '127.0.0.1', () => console.log(`recomp server on http://localhost:${PORT}/ (game ${GAME}, ${shaders.size} shaders)`));
+server.listen(PORT, '127.0.0.1', () => console.log(`recomp server on http://localhost:${PORT}/ (game ${GAME}, ${shaders.size} shaders, DLC ${DLC ? 'on' : 'off'})`));
 // a failed request (client gone mid-stream, a file error) must not take the game's file server down
 process.on('uncaughtException', (e) => console.error('[serve] ' + (e.stack || e)));
 process.on('unhandledRejection', (e) => console.error('[serve] ' + (e && e.stack || e)));
