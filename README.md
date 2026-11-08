@@ -84,7 +84,7 @@ question.
 - To find a function, map an address to the decomp with `grep -rn "@fnv 0x00XXXXXX" ../fnv_decomp-main-updated/src`,
   or read the lifted body in `out/recomp/recomp_NN.cpp` (`f_XXXXXXXX`).
 
-**On a server:** `python -B tools/recomp_bundle.py` makes `out/dist/`, which `node server/serve.mjs --dist out/dist ...`
+**On a server:** `python -B tools/recomp_bundle.py` makes `out/dist/`, with the live page (no log or debug status; `?debug` in the address shows them), which `node server/serve.mjs --dist out/dist ...`
 serves. HTTPS, a reverse proxy, systemd and the measured network behaviour are in `server/README.md`. `--delay 40`
 (40 ms added to each file request) and `--dist out/dist` test both locally.
 

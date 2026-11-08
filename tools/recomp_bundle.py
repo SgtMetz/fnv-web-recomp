@@ -61,6 +61,12 @@ def main():
     (out / 'shader').mkdir()
     for f in PAGE:
         shutil.copy2(ROOT / 'web/recomp' / f, out / f)
+    # the live page: no log or debug status (web/recomp/index.html, html.dev); ?debug in the address shows them
+    page = out / 'index.html'
+    text = page.read_text(encoding='utf-8')
+    if '/*FNV_DEV*/true' not in text:
+        sys.exit('web/recomp/index.html has no /*FNV_DEV*/true switch')
+    page.write_text(text.replace('/*FNV_DEV*/true', '/*FNV_DEV*/false'), encoding='utf-8', newline='')
     for f in BUILD:
         shutil.copy2(build / f, out / 'build' / f)
 
