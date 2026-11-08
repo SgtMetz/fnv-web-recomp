@@ -1,10 +1,5 @@
 # Fallout: New Vegas in the browser
 
-Start here. This page is the map: what works, how to build and run it, where the code is, and which documents are
-current. The detailed history lives in `PROGRESS.md`, which is append-only, with the newest entry at the end.
-
-## Where it stands (2026-11-08)
-
 The original `FalloutNV.exe` is **statically recompiled**: every function is lifted to portable C++ and built for two
 hosts, native Win32 and WebAssembly. A platform layer (PAL) stands in for Windows, Direct3D 9, DirectSound and
 DirectShow.
@@ -16,7 +11,7 @@ The browser build plays New Game through character creation into Doc Mitchell's 
 - About 45-60 fps in the heavy interior and about 95 fps in menus.
 - DLC is off by default.
 
-See `docs/RECOMP.md` for the design and `PROGRESS.md` for the evidence.
+See `docs/RECOMP.md` for the design and `PROGRESS.md` 
 
 ## Credits
 
