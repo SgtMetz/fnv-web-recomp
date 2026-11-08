@@ -2,7 +2,7 @@
 """Bundle the browser build for a server (server/README.md): everything server/serve.mjs --dist serves, in one folder.
 
     out/dist/
-      index.html, renderer.js, audio-worklet.js, debug.js     the page (web/recomp/)
+      index.html, credits.html, renderer.js, ...              the page (web/recomp/)
       build/fnv_web.js, build/fnv_web.wasm                     the Emscripten build (out/recomp/web_browser/)
       shader/<sha1>                                            each translated shader as the page fetches it (JSON)
       VERSION.json                                             what went in: commit, build time, wasm SHA-256
@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PAGE = ['index.html', 'renderer.js', 'audio-worklet.js', 'debug.js']
+PAGE = ['index.html', 'credits.html', 'renderer.js', 'audio-worklet.js', 'debug.js']
 BUILD = ['fnv_web.js', 'fnv_web.wasm']
 BROTLI = r"""
 const fs = require('fs'), zlib = require('zlib');

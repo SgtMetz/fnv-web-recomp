@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Credits</title>
+<style>
+  :root { color-scheme: dark; --bg: #0d0d0d; --fg: #d8d2c4; --dim: #8a8478; --accent: #e0a040; --line: #3a3528; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.6 system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 48px; box-sizing: border-box; }
+  h1 { color: var(--accent); font-size: 24px; font-weight: 600; margin: 0 0 4px; }
+  h2 { color: var(--accent); font-size: 17px; font-weight: 600; margin: 32px 0 6px; padding-top: 16px; border-top: 1px solid var(--line); }
+  p, li { color: var(--fg); }
+  .dim { color: var(--dim); }
+  a { color: var(--accent); }
+  ul { padding-left: 20px; }
+  .back { display: inline-block; margin-bottom: 20px; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="./">&larr; Back to the game</a>
+  <h1>Credits</h1>
+  <p class="dim">Fallout: New Vegas in the browser, recompiled from your own copy of the game. It stands on other people's work.</p>
+
+  <h2>fnv_decomp: the foundation</h2>
+  <p><a href="https://github.com/momusdigital/fnv_decomp">fnv_decomp</a>, the community decompilation coordinated on
+    <a href="https://fnvdecomp.com">fnvdecomp.com</a>, rebuilt the game's program as C++, function by function, each one
+    checked to compile to the same bytes as the original. Its names, types and layouts are how every part of this port
+    understands the game.</p>
+  <p>Its authors released it with no licence and said that credit is not required. We credit them anyway, because this
+    port would not exist without them. The largest contributions came from connorx2000, h-x3n, L1ll3J, andgju, gavinbrow,
+    FFwLo, MK5280, momentom861, MatiasIsGood and Stargallian, with 35 more named contributors and 8 who took part
+    anonymously. The full list is in <a href="https://github.com/momusdigital/fnv_decomp/blob/main/CREDITS.md">their credits</a>.</p>
+
+  <h2>nv-rs: design ideas</h2>
+  <p><a href="https://github.com/slaterain/nv-rs">nv-rs</a>, by slaterain and its contributors, is a new engine for the
+    game written in Rust. We took two ideas from it: running the game's threads as deterministic coroutines, and
+    modelling Direct3D 9 as a complete state machine. No nv-rs code was copied.</p>
+
+  <h2>Tools</h2>
+  <ul>
+    <li><a href="https://llvm.org">LLVM/Clang</a> and <a href="https://emscripten.org">Emscripten</a> build the game for the browser.</li>
+    <li><a href="https://www.capstone-engine.org">Capstone</a> disassembles the program for the recompiler.</li>
+    <li><a href="https://gitlab.winehq.org/wine/vkd3d">vkd3d</a> and <a href="https://dawn.googlesource.com/dawn">Tint</a> translate the game's shaders to WebGPU.</li>
+  </ul>
+
+  <h2>The game</h2>
+  <p>Fallout: New Vegas was developed by Obsidian Entertainment and published by Bethesda Softworks. "Fallout",
+    "Fallout: New Vegas" and "Bethesda" are trademarks of their owners. This project is not affiliated with or endorsed
+    by Bethesda Softworks, ZeniMax Media, Obsidian Entertainment or Microsoft. It contains no game files: the game runs
+    from your own copy.</p>
+</main>
+</body>
+</html>

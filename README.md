@@ -18,6 +18,15 @@ The browser build plays New Game through character creation into Doc Mitchell's 
 
 See `docs/RECOMP.md` for the design and `PROGRESS.md` for the evidence.
 
+## Credits
+
+This project is built on **[fnv_decomp](https://github.com/momusdigital/fnv_decomp)**, the community decompilation
+of the game ([fnvdecomp.com](https://fnvdecomp.com)). Its names and types are how every part of this port
+understands the game. **[nv-rs](https://github.com/slaterain/nv-rs)** by slaterain supplied two design ideas,
+and no code was copied from it. Fallout: New Vegas belongs to its owners: Obsidian Entertainment developed it and
+Bethesda Softworks published it. This project is not affiliated with or endorsed by them, and it contains no game
+files. The full list is in [CREDITS.md](CREDITS.md), and the site shows it at `/credits.html`.
+
 ## Folders on this machine (`E:\Games`)
 
 | Folder | What it is |
