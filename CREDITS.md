@@ -54,4 +54,6 @@ copy of the game.
 
 ## Licence
 
-This project has not chosen a licence yet, so no rights are granted beyond viewing and forking on GitHub.
+This project's own code is under the [MIT licence](LICENSE): anyone may use, copy, change and share it, provided
+the licence notice is kept. The licence covers only our original work, not the game, its files, anything generated
+from them, or fnv_decomp's material.

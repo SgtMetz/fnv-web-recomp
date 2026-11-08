@@ -27,6 +27,8 @@ and no code was copied from it. Fallout: New Vegas belongs to its owners: Obsidi
 Bethesda Softworks published it. This project is not affiliated with or endorsed by them, and it contains no game
 files. The full list is in [CREDITS.md](CREDITS.md), and the site shows it at `/credits.html`.
 
+**Licence:** [MIT](LICENSE), for this project's own code only. It grants nothing in the game or its files.
+
 ## Folders
 
 | Folder | What it is |
