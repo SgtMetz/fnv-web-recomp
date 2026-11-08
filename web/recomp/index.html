@@ -58,31 +58,55 @@ window.Module = {
 
 // the D3D9 command ring (port/recomp/pal_d3d9.h D3dRing: data, size, write, read, frames_sent, frames_done, enabled)
 let ring = 0, lastFrames = 0, lastT = performance.now(), fps = 0;
+const yieldChannel = new MessageChannel();
+const yieldWaiters = [];
+yieldChannel.port1.onmessage = () => { const f = yieldWaiters.shift(); if (f) f(); };
+const yieldSoon = () => new Promise((res) => { yieldWaiters.push(res); yieldChannel.port2.postMessage(0); });
 const pumpInfo = window.fnvPump = { calls: 0, packets: 0, error: null };
 async function pump() {
   pumpInfo.calls++;
   const M = window.Module;
   if (!ring) ring = M._fnv_ring();
-  const H32 = M.HEAPU32, H8 = M.HEAPU8, b = ring >>> 2;
-  const deadline = performance.now() + 14;
+  const H32 = M.HEAPU32, H8 = M.HEAPU8, F32 = M.HEAPF32, b = ring >>> 2;
+  const t0p = performance.now(), deadline = t0p + 14;
+  let more = false;
   try {
     for (;;) {
-      const data = Atomics.load(H32, b), rd = Atomics.load(H32, b + 3), wr = Atomics.load(H32, b + 2);
-      if (!data || rd === wr) break;
-      const p = data + rd, op = H32[p >>> 2], len = H32[(p >>> 2) + 1];
-      if (op === 0xffff) { Atomics.store(H32, b + 3, 0); continue; }
-      const w = H32.subarray((p >>> 2) + 2, (p >>> 2) + 2 + (len >>> 2)), bytes = H8.subarray(p + 8, p + 8 + len);
-      pumpInfo.packets++; pumpInfo.op = op;
-      const presented = await renderer.exec(op, w, bytes);
-      Atomics.store(H32, b + 3, rd + 8 + len);
-      if (presented) { Atomics.add(H32, b + 5, 1); break; }
-      if (performance.now() > deadline) break;
+      const data = Atomics.load(H32, b), wr = Atomics.load(H32, b + 2);
+      let rd = Atomics.load(H32, b + 3);
+      if (!data || rd === wr) {
+        // nothing queued: poll again soon within this tick (a message-channel yield, no timer clamp)
+        if (data && performance.now() < deadline - 2) { await yieldSoon(); continue; }
+        pumpInfo.empty = (pumpInfo.empty || 0) + 1;
+        break;
+      }
+      // everything written so far; the read counter is published every 64 packets, at a Present and at the end
+      let n = 0;
+      while (rd !== wr) {
+        const pi = (data + rd) >>> 2, op = H32[pi], len = H32[pi + 1];
+        if (op === 0xffff) { rd = 0; continue; }
+        n++;
+        if (!renderer.execHeap(op, H32, F32, pi + 2)) {
+          const p = data + rd;
+          let presented = renderer.exec(op, H32.subarray(pi + 2, pi + 2 + (len >>> 2)), H8.subarray(p + 8, p + 8 + len));
+          if (presented && presented.then) presented = await presented;
+          // a Present releases the game; keep going while it has more queued and the tick's budget lasts, so the
+          // game is not held to one frame per display tick (only the last frame of a tick reaches the screen)
+          if (presented === true) { rd += 8 + len; Atomics.store(H32, b + 3, rd); Atomics.add(H32, b + 5, 1); continue; }
+        }
+        rd += 8 + len;
+        if ((n & 63) === 0) { Atomics.store(H32, b + 3, rd); if (performance.now() > deadline) break; }
+      }
+      Atomics.store(H32, b + 3, rd);
+      pumpInfo.packets += n;
+      if (rd !== wr) { pumpInfo.budget = (pumpInfo.budget || 0) + 1; more = true; break; }
     }
   } catch (e) {
     pumpInfo.error = String(e.stack || e);
     log('renderer: ' + (e.stack || e), true);
   }
   const now = performance.now();
+  pumpInfo.busyMs = (pumpInfo.busyMs || 0) + (now - t0p);
   if (now - lastT > 1000) {
     fps = (renderer.frames - lastFrames) * 1000 / (now - lastT);
     lastFrames = renderer.frames; lastT = now;
@@ -91,6 +115,8 @@ async function pump() {
   }
   // the game waits on the renderer, and a hidden or embedded page may get no animation frames: whichever of the
   // next frame and a short timer comes first runs the pump
+  // (still behind after the budget: continue right after the browser's pending work, not a whole display tick later)
+  if (more) { yieldSoon().then(pump); return; }
   let due = true;
   const go = () => { if (due) { due = false; pump(); } };
   requestAnimationFrame(go);

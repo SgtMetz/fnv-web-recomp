@@ -211,6 +211,14 @@ export class Renderer {
     this.layouts = new Map();
     this.samplers = new Map();
     this.bindGroups = new Map();
+    this.vstates = new Map();            // vertex layouts by shader, declaration and stream strides
+    this.fvfDecls = new Map();
+    this.objIds = new WeakMap(); this.nextObjId = 1;
+    this.bgOffset = new Uint32Array(1);
+    this.texViews = []; this.texSamplers = [];
+    this.ssVer = new Uint32Array(20); this.smpCache = [];
+    this.constVer = [1, 1];               // bumped by SHADER_CONST (vertex, pixel)
+    this.rsVer = 0; this.rsKeyVer = -1; this.rsKeyStr = '';
     this.rs = defaultRenderStates();
     this.ss = defaultSamplerStates();
     this.tex = new Array(20).fill(0);
@@ -459,7 +467,7 @@ export class Renderer {
     this.passInfo = a;
     for (const c of a.colors) if (c) this.used.add(c.t.id);
     if (a.depth) this.used.add(a.depth.t.id);
-    this.passState = {};
+    this.passState = { bgOff: [-1, -1], vb: [] };
     return this.pass;
   }
   ensurePass() { return this.pass || this.beginPass(null); }
@@ -601,17 +609,39 @@ export class Renderer {
     };
   }
 
+  objId(o) {
+    let i = this.objIds.get(o);
+    if (!i) { i = this.nextObjId++; this.objIds.set(o, i); }
+    return i;
+  }
+  // the render states a pipeline bakes in (blend, depth/stencil, cull, write masks, alpha test), as a key
+  rsKey() {
+    if (this.rsKeyVer === this.rsVer) return this.rsKeyStr;
+    const rs = this.rs, k = [rs[RS.ZENABLE], rs[RS.ZWRITEENABLE], rs[RS.ZFUNC], rs[RS.CULLMODE], rs[RS.COLORWRITEENABLE] & 15,
+      rs[190] & 15, rs[191] & 15, rs[192] & 15, rs[RS.DEPTHBIAS], rs[RS.SLOPESCALEDEPTHBIAS], rs[RS.ALPHABLENDENABLE], rs[RS.STENCILENABLE]];
+    if (rs[RS.ALPHABLENDENABLE]) k.push(rs[RS.SRCBLEND], rs[RS.DESTBLEND], rs[RS.BLENDOP], rs[RS.SEPARATEALPHABLENDENABLE],
+      rs[RS.SRCBLENDALPHA], rs[RS.DESTBLENDALPHA], rs[RS.BLENDOPALPHA]);
+    if (rs[RS.STENCILENABLE]) k.push(rs[RS.STENCILFAIL], rs[RS.STENCILZFAIL], rs[RS.STENCILPASS], rs[RS.STENCILFUNC], rs[RS.STENCILMASK] & 255,
+      rs[RS.STENCILWRITEMASK] & 255, rs[RS.TWOSIDEDSTENCILMODE], rs[RS.CCW_STENCILFAIL], rs[RS.CCW_STENCILZFAIL], rs[RS.CCW_STENCILPASS], rs[RS.CCW_STENCILFUNC]);
+    if (rs[RS.ALPHATESTENABLE] && rs[RS.ALPHAFUNC] !== 8) k.push('a', rs[RS.ALPHAFUNC], rs[RS.ALPHAREF] & 255);
+    this.rsKeyStr = k.join(',');
+    this.rsKeyVer = this.rsVer;
+    return this.rsKeyStr;
+  }
+
   // ---- draws --------------------------------------------------------------------------------------------------------
-  async draw(kind, w, data) {
+  // synchronous, except that a draw whose shaders are still loading returns a promise (the pump waits for it)
+  draw(kind, w, data) {
     const vs = this.shaders.get(this.vs), ps = this.shaders.get(this.ps);
     if (!vs || !ps) { this.stats.skipped++; this.warn('draw without shaders (fixed function) skipped'); return; }
-    if (!vs.wgsl) await vs.ready;
-    if (!ps.wgsl) await ps.ready;
-    if (!vs.wgsl || !ps.wgsl) { this.stats.skipped++; return; }
+    if (!vs.wgsl || !ps.wgsl) {
+      if (vs.loaded && ps.loaded) { this.stats.skipped++; return; }
+      return Promise.all([vs.ready, ps.ready]).then(() => { vs.loaded = ps.loaded = true; if (vs.wgsl && ps.wgsl) return this.draw(kind, w, data); this.stats.skipped++; });
+    }
     const prim = w[0];
     let count, start = 0, baseVertex = 0, indexed = false;
     // primitive count -> vertex/index count
-    const n = (pc) => [0, pc, pc * 2, pc + 1, pc * 3, pc + 2, pc + 2][prim] || 0;
+    const n = (pc) => prim === 1 ? pc : prim === 2 ? pc * 2 : prim === 3 ? pc + 1 : prim === 4 ? pc * 3 : prim === 5 || prim === 6 ? pc + 2 : 0;
     let upBuffer = null, upOffset = 0, upIndexOffset = 0, upIndex32 = false, upStride = 0;
     if (kind === OP.DRAW) { start = w[1]; count = n(w[2]); }
     else if (kind === OP.DRAW_INDEXED) { baseVertex = w[1]; start = w[4]; count = n(w[5]); indexed = true; }
@@ -629,13 +659,22 @@ export class Renderer {
     }
     if (!count) return;
     const isUP = kind === OP.DRAW_UP || kind === OP.DRAW_INDEXED_UP;
-    let elements = this.decl ? this.decls.get(this.decl) : fvfElements(this.fvf);
+    let elements = this.decl ? this.decls.get(this.decl) : this.fvfDecls.get(this.fvf);
+    if (!this.decl && !elements) { elements = fvfElements(this.fvf); this.fvfDecls.set(this.fvf, elements); }
     if (!elements) return;
     const savedStream0 = this.streams[0];
     if (isUP) this.streams[0] = { id: -2, offset: upOffset, stride: upStride, freq: 1 };
     const instanced = (this.streams[0].freq & 0x40000000) !== 0;
     const instances = instanced ? (this.streams[0].freq & 0xffff) || 1 : 1;
-    const vstate = this.vertexState(vs, elements, instanced);
+    if (!elements.streamList) elements.streamList = [...new Set(elements.map((e) => e.stream))].sort((x, y) => x - y);
+    let vkey = this.objId(vs) + ':' + this.objId(elements) + ':' + (instanced ? 1 : 0);
+    for (const s of elements.streamList) { const st = this.streams[s]; vkey += ':' + st.stride + (instanced && (st.freq & 0x80000000) ? 'i' : ''); }
+    let vstate = this.vstates.get(vkey);
+    if (!vstate) {
+      vstate = this.vertexState(vs, elements, instanced);
+      vstate.id = this.vstates.size + 1;
+      this.vstates.set(vkey, vstate);
+    }
 
     // topology (fans become lists through an index buffer built here)
     let topology = ['point-list', 'point-list', 'line-list', 'line-strip', 'triangle-list', 'triangle-strip', 'triangle-list'][prim];
@@ -659,44 +698,53 @@ export class Renderer {
       count = tris * 3;
     }
     const a = this.passInfo && this.pass ? this.passInfo : this.attachments();
-    const colorFormats = a.colors.map((c) => c && c.t.gpuFormat);
+    const colorFormats = a.colorFormats || (a.colorFormats = a.colors.map((c) => c && c.t.gpuFormat));
+    const cfKey = a.cfKey || (a.cfKey = colorFormats.join());
     const depthFormat = a.depth ? 'depth24plus-stencil8' : undefined;
     if (!colorFormats.length && !depthFormat) return;
 
     // textures, samplers
-    const texKinds = [];
-    const texViews = [];
-    const samplers = [];
-    for (const sh of [vs, ps]) {
-      for (const s of sh.info.bindings.samplers) {
+    let texKinds = '';
+    const texViews = this.texViews, samplers = this.texSamplers;
+    let ti0 = 0;
+    for (let si = 0; si < 2; si++) {
+      const sh = si ? ps : vs;
+      const smps = sh.info.bindings.samplers;
+      for (let k = 0; k < smps.length; k++) {
+        const s = smps[k];
         const stage = sh.stage ? s.n : 16 + s.n;
         const t = this.textures.get(this.tex[stage]);
         let view = this.dummy[s.dim] || this.dummy['2d'];
         let uf = false;
-        const inUse = t && a.colors.some((c) => c && c.t === t) || (t && a.depth && a.depth.t === t);
-        const dimOk = t && ((s.dim === 'cube') === (t.kind === 1)) && ((s.dim === '3d') === (t.kind === 2));
-        if (t && !inUse && dimOk) { view = t.sampleView; uf = !!(t.info.unfilterable || t.isDepth); }
-        texKinds.push(uf ? 'u' : 'f');
-        texViews.push(view);
-        samplers.push(this.sampler(stage, uf));
-        if (t) this.used.add(t.id);
+        if (t) {
+          let inUse = a.depth && a.depth.t === t;
+          for (let ci = 0; !inUse && ci < a.colors.length; ci++) inUse = a.colors[ci] && a.colors[ci].t === t;
+          const dimOk = ((s.dim === 'cube') === (t.kind === 1)) && ((s.dim === '3d') === (t.kind === 2));
+          if (!inUse && dimOk) { view = t.sampleView; uf = !!(t.info.unfilterable || t.isDepth); }
+          this.used.add(t.id);
+        }
+        texKinds += uf ? 'u' : 'f';
+        texViews[ti0] = view;
+        samplers[ti0] = this.sampler(stage, uf);
+        ti0++;
       }
     }
-    const vsKinds = texKinds.slice(0, vs.info.bindings.samplers.length), psKinds = texKinds.slice(vs.info.bindings.samplers.length);
     const rs = this.rs;
     const alpha = rs[RS.ALPHATESTENABLE] && rs[RS.ALPHAFUNC] !== 8 ? [rs[RS.ALPHAFUNC], rs[RS.ALPHAREF] & 255] : null;
     const cull = rs[RS.CULLMODE] === 1 ? 'none' : 'back';
     const frontFace = rs[RS.CULLMODE] === 3 ? 'cw' : 'ccw';
-    const writeMasks = [RS.COLORWRITEENABLE, 190, 191, 192].map((r) => rs[r] & 15);
-    const blend = this.blendState();
-    const key = [this.vs, this.ps, JSON.stringify(vstate.buffers), topology, indexed && topology === 'triangle-strip' ? (isUP ? (upIndex32 ? 32 : 16) : (this.buffers.get(this.indices)?.kind === 2 ? 32 : 16)) : 0,
-      JSON.stringify(blend), cull, frontFace, writeMasks.join(), JSON.stringify(this.depthStencil(depthFormat)), colorFormats.join(), alpha && alpha.join(), texKinds.join('')].join('|');
+    const stripBits = indexed && topology === 'triangle-strip' ? (isUP ? (upIndex32 ? 32 : 16) : (this.buffers.get(this.indices)?.kind === 2 ? 32 : 16)) : 0;
+    const key = this.vs + '|' + this.ps + '|' + vstate.id + '|' + topology + '|' + stripBits + '|' + this.rsKey() + '|' + (depthFormat ? 'd' : '') + '|' +
+      cfKey + '|' + texKinds;
     let pipe = this.pipelines.get(key);
     if (pipe === undefined) {
+      const writeMasks = [RS.COLORWRITEENABLE, 190, 191, 192].map((r) => rs[r] & 15);
+      const blend = this.blendState();
       try {
-        const vsl = this.stageLayout(vs, 0, vsKinds), psl = this.stageLayout(ps, 1, psKinds);
+        const nvs = vs.info.bindings.samplers.length;
+        const vsl = this.stageLayout(vs, 0, texKinds.slice(0, nvs)), psl = this.stageLayout(ps, 1, texKinds.slice(nvs));
         const layout = this.dev.createPipelineLayout({ bindGroupLayouts: [vsl, psl] });
-        const stripFormat = topology === 'triangle-strip' || topology === 'line-strip' ? (indexed ? (key.split('|')[4] === '32' ? 'uint32' : 'uint16') : undefined) : undefined;
+        const stripFormat = topology === 'triangle-strip' || topology === 'line-strip' ? (indexed ? (stripBits === 32 ? 'uint32' : 'uint16') : undefined) : undefined;
         this.dev.pushErrorScope('validation');
         const p = this.dev.createRenderPipeline({
           layout,
@@ -717,75 +765,110 @@ export class Renderer {
     }
     if (!pipe) { this.stats.skipped++; if (isUP) this.streams[0] = savedStream0; return; }
 
+    // room for both stages' constants now: a flush once the pass is open would end it mid-draw
+    if (this.uniformUsed + 2 * 4352 > this.uniformStage.length) this.flush();
     const pass = this.ensurePass();
     if (!pass) return;
-    pass.setPipeline(pipe.p);
-    // viewport / scissor
+    const ps_ = this.passState;
+    if (ps_.pipe !== pipe.p) { pass.setPipeline(pipe.p); ps_.pipe = pipe.p; }
+    // viewport / scissor / stencil reference / blend constant: set when they change within the pass
     const vp = this.viewport;
     const vx = Math.max(0, vp[0]), vy = Math.max(0, vp[1]);
     const vw = Math.max(1, Math.min(vp[2], a.w - vx)), vh = Math.max(1, Math.min(vp[3], a.h - vy));
-    pass.setViewport(vx, vy, vw, vh, Math.min(vp[4], vp[5]), Math.max(vp[4], vp[5]));
+    const vz0 = Math.min(vp[4], vp[5]), vz1 = Math.max(vp[4], vp[5]);
+    const pv = ps_.vp || (ps_.vp = [-1, 0, 0, 0, 0, 0]);
+    if (pv[0] !== vx || pv[1] !== vy || pv[2] !== vw || pv[3] !== vh || pv[4] !== vz0 || pv[5] !== vz1) {
+      pass.setViewport(vx, vy, vw, vh, vz0, vz1); pv[0] = vx; pv[1] = vy; pv[2] = vw; pv[3] = vh; pv[4] = vz0; pv[5] = vz1;
+    }
+    let sx = 0, sy = 0, sw = a.w, sh_ = a.h;
     if (rs[RS.SCISSORTESTENABLE]) {
       const [l, t, r, b] = this.scissor;
-      const x0 = Math.max(0, Math.min(l, a.w)), y0 = Math.max(0, Math.min(t, a.h));
-      pass.setScissorRect(x0, y0, Math.max(0, Math.min(r, a.w) - x0), Math.max(0, Math.min(b, a.h) - y0));
-    } else pass.setScissorRect(0, 0, a.w, a.h);
-    if (depthFormat) pass.setStencilReference(rs[RS.STENCILREF] & 255);
+      sx = Math.max(0, Math.min(l, a.w)); sy = Math.max(0, Math.min(t, a.h));
+      sw = Math.max(0, Math.min(r, a.w) - sx); sh_ = Math.max(0, Math.min(b, a.h) - sy);
+    }
+    const sc = ps_.sc || (ps_.sc = [-1, 0, 0, 0]);
+    if (sc[0] !== sx || sc[1] !== sy || sc[2] !== sw || sc[3] !== sh_) { pass.setScissorRect(sx, sy, sw, sh_); sc[0] = sx; sc[1] = sy; sc[2] = sw; sc[3] = sh_; }
+    if (depthFormat && ps_.sref !== (rs[RS.STENCILREF] & 255)) { ps_.sref = rs[RS.STENCILREF] & 255; pass.setStencilReference(ps_.sref); }
     const bf = rs[RS.BLENDFACTOR];
-    pass.setBlendConstant([((bf >>> 16) & 255) / 255, ((bf >>> 8) & 255) / 255, (bf & 255) / 255, (bf >>> 24) / 255]);
-    // bind groups
+    if (ps_.bf !== bf) { ps_.bf = bf; pass.setBlendConstant([((bf >>> 16) & 255) / 255, ((bf >>> 8) & 255) / 255, (bf & 255) / 255, (bf >>> 24) / 255]); }
+    // bind groups: the constants are a dynamic offset into the uniform arena, so a group is fixed by its layout,
+    // textures and samplers and is made once
     let ti = 0;
-    for (const [g, sh, layout] of [[0, vs, pipe.vsl], [1, ps, pipe.psl]]) {
-      const entries = [];
+    for (let g = 0; g < 2; g++) {
+      const sh = g ? ps : vs, layout = g ? pipe.psl : pipe.vsl;
       const c = sh.info.bindings.constants;
-      const offsets = [];
+      const smps = sh.info.bindings.samplers;
+      let bkey = this.objId(layout) + (c ? ':' + c.vec4_count : '');
+      for (let i = 0; i < smps.length; i++) bkey += ':' + this.objId(texViews[ti + i]) + '/' + this.objId(samplers[ti + i]);
+      let bg = this.bindGroups.get(bkey);
+      if (!bg) {
+        const entries = [];
+        if (c) entries.push({ binding: c.binding, resource: { buffer: this.uniformArena, offset: 0, size: Math.max(16, c.vec4_count * 16) } });
+        for (let i = 0; i < smps.length; i++) {
+          entries.push({ binding: smps[i].texture_binding, resource: texViews[ti + i] });
+          entries.push({ binding: smps[i].sampler_binding, resource: samplers[ti + i] });
+        }
+        if (this.bindGroups.size > 50000) this.bindGroups.clear();
+        bg = this.dev.createBindGroup({ layout, entries });
+        this.bindGroups.set(bkey, bg);
+      }
+      ti += smps.length;
+      // constants unchanged since this pass last uploaded at least as many: reuse that upload, and skip the call
+      // entirely when the group is the one already bound
+      const st = sh.stage ? 1 : 0, last = ps_.cst || (ps_.cst = [null, null]), bound = ps_.bg || (ps_.bg = [null, null]);
       if (c) {
-        const bytes = c.vec4_count * 16;
-        offsets.push(this.uniformPut(sh.stage ? this.psConst : this.vsConst, bytes));
-        entries.push({ binding: c.binding, resource: { buffer: this.uniformArena, offset: 0, size: Math.max(16, bytes) } });
-      }
-      for (const s of sh.info.bindings.samplers) {
-        entries.push({ binding: s.texture_binding, resource: texViews[ti] });
-        entries.push({ binding: s.sampler_binding, resource: samplers[ti] });
-        ti++;
-      }
-      pass.setBindGroup(g, this.dev.createBindGroup({ layout, entries }), offsets);
+        const l = last[st];
+        let off;
+        if (l && l.ver === this.constVer[st] && l.n >= c.vec4_count) off = l.off;
+        else { off = this.uniformPut(sh.stage ? this.psConst : this.vsConst, c.vec4_count * 16); last[st] = { ver: this.constVer[st], n: c.vec4_count, off }; }
+        if (bound[g] !== bg || ps_.bgOff[g] !== off) { this.bgOffset[0] = off; pass.setBindGroup(g, bg, this.bgOffset); bound[g] = bg; ps_.bgOff[g] = off; }
+      } else if (bound[g] !== bg) { pass.setBindGroup(g, bg); bound[g] = bg; }
     }
     // vertex buffers
     let slot = 0;
     for (const s of vstate.order) {
       const st = this.streams[s];
-      if (st.id === -2) pass.setVertexBuffer(slot, this.vertexArena, st.offset);
+      let gb, go;
+      if (st.id === -2) { gb = this.vertexArena; go = st.offset; }
       else {
         const b = this.buffers.get(st.id);
         if (!b) { this.stats.skipped++; if (isUP) this.streams[0] = savedStream0; return; }
         this.used.add(b.id);
-        pass.setVertexBuffer(slot, b.gpu, st.offset & ~3);
+        gb = b.gpu; go = st.offset & ~3;
       }
+      const vb = ps_.vb[slot];
+      if (!vb || vb[0] !== gb || vb[1] !== go) { pass.setVertexBuffer(slot, gb, go); ps_.vb[slot] = [gb, go]; }
       slot++;
     }
-    if (vstate.zeroSlot) pass.setVertexBuffer(slot, this.zeroVB);
+    if (vstate.zeroSlot) { const vb = ps_.vb[slot]; if (!vb || vb[0] !== this.zeroVB) { pass.setVertexBuffer(slot, this.zeroVB); ps_.vb[slot] = [this.zeroVB, 0]; } }
     if (isUP) this.streams[0] = savedStream0;
     this.stats.draws++;
     if (this.trace) this.trace.push({ vs: vs.name, ps: ps.name, prim, count, rt: this.rt.map((r) => r && r.id), depth: this.depth,
       tex: texViews.map((v, i) => { const st = i < vs.info.bindings.samplers.length ? 16 + vs.info.bindings.samplers[i].n : ps.info.bindings.samplers[i - vs.info.bindings.samplers.length].n; const tx = this.textures.get(this.tex[st]); return tx ? `${tx.id}:${tx.fmt}:${tx.w}x${tx.h}${v === tx.sampleView ? '' : '(dummy)'}` : 'none'; }),
       blend: rs[RS.ALPHABLENDENABLE] ? `${rs[RS.SRCBLEND]}/${rs[RS.DESTBLEND]}` : 'off', alpha, z: `${rs[RS.ZENABLE]}${rs[RS.ZWRITEENABLE]}${rs[RS.ZFUNC]}`, stencil: rs[RS.STENCILENABLE] });
     if (fanIndex != null) {
-      pass.setIndexBuffer(this.vertexArena, 'uint32', fanIndex);
+      pass.setIndexBuffer(this.vertexArena, 'uint32', fanIndex); ps_.ib = null;
       pass.drawIndexed(count, instances, 0, indexed && !isUP ? baseVertex : 0, 0);
     } else if (kind === OP.DRAW_INDEXED_UP) {
-      pass.setIndexBuffer(this.vertexArena, upIndex32 ? 'uint32' : 'uint16', upIndexOffset);
+      pass.setIndexBuffer(this.vertexArena, upIndex32 ? 'uint32' : 'uint16', upIndexOffset); ps_.ib = null;
       pass.drawIndexed(count, 1, 0, 0, 0);
     } else if (indexed) {
       const ib = this.buffers.get(this.indices);
       if (!ib) return;
       this.used.add(ib.id);
-      pass.setIndexBuffer(ib.gpu, ib.kind === 2 ? 'uint32' : 'uint16');
+      if (ps_.ib !== ib.gpu || ps_.ibf !== ib.kind) { pass.setIndexBuffer(ib.gpu, ib.kind === 2 ? 'uint32' : 'uint16'); ps_.ib = ib.gpu; ps_.ibf = ib.kind; }
       pass.drawIndexed(count, instances, start, baseVertex, 0);
     } else pass.draw(count, instances, start, 0);
   }
 
   sampler(stage, unfilterable) {
+    const c = this.smpCache[stage * 2 + (unfilterable ? 1 : 0)];
+    if (c && c.ver === this.ssVer[stage]) return c.smp;
+    const smp = this.samplerFor(stage, unfilterable);
+    this.smpCache[stage * 2 + (unfilterable ? 1 : 0)] = { ver: this.ssVer[stage], smp };
+    return smp;
+  }
+  samplerFor(stage, unfilterable) {
     const s = this.ss[stage] || this.ss[0];
     const key = [s[1], s[2], s[3], s[5], s[6], s[7], s[10], unfilterable].join();
     let smp = this.samplers.get(key);
@@ -900,7 +983,32 @@ export class Renderer {
 
   // ---- packet dispatch ----------------------------------------------------------------------------------------------
   // w: Uint32Array over the payload, data: Uint8Array over the payload (both may be views of shared memory)
-  async exec(op, w, data) {
+  // the frequent state packets read straight from the heap (i: word index of the payload), without making views;
+  // false for a packet exec() must handle
+  execHeap(op, H32, F32, i) {
+    switch (op) {
+      case OP.RENDER_STATE: { const k = H32[i], v = H32[i + 1]; if (k < 256 && this.rs[k] !== v) { this.rs[k] = v; this.rsVer++; } return true; }
+      case OP.SAMPLER_STATE: { const s = H32[i], k = H32[i + 1], v = H32[i + 2]; if (s < 20 && k < 14 && this.ss[s][k] !== v) { this.ss[s][k] = v; this.ssVer[s]++; } return true; }
+      case OP.SET_TEXTURE: if (H32[i] < 20) this.tex[H32[i]] = H32[i + 1]; return true;
+      case OP.SET_SHADER: if (H32[i]) this.ps = H32[i + 1]; else this.vs = H32[i + 1]; return true;
+      case OP.SHADER_CONST: {
+        const st = H32[i] ? 1 : 0, arr = st ? this.psConst : this.vsConst, at = H32[i + 1] * 4;
+        const n = Math.min(H32[i + 2] * 4, arr.length - at), src = i + 3;
+        for (let k = 0; k < n; k++) arr[at + k] = F32[src + k];
+        this.constVer[st]++;
+        return true;
+      }
+      case OP.SET_STREAM: if (H32[i] < 16) { const st = this.streams[H32[i]]; st.id = H32[i + 1]; st.offset = H32[i + 2]; st.stride = H32[i + 3]; } return true;
+      case OP.STREAM_FREQ: if (H32[i] < 16) this.streams[H32[i]].freq = H32[i + 1]; return true;
+      case OP.SET_INDICES: this.indices = H32[i]; return true;
+      case OP.SET_DECL: this.decl = H32[i]; return true;
+      case OP.TEX_STAGE_STATE: case OP.SET_TRANSFORM: return true;
+    }
+    return false;
+  }
+
+  // returns true for a Present, a promise when the packet must wait (a draw whose shaders are loading)
+  exec(op, w, data) {
     switch (op) {
       case OP.CREATE_TEXTURE: this.createTexture(w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); break;
       case OP.DESTROY: this.destroy(w[0]); break;
@@ -909,14 +1017,15 @@ export class Renderer {
       case OP.UPLOAD_BUFFER: this.uploadBuffer(w[0], w[1], w[2], data.subarray(12)); break;
       case OP.CREATE_SHADER: this.createShader(w[0], w[1], [...w.subarray(2, 7)].map((x) => x.toString(16).padStart(8, '0')).join('')); break;
       case OP.CREATE_DECL: this.createDecl(w[0], w[1], data.slice(8)); break;
-      case OP.RENDER_STATE: if (w[0] < 256) this.rs[w[0]] = w[1]; break;
-      case OP.SAMPLER_STATE: if (w[0] < 20 && w[1] < 14) this.ss[w[0]][w[1]] = w[2]; break;
+      case OP.RENDER_STATE: if (w[0] < 256 && this.rs[w[0]] !== w[1]) { this.rs[w[0]] = w[1]; this.rsVer++; } break;
+      case OP.SAMPLER_STATE: if (w[0] < 20 && w[1] < 14 && this.ss[w[0]][w[1]] !== w[2]) { this.ss[w[0]][w[1]] = w[2]; this.ssVer[w[0]]++; } break;
       case OP.SET_TEXTURE: if (w[0] < 20) this.tex[w[0]] = w[1]; break;
       case OP.SET_SHADER: if (w[0]) this.ps = w[1]; else this.vs = w[1]; break;
       case OP.SHADER_CONST: {
         const arr = w[0] ? this.psConst : this.vsConst;
-        const f = new Float32Array(data.slice(12, 12 + w[2] * 16).buffer);
+        const f = (data.byteOffset & 3) === 0 ? new Float32Array(data.buffer, data.byteOffset + 12, w[2] * 4) : new Float32Array(data.slice(12, 12 + w[2] * 16).buffer);
         arr.set(f.subarray(0, Math.max(0, Math.min(f.length, arr.length - w[1] * 4))), w[1] * 4);
+        this.constVer[w[0] ? 1 : 0]++;
         break;
       }
       case OP.SET_STREAM: if (w[0] < 16) { const st = this.streams[w[0]]; st.id = w[1]; st.offset = w[2]; st.stride = w[3]; } break;
@@ -927,7 +1036,7 @@ export class Renderer {
       case OP.SET_TARGET: {
         const cur = this.rt[w[0]];
         const nw = w[1] ? { id: w[1], face: w[2], level: w[3] } : null;
-        if (JSON.stringify(cur) !== JSON.stringify(nw)) { this.endPass(); this.rt[w[0]] = nw; }
+        if (!cur !== !nw || (cur && (cur.id !== nw.id || cur.face !== nw.face || cur.level !== nw.level))) { this.endPass(); this.rt[w[0]] = nw; }
         if (w[0] === 0 && nw) { const t = this.textures.get(nw.id); if (t) { this.viewport = [0, 0, Math.max(1, t.w >> nw.level), Math.max(1, t.h >> nw.level), 0, 1]; } }
         break;
       }
@@ -940,9 +1049,9 @@ export class Renderer {
       case OP.SCISSOR: this.scissor = [w[0] | 0, w[1] | 0, w[2] | 0, w[3] | 0]; break;
       case OP.CLEAR: if (this.trace) this.trace.push({ clear: w[0], color: w[1].toString(16), rt: this.rt.map((r) => r && r.id), vp: this.viewport.slice(0, 4) });
         this.clear(w[0], w[1], new Float32Array(w.slice(2, 3).buffer)[0], w[3]); break;
-      case OP.DRAW: case OP.DRAW_INDEXED: await this.draw(op, w, null); break;
-      case OP.DRAW_UP: await this.draw(op, w, data.subarray(16)); break;
-      case OP.DRAW_INDEXED_UP: await this.draw(op, w, data.subarray(32)); break;
+      case OP.DRAW: case OP.DRAW_INDEXED: return this.draw(op, w, null);
+      case OP.DRAW_UP: return this.draw(op, w, data.subarray(16));
+      case OP.DRAW_INDEXED_UP: return this.draw(op, w, data.subarray(32));
       case OP.STRETCH: this.stretch(w); break;
       case OP.COLOR_FILL: this.colorFill(w); break;
       case OP.PRESENT: this.present(); return true;
