@@ -1,6 +1,6 @@
 // WebGPU renderer for the whole-game recompiler (docs/RECOMP.md, milestone 3). It consumes the Direct3D 9 command
 // stream that port/recomp/pal_d3d9.cpp writes (live from the wasm heap, or a captured ring.bin) and draws it with the
-// game's own shaders, translated ahead of time to WGSL (out/shaders, served by tools/recomp_serve.mjs at /shader/<sha1>).
+// game's own shaders, translated ahead of time to WGSL (out/shaders, served by server/serve.mjs at /shader/<sha1>).
 //
 // D3D9 -> WebGPU in brief: render states become pipeline state (cached by key), constants go to per-submit uniform
 // arenas with dynamic offsets, UP draws to a per-submit vertex arena, and an upload to a resource already used by

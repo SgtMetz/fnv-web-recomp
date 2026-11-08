@@ -33,7 +33,8 @@ See `docs/RECOMP.md` for the design and `PROGRESS.md` for the evidence.
   venv) are git-ignored for that reason.
 - **Never touch the real `Documents\My Games\FalloutNV`.** The builds use a private copy in `out/fnv_docs`, which the
   web host serves as `/docs`.
-- **The dev server binds to 127.0.0.1 only.** Game files never leave the machine.
+- **The server binds to 127.0.0.1 by default.** Everything it serves comes from your copy of the game, so a
+  deployment must never be public. It has no access control yet: see `server/README.md`.
 - **Git:**
   - Stage explicit paths, never `git add -A`.
   - Don't switch branches. Other sessions may share this checkout.
@@ -60,8 +61,8 @@ python -B tools/recomp_build_web.py --target browser # -O2, ~3 min cold -> out/r
 shaders (`out/shaders`, `out/shader_manifest`) come from the pipeline in `docs/SHADERS.md`. All of these already
 exist, so you only rerun a step when its inputs change.
 
-**Run:** start the dev server (launch config `recomp` in `.claude/launch.json`, or
-`node tools/recomp_serve.mjs --game "E:/Games/Fallout New Vegas"`) and open `http://localhost:8093/`. `--dlc` turns
+**Run:** start the server in development mode (launch config `recomp` in `.claude/launch.json`, or
+`node server/serve.mjs --dev --game "E:/Games/Fallout New Vegas"`) and open `http://localhost:8093/`. `--dlc` turns
 the DLC on.
 
 Before the game loads, the page asks how to start. `?start=normal` or `?start=quick` in the address skips the
@@ -87,6 +88,10 @@ question.
 - To find a function, map an address to the decomp with `grep -rn "@fnv 0x00XXXXXX" ../fnv_decomp-main-updated/src`,
   or read the lifted body in `out/recomp/recomp_NN.cpp` (`f_XXXXXXXX`).
 
+**On a server:** `python -B tools/recomp_bundle.py` makes `out/dist/`, which `node server/serve.mjs --dist out/dist ...`
+serves. HTTPS, a reverse proxy, systemd and the measured network behaviour are in `server/README.md`. The launch
+configs `recomp-remote` (40 ms added to each file request) and `recomp-dist` (the bundle) test both here.
+
 **Native host:** `bash tools/recomp_cycle.sh [seconds]` recompiles, builds `out/recomp/fnv_recomp.exe` and runs it
 headless. The log goes to `out/recomp/run.log`.
 
@@ -94,14 +99,15 @@ headless. The log goes to `out/recomp/run.log`.
 
 | Path | Contents |
 | --- | --- |
-| `tools/recomp*.py`, `tools/recomp_serve.mjs`, `tools/gen_*.py` | **Active.** The recompiler, the builds, the browser dev server, and the generated tables. |
+| `tools/recomp*.py`, `tools/gen_*.py` | **Active.** The recompiler, the builds (`recomp_bundle.py`: the deployment bundle), and the generated tables. |
+| `server/` | **Active.** `serve.mjs`, the web server for both development and deployment, and `README.md`, the deployment guide. |
 | `port/recomp/` | **Active.** Runtime and PAL: `fnv_recomp_rt.cpp` (CPU state, calls), `pal_kernel/user/fs/com/input.cpp`, `pal_d3d9.cpp` (writes the D3D9 command ring), `pal_dsound.cpp`, `pal_dshow.cpp`, and the hosts `host_win32.cpp` and `host_web.cpp`. |
 | `web/recomp/` | **Active.** The browser page: `index.html` (worker start-up, ring pump, audio), `renderer.js` (WebGPU D3D9 renderer), `audio-worklet.js`, `debug.js`, and `replay.html` (plays a captured ring). |
 | `tools/shader_*.py`, `tools/vkd3d_patches/`, `tools/build_vkd3d.py` | Shader translation from d3dbc to WGSL (`docs/SHADERS.md`). |
 | `port/loader/`, `port/runtime/`, `port/compat/`, most other `tools/*.py` | **Dormant: Phases 1-2.** The native relink of the decomp C++ plus the lifter. It reached the Mojave natively, but it cannot target wasm because clang has no MSVC C++ ABI there. Kept for reference and for its analysis scans. |
 | `web/` (outside `recomp/`), `web/README.md` | An earlier browser shell: install importer, saves, and an OPFS file layer. It is not wired to the recompiled build. |
 | `spikes/` | Phase 0 experiments: a BSA viewer and a WGSL checker. |
-| `out/` | Generated and ignored. `out/recomp/` (lifted sources, builds, `web_browser/`), `out/shaders`, `out/shader_manifest`, `out/fnv_docs` (private My Games copy), `out/link`, `out/obj`, `out/src`, `out/cache` (relink-era build products and caches). |
+| `out/` | Generated and ignored. `out/recomp/` (lifted sources, builds, `web_browser/`), `out/dist/` (the deployment bundle), `out/shaders`, `out/shader_manifest`, `out/fnv_docs` (private My Games copy), `out/link`, `out/obj`, `out/src`, `out/cache` (relink-era build products and caches). |
 | `local/` | Ignored. Toolchains (`dl/emsdk`, `dl/vkd3d`, `dl/dawn`) and `venv/`. |
 
 ## Documents

@@ -201,6 +201,7 @@ void fill_find(uint32_t d, const std::string& full)
 struct Ini
 {
     int64_t mtime = -1;
+    uint64_t checked = ~0ull;    // pal_fs_change_count() when mtime was last compared
     std::vector<std::pair<std::string, std::vector<std::pair<std::string, std::string>>>> sections;
 };
 std::mutex g_ini_mx;
@@ -217,14 +218,20 @@ std::string trim(const std::string& s)
     return a == std::string::npos ? std::string() : s.substr(a, b - a + 1);
 }
 
+// The game reads each setting with its own call; a file is re-checked only after something was written through
+// pal_fs (in the browser every stat is a request to the server, and start-up reads hundreds of settings).
 const Ini& load_ini(const std::string& path)
 {
+    Ini& ini = g_ini[lower(path)];
+    uint64_t changes = pal_fs_change_count();
+    if (ini.checked == changes) return ini;
     PalStat st;
     int64_t mt = stat_path(path, st) ? st.mtime : -2;
-    Ini& ini = g_ini[lower(path)];
+    ini.checked = changes;
     if (ini.mtime == mt) return ini;
     ini = Ini();
     ini.mtime = mt;
+    ini.checked = changes;
     PalFile* f = pal_fs_open(path.c_str(), "rb");
     if (!f) return ini;
     std::string text;

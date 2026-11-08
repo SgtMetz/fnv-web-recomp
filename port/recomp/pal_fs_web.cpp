@@ -1,13 +1,17 @@
-// pal_fs backend for the browser (pal_fs.h): synchronous requests from the game's worker threads to the local dev
-// server (tools/recomp_serve.mjs), which serves two roots: /game (the player's install, read-only) and /docs (the
-// private copy of My Games\FalloutNV in out/fnv_docs, writable). Each worker keeps a read-ahead cache of 256 KB blocks;
-// game files never leave the machine.
+// pal_fs backend for the browser (pal_fs.h): synchronous requests from the game's worker threads to the web server
+// (server/serve.mjs), which serves two roots: /game (the player's install, read-only) and /docs (the private copy of
+// My Games\FalloutNV, writable). Built to stay usable with network latency:
+//   - stat and list under /game come from one index of the install (/fs/index, fetched once per thread), not one
+//     request each (start-up makes thousands);
+//   - reads go in 1 MB blocks, with a read-ahead cache per thread;
+//   - a read of an install file names the file's mtime (v=), so the browser's HTTP cache keeps it across sessions.
 #include "pal_fs.h"
 
 #include <emscripten.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include <atomic>
 #include <mutex>
 
 // one synchronous request, retried: a dropped connection must not kill the game thread that asked. Defined once per
@@ -28,10 +32,41 @@ EM_JS(void, js_fs_init, (), {
         }
         return { status: 0 };
     };
+    // the install's index: keys are lowercased paths ("/game/data/falloutnv.esm"); f: [size, mtime], d: listings
+    globalThis.fnvGameIndex = function () {
+        if (globalThis.fnvIdx === undefined) {
+            var x = fnvXhr('GET', '/fs/index', null, false);
+            globalThis.fnvIdx = x.status == 200 ? JSON.parse(x.responseText) : null;
+        }
+        return globalThis.fnvIdx;
+    };
+    // index answer for a /game path: {file: [size, mtime]} / {dir: names} / {missing}, or null (ask the server)
+    globalThis.fnvGameLookup = function (p) {
+        // (no regex literals in EM_JS: its stringification breaks backslashes)
+        var k = p.toLowerCase();
+        while (k.length > 1 && k.charAt(k.length - 1) == '/') k = k.substring(0, k.length - 1);
+        if (k != '/game' && k.indexOf('/game/') != 0) return null;
+        var ix = fnvGameIndex();
+        if (!ix) return null;
+        if (ix.f[k]) return { file: ix.f[k] };
+        if (ix.d[k]) return { dir: ix.d[k] };
+        return { missing: true };
+    };
 });
 
 EM_JS(int, js_fs_stat, (const char* path, uint32_t* out), {
-    var x = fnvXhr('GET', '/fs/stat?p=' + encodeURIComponent(UTF8ToString(path)), null, false);
+    var p = UTF8ToString(path);
+    var hit = fnvGameLookup(p);
+    if (hit) {
+        if (hit.missing) return 0;
+        var size = hit.file ? hit.file[0] : 0;
+        HEAPU32[out >> 2] = hit.dir ? 1 : 0;
+        HEAPU32[(out >> 2) + 1] = size % 4294967296;
+        HEAPU32[(out >> 2) + 2] = Math.floor(size / 4294967296);
+        HEAPU32[(out >> 2) + 3] = hit.file ? hit.file[1] : 0;
+        return 1;
+    }
+    var x = fnvXhr('GET', '/fs/stat?p=' + encodeURIComponent(p), null, false);
     if (x.status != 200) return 0;
     var j = JSON.parse(x.responseText);
     HEAPU32[out >> 2] = j.dir ? 1 : 0;
@@ -43,8 +78,10 @@ EM_JS(int, js_fs_stat, (const char* path, uint32_t* out), {
 
 EM_JS(int, js_fs_read, (const char* path, double off, int len, uint8_t* dst, double size), {
     var p = UTF8ToString(path);
-    var B = 262144;
+    var B = 1048576;
     var g = globalThis;
+    var hit = fnvGameLookup(p);
+    var ver = hit && hit.file ? '&v=' + hit.file[1] : '';
     if (!g.fnvCache) { g.fnvCache = new Map(); g.fnvCacheBytes = 0; }
     var done = 0;
     while (done < len) {
@@ -55,7 +92,7 @@ EM_JS(int, js_fs_read, (const char* path, double off, int len, uint8_t* dst, dou
         var data = g.fnvCache.get(key);
         if (!data) {
                     var want = Math.min(B, size - blk * B);
-            var x = fnvXhr('GET', '/fs/read?p=' + encodeURIComponent(p) + '&o=' + (blk * B) + '&n=' + want, null, true);
+            var x = fnvXhr('GET', '/fs/read?p=' + encodeURIComponent(p) + '&o=' + (blk * B) + '&n=' + want + ver, null, true);
             if (x.status != 200) break;
             data = new Uint8Array(x.response);
             g.fnvCache.set(key, data);
@@ -87,9 +124,18 @@ EM_JS(int, js_fs_write, (const char* path, double off, int len, const uint8_t* s
 });
 
 EM_JS(int, js_fs_list, (const char* path, char* out, int cap), {
-    var x = fnvXhr('GET', '/fs/list?p=' + encodeURIComponent(UTF8ToString(path)), null, false);
-    if (x.status != 200) return -1;
-    var s = JSON.parse(x.responseText).join('\0') + '\0';
+    var p = UTF8ToString(path);
+    var hit = fnvGameLookup(p);
+    var names;
+    if (hit) {
+        if (!hit.dir) return -1;
+        names = hit.dir;
+    } else {
+        var x = fnvXhr('GET', '/fs/list?p=' + encodeURIComponent(p), null, false);
+        if (x.status != 200) return -1;
+        names = JSON.parse(x.responseText);
+    }
+    var s = names.join('\0') + '\0';
     var need = lengthBytesUTF8(s) + 1;
     if (need > cap) return need;
     stringToUTF8(s, out, cap);
@@ -153,8 +199,11 @@ void pal_fs_chdir(const char* path)
     g_cwd = n;
 }
 
+static std::atomic<uint64_t> g_changes;
+uint64_t pal_fs_change_count() { return g_changes.load(); }
 PalFile* pal_fs_open(const char* path, const char* mode)
 {
+    if (strpbrk(mode, "wa+")) ++g_changes;
     std::string p = norm(path);
     uint32_t st[4];
     bool exists = js_fs_stat(p.c_str(), st) && !st[0];
@@ -177,6 +226,7 @@ size_t pal_fs_read(void* buf, size_t n, PalFile* f)
 }
 size_t pal_fs_write(const void* buf, size_t n, PalFile* f)
 {
+    ++g_changes;
     if (!f->writable) return 0;
     fs_init();
     int put = js_fs_write(f->path.c_str(), (double)f->pos, (int)n, (const uint8_t*)buf);
@@ -217,9 +267,9 @@ bool pal_fs_list(const char* dir, std::vector<std::string>& names)
     for (const char* q = buf.data(); *q; q += strlen(q) + 1) names.push_back(q);
     return true;
 }
-bool pal_fs_mkdir(const char* path) { return js_fs_op("mkdir", norm(path).c_str(), nullptr); }
-bool pal_fs_remove(const char* path) { return js_fs_op("remove", norm(path).c_str(), nullptr); }
-bool pal_fs_rename(const char* from, const char* to) { return js_fs_op("rename", norm(from).c_str(), norm(to).c_str()); }
+bool pal_fs_mkdir(const char* path) { ++g_changes; return js_fs_op("mkdir", norm(path).c_str(), nullptr); }
+bool pal_fs_remove(const char* path) { ++g_changes; return js_fs_op("remove", norm(path).c_str(), nullptr); }
+bool pal_fs_rename(const char* from, const char* to) { ++g_changes; return js_fs_op("rename", norm(from).c_str(), norm(to).c_str()); }
 std::string pal_fs_cwd()
 {
     std::lock_guard<std::mutex> lk(g_cwd_mx);

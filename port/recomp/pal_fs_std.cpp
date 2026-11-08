@@ -6,6 +6,8 @@
 
 #include <stdlib.h>
 
+#include <string.h>
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 
@@ -31,9 +33,15 @@ std::string norm(const char* p)
 }
 } // namespace
 
-PalFile* pal_fs_open(const char* path, const char* mode) { return (PalFile*)fopen(norm(path).c_str(), mode); }
+static std::atomic<uint64_t> g_changes;
+uint64_t pal_fs_change_count() { return g_changes.load(); }
+PalFile* pal_fs_open(const char* path, const char* mode)
+{
+    if (strpbrk(mode, "wa+")) ++g_changes;
+    return (PalFile*)fopen(norm(path).c_str(), mode);
+}
 size_t pal_fs_read(void* buf, size_t n, PalFile* f) { return fread(buf, 1, n, (FILE*)f); }
-size_t pal_fs_write(const void* buf, size_t n, PalFile* f) { return fwrite(buf, 1, n, (FILE*)f); }
+size_t pal_fs_write(const void* buf, size_t n, PalFile* f) { ++g_changes; return fwrite(buf, 1, n, (FILE*)f); }
 int pal_fs_seek(PalFile* f, int64_t off, int whence) { return fseeko((FILE*)f, off, whence); }
 int64_t pal_fs_tell(PalFile* f) { return ftello((FILE*)f); }
 void pal_fs_flush(PalFile* f) { fflush((FILE*)f); }
@@ -70,8 +78,8 @@ bool pal_fs_mkdir(const char* path)
     return mkdir(norm(path).c_str(), 0777) == 0;
 #endif
 }
-bool pal_fs_remove(const char* path) { return remove(norm(path).c_str()) == 0; }
-bool pal_fs_rename(const char* from, const char* to) { return rename(norm(from).c_str(), norm(to).c_str()) == 0; }
+bool pal_fs_remove(const char* path) { ++g_changes; return remove(norm(path).c_str()) == 0; }
+bool pal_fs_rename(const char* from, const char* to) { ++g_changes; return rename(norm(from).c_str(), norm(to).c_str()) == 0; }
 std::string pal_fs_resolve(const char* path) { return norm(path); }
 void pal_fs_chdir(const char* path)
 {

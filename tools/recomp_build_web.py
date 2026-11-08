@@ -3,7 +3,7 @@
 (tools/recomp.py) and the portable runtime + PAL + web host. Two links share the objects:
   node     out/recomp/web/fnv_web.js (+ .wasm): direct access to the host filesystem (NODERAWFS), pal_fs_std
   browser  out/recomp/web_browser/fnv_web.js: the game in a worker (PROXY_TO_PTHREAD), files from the local dev server
-           (pal_fs_web, tools/recomp_serve.mjs), frames to web/recomp/renderer.js through the D3D9 command ring
+           (pal_fs_web, server/serve.mjs), frames to web/recomp/renderer.js through the D3D9 command ring
 A shard whose source and headers are unchanged keeps its object.
 
 usage: python tools/recomp_build_web.py [--jobs N] [--target node|browser|both]
