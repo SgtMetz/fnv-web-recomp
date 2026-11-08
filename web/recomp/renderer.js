@@ -74,6 +74,72 @@ function convertPixels(conv, src, w, h, srcRow) {
   return out;
 }
 
+// Block-compressed (DXT / BC1-5) data to BGRA8 on the CPU, for GPUs without 'texture-compression-bc' (most phones
+// and tablets) and for the cases WebGPU cannot keep compressed (render targets, sizes that are not multiples of 4).
+// src holds ceil(h / 4) rows of blocks, srcRow bytes apart; out is w x h BGRA8, cropped from the 4x4 blocks.
+// BC4 and BC5 land in red (and green), as bc4-r-unorm / bc5-rg-unorm sample.
+function decodeBlocks(fourcc, src, w, h, srcRow) {
+  const out = new Uint8Array(w * h * 4);
+  const bc1 = fourcc === FMT.DXT1, bc2 = fourcc === FMT.DXT2 || fourcc === FMT.DXT3;
+  const bc4 = fourcc === FMT.ATI1, bc5 = fourcc === FMT.ATI2;
+  const blockBytes = bc1 || bc4 ? 8 : 16;
+  const pal = new Uint8Array(16), alpha = new Uint8Array(16), red = new Uint8Array(16), green = new Uint8Array(16);
+  const ramp = (s, o, dst) => {        // a BC3 alpha / BC4 block at s[o]: eight levels and 3-bit indices
+    const a0 = s[o], a1 = s[o + 1], lv = [a0, a1, 0, 0, 0, 0, 0, 0];
+    if (a0 > a1) for (let i = 1; i < 7; i++) lv[i + 1] = ((7 - i) * a0 + i * a1 + 3) / 7 | 0;
+    else { for (let i = 1; i < 5; i++) lv[i + 1] = ((5 - i) * a0 + i * a1 + 2) / 5 | 0; lv[6] = 0; lv[7] = 255; }
+    let bits = 0, n = 0, k = o + 2;
+    for (let i = 0; i < 16; i++) {
+      if (n < 3) { bits |= s[k++] << n; n += 8; }
+      dst[i] = lv[bits & 7]; bits >>= 3; n -= 3;
+    }
+  };
+  for (let by = 0; by < h; by += 4) {
+    for (let bx = 0; bx < w; bx += 4) {
+      const o = (by >> 2) * srcRow + (bx >> 2) * blockBytes;
+      if (o + blockBytes > src.length) continue;
+      let colorAt = -1;
+      if (bc4) ramp(src, o, red);
+      else if (bc5) { ramp(src, o, red); ramp(src, o + 8, green); }
+      else if (bc1) colorAt = o;
+      else {
+        colorAt = o + 8;
+        if (bc2) for (let i = 0; i < 16; i++) alpha[i] = ((src[o + (i >> 1)] >> ((i & 1) * 4)) & 15) * 17;
+        else ramp(src, o, alpha);
+      }
+      let idx = 0;
+      if (colorAt >= 0) {
+        const c0 = src[colorAt] | (src[colorAt + 1] << 8), c1 = src[colorAt + 2] | (src[colorAt + 3] << 8);
+        const r0 = (c0 >> 11) * 255 / 31 | 0, g0 = ((c0 >> 5) & 63) * 255 / 63 | 0, b0 = (c0 & 31) * 255 / 31 | 0;
+        const r1 = (c1 >> 11) * 255 / 31 | 0, g1 = ((c1 >> 5) & 63) * 255 / 63 | 0, b1 = (c1 & 31) * 255 / 31 | 0;
+        pal[0] = b0; pal[1] = g0; pal[2] = r0; pal[3] = 255;
+        pal[4] = b1; pal[5] = g1; pal[6] = r1; pal[7] = 255;
+        if (!bc1 || c0 > c1) {
+          pal[8] = (2 * b0 + b1) / 3 | 0; pal[9] = (2 * g0 + g1) / 3 | 0; pal[10] = (2 * r0 + r1) / 3 | 0; pal[11] = 255;
+          pal[12] = (b0 + 2 * b1) / 3 | 0; pal[13] = (g0 + 2 * g1) / 3 | 0; pal[14] = (r0 + 2 * r1) / 3 | 0; pal[15] = 255;
+        } else {
+          pal[8] = (b0 + b1) >> 1; pal[9] = (g0 + g1) >> 1; pal[10] = (r0 + r1) >> 1; pal[11] = 255;
+          pal[12] = pal[13] = pal[14] = pal[15] = 0;         // BC1 three-colour mode: transparent black
+        }
+        idx = src[colorAt + 4] | (src[colorAt + 5] << 8) | (src[colorAt + 6] << 16) | (src[colorAt + 7] << 24);
+      }
+      for (let py = 0; py < 4 && by + py < h; py++) {
+        for (let px = 0; px < 4 && bx + px < w; px++) {
+          const i = py * 4 + px, d = ((by + py) * w + bx + px) * 4;
+          if (colorAt >= 0) {
+            const c = ((idx >>> (i * 2)) & 3) * 4;
+            out[d] = pal[c]; out[d + 1] = pal[c + 1]; out[d + 2] = pal[c + 2];
+            out[d + 3] = bc1 ? pal[c + 3] : alpha[i];
+          } else {
+            out[d] = 0; out[d + 1] = bc5 ? green[i] : 0; out[d + 2] = red[i]; out[d + 3] = 255;
+          }
+        }
+      }
+    }
+  }
+  return out;
+}
+
 // D3DDECLTYPE -> vertex format, byte size, shader base type
 const DECL_TYPES = [
   ['float32', 4, 'f32'], ['float32x2', 8, 'f32'], ['float32x3', 12, 'f32'], ['float32x4', 16, 'f32'],
@@ -195,6 +261,8 @@ function convertExpr(x, from, to) {
 export class Renderer {
   constructor(device, canvas, opts = {}) {
     this.dev = device;
+    // BC (DXT) textures stay compressed on the GPU when it can sample them; otherwise they are decoded to BGRA8
+    this.bc = device.features.has('texture-compression-bc');
     this.canvas = canvas;
     this.ctx = canvas.getContext('webgpu');
     this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
@@ -310,6 +378,7 @@ export class Renderer {
     const info = formatInfo(fmt);
     const isDepth = info.depth || kind === 4;
     let gpuFormat = isDepth ? 'depth24plus-stencil8' : info.gpu;
+    if (info.block && !this.bc) gpuFormat = 'bgra8unorm';     // no BC support (phones): decoded on upload
     if (info.block && ((w & 3) || (h & 3))) { gpuFormat = 'bgra8unorm'; info.badBlock = true; }
     if ((kind === 3 || (usage & 1)) && (info.block || info.conv && info.conv !== 'xrgb')) gpuFormat = 'bgra8unorm';
     let u = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST | GPUTextureUsage.COPY_SRC;
@@ -349,7 +418,12 @@ export class Renderer {
       // physical size of a small mip may exceed the level: WebGPU accepts the block-rounded extent
       if (x + cw > ((lw + 3) & ~3) || y + ch > ((lh + 3) & ~3)) return;
     } else if (info.block) {
-      return;                                     // non-multiple-of-4 compressed texture: left black (rare)
+      // kept as BGRA8 (no BC support, a render target, or not a multiple of 4): decode on the CPU, cropped to the level
+      if (t.kind === 2) return;                   // compressed volume textures: not used by the game
+      cw = Math.min(ww, lw - x); ch = Math.min(hh, lh - y);
+      if (cw <= 0 || ch <= 0) return;
+      src = decodeBlocks(t.fmt >>> 0, data, cw, ch, rowBytes);
+      bpr = cw * 4;
     } else if (info.conv) {
       const slices = t.kind === 2 ? rows / hh : 1;
       if (slices !== 1) return;
@@ -359,7 +433,7 @@ export class Renderer {
     const depthOrLayers = t.kind === 2 ? Math.max(1, t.depth >> level) : 1;
     try {
       this.dev.queue.writeTexture({ texture: t.gpu, mipLevel: level, origin: [x, y, t.kind === 1 ? face : 0] }, src,
-        { bytesPerRow: bpr, rowsPerImage: info.block ? ch / 4 : ch }, [cw, ch, depthOrLayers]);
+        { bytesPerRow: bpr, rowsPerImage: info.block && t.gpuFormat.startsWith('bc') ? ch / 4 : ch }, [cw, ch, depthOrLayers]);
     } catch (e) {
       this.warn('upload: ' + e.message);
     }
@@ -1070,7 +1144,9 @@ export async function createDevice() {
   const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
   if (!adapter) throw new Error('no WebGPU adapter');
   const want = ['texture-compression-bc', 'float32-filterable', 'depth-clip-control'];
-  const requiredFeatures = want.filter((f) => adapter.features.has(f));
+  // ?nobc tests the path phones take: no BC texture support, so DXT textures are decoded on the CPU
+  const noBc = typeof location !== 'undefined' && new URLSearchParams(location.search).has('nobc');
+  const requiredFeatures = want.filter((f) => adapter.features.has(f) && !(noBc && f === 'texture-compression-bc'));
   const device = await adapter.requestDevice({ requiredFeatures, requiredLimits: {
     maxBindGroups: Math.min(4, adapter.limits.maxBindGroups),
     maxSampledTexturesPerShaderStage: adapter.limits.maxSampledTexturesPerShaderStage,
