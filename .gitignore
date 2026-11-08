@@ -14,3 +14,6 @@ local/
 *.dds
 __pycache__/
 node_modules/
+
+# Local agent and editor settings
+.claude/

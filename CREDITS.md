@@ -32,8 +32,7 @@ New Vegas written in Rust (GPL-3.0-or-later). We studied it and took two ideas f
 - running the game's threads as deterministic coroutines;
 - modelling Direct3D 9 as a complete state machine, separate from any real graphics API.
 
-No nv-rs code was copied, so its licence does not apply to this project. The evaluation is in
-`docs/NVRS_EVALUATION.md`.
+No nv-rs code was copied, so its licence does not apply to this project.
 
 ## Tools and libraries
 

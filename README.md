@@ -11,7 +11,7 @@ The browser build plays New Game through character creation into Doc Mitchell's 
 - About 45-60 fps in the heavy interior and about 95 fps in menus.
 - DLC is off by default.
 
-See `docs/RECOMP.md` for the design and `PROGRESS.md` 
+See `docs/RECOMP.md` for the design.
 
 ## Credits
 
@@ -31,7 +31,7 @@ files. The full list is in [CREDITS.md](CREDITS.md), and the site shows it at `/
 | `Claude fnv\` | This repository. |
 | `Fallout New Vegas\` | The player's install. **Read-only: never modify it.** The tools read the exe and Data from here. |
 | `fnv_decomp-main-updated\` | The community decompilation, used as the reference for names and understanding (`@fnv 0xADDR` annotations). Tools find it through `tools/decomp_path.py` (`FNV_DECOMP` overrides it). |
-| `nv-rs-main\` | Another project (GPL-3.0). It was the source of two design ideas, and no code was copied. See `docs/PHASE2_PLAN.md` and `docs/NVRS_EVALUATION.md`. |
+| `nv-rs-main\` | Another project (GPL-3.0). It was the source of two design ideas, and no code was copied. |
 
 
 ## Build and run the browser version
@@ -54,8 +54,7 @@ python -B tools/recomp_build_web.py --target browser # -O2, ~3 min cold -> out/r
 shaders (`out/shaders`, `out/shader_manifest`) come from the pipeline in `docs/SHADERS.md`. All of these already
 exist, so you only rerun a step when its inputs change.
 
-**Run:** start the server in development mode (launch config `recomp` in `.claude/launch.json`, or
-`node server/serve.mjs --dev --game "E:/Games/Fallout New Vegas"`) and open `http://localhost:8093/`. `--dlc` turns
+**Run:** start the server in development mode (`node server/serve.mjs --dev --game "E:/Games/Fallout New Vegas"`) and open `http://localhost:8093/`. `--dlc` turns
 the DLC on.
 
 Before the game loads, the page asks how to start. `?start=normal` or `?start=quick` in the address skips the
@@ -82,8 +81,8 @@ question.
   or read the lifted body in `out/recomp/recomp_NN.cpp` (`f_XXXXXXXX`).
 
 **On a server:** `python -B tools/recomp_bundle.py` makes `out/dist/`, which `node server/serve.mjs --dist out/dist ...`
-serves. HTTPS, a reverse proxy, systemd and the measured network behaviour are in `server/README.md`. The launch
-configs `recomp-remote` (40 ms added to each file request) and `recomp-dist` (the bundle) test both here.
+serves. HTTPS, a reverse proxy, systemd and the measured network behaviour are in `server/README.md`. `--delay 40`
+(40 ms added to each file request) and `--dist out/dist` test both locally.
 
 **Native host:** `bash tools/recomp_cycle.sh [seconds]` recompiles, builds `out/recomp/fnv_recomp.exe` and runs it
 headless. The log goes to `out/recomp/run.log`.
@@ -105,12 +104,6 @@ headless. The log goes to `out/recomp/run.log`.
 
 ## Documents
 
-Current:
 - `docs/RECOMP.md`: the recompiler's design, milestones and performance notes.
 - `docs/SHADERS.md`: the shader translation pipeline.
-- `docs/DECOMP_UPDATE.md`: how the decomp update was handled, and its checklist.
-- `PROGRESS.md`: the full dated log. Read the last few entries before starting.
-
-Historical, kept for context: `docs/PHASE2_PLAN.md`, `docs/NVRS_EVALUATION.md`, and `docs/history/` (the Phase 0
-report, the original roadmap, and the 2026-11-03 handoff). These describe the relink path that preceded the
-recompiler.
+- `server/README.md`: serving the build, locally or on a server.

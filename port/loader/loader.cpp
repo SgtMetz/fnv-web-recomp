@@ -1957,7 +1957,7 @@ static void* WINAPI wrap_Direct3DCreate9(UINT sdk)
     return d3d;
 }
 
-// ---- FNV_THREAD_HOST=1: game threads run one at a time (docs/PHASE2_PLAN.md, idea from nv-rs's thread host) ----
+// ---- FNV_THREAD_HOST=1: game threads run one at a time (idea from nv-rs's thread host) ----
 // Every thread the game creates and the main thread hold a baton while running game code. The baton is a fair
 // ticket lock (arrival order). Switch points are the blocking calls: waits with a timeout, Sleep (also Sleep(0),
 // the game's spin-lock yield), a contended EnterCriticalSection, thread exit. The real kernel objects keep their

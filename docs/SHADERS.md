@@ -2,9 +2,8 @@
 
 **Author:** Claude Sonnet 5.5, 2026-11-03. Read this before touching the renderer's shader path or the vkd3d patches.
 
-Status: done, committed as `575e838` in `E:\Games\Claude fnv`. 15,791 / 15,791 shaders translate (all 16 `.sdp`
+Status: done, committed as `575e838`. 15,791 / 15,791 shaders translate (all 16 `.sdp`
 packages, 100% each; package 013 = 1,007/1,007). Baseline was 96.8%. No failures remain.
-Short version is also in `PROGRESS.md`.
 
 ## Pipeline
 `.sdp` (in `E:\Games\Fallout New Vegas\Data\Shaders\`) -> `tools/shader_spike.py` unpacks to `out/shaders/<pkg>/*.dxbc`
@@ -57,7 +56,7 @@ register: oT4 -> location 4, colors 8+) without parsing WGSL. All 15,791 entries
   the D3D9 default diffuse (1,1,1,1) at location 8 when the VS does not write oD0; outputs are a struct `tint_symbol_1`.
   Locations come from D3D register numbers (colors offset 8; interpolators keep their register index).
 - vFace arrives as `@builtin(front_facing)` bool, converted to +/-1 float in the body.
-- Package choice: the port should report NVIDIA SM3 + FP16 caps so the game selects package 013 (see history/PHASE0_REPORT.md).
+- Package choice: the port should report NVIDIA SM3 + FP16 caps so the game selects package 013.
 
 ## Browser compile check (done)
 `spikes/wgsl_check/` (launch config `wgsl-check`, port 8660) fetches every `out/shaders/*/*.wgsl.gen` from a local-only

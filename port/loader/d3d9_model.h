@@ -1,4 +1,4 @@
-// Direct3D 9 model (Phase 2, docs/PHASE2_PLAN.md section 2). FNV_D3D9_MODEL=1 hands the game our own
+// Direct3D 9 model (Phase 2). FNV_D3D9_MODEL=1 hands the game our own
 // IDirect3D9 / IDirect3DDevice9 (generated forwarding classes in d3d9_model_gen.h) instead of the runtime's. The
 // model keeps the device state the game sets in its own structure (render states, samplers, textures, shaders,
 // shader constants, streams, targets, viewport, scissor) and counts each frame's work; for now every call is also

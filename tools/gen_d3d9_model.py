@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Generate port/loader/d3d9_model_gen.h: forwarding classes for IDirect3D9 and IDirect3DDevice9 (Phase 2, the
-Direct3D 9 model; docs/PHASE2_PLAN.md section 2).
+Direct3D 9 model).
 
 The model is our own implementation of the interfaces the game calls. This first layer forwards every method to the
 real d3d9.dll object and gives each state-changing method a recording hook (`model_<Method>` in

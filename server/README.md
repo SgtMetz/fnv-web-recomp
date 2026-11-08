@@ -136,7 +136,7 @@ Two knobs to tune:
 
 ## Testing locally
 
-The launch configurations in `.claude/launch.json` (each one is `node server/serve.mjs` with these options):
+Three ways to run `node server/serve.mjs` here:
 
 | Name | Options | Port |
 | --- | --- | --- |

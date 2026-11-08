@@ -2,7 +2,7 @@
 
 Author: Claude Opus 5.5. The user chose to build the browser version by lifting the whole original executable,
 rather than compiling decomp C++ to WebAssembly. clang has no Microsoft C++ ABI on wasm, so decomp objects could not
-share vtables and layouts with the game's data (see PROGRESS.md, 2026-11-07). The decomp stays the reference for names,
+share vtables and layouts with the game's data. The decomp stays the reference for names,
 understanding and debugging.
 
 ## Model
@@ -45,7 +45,7 @@ understanding and debugging.
    the player's exe, installs host imports that call real Win32 directly (guest pointers are host pointers here),
    and runs the original entry point `mainCRTStartup`, so the original CRT start-up runs too. Exit: main menu.
 2. **Emscripten build of the same code, headless in node.** Host imports are the browser `pal_win32` (files through
-   the OPFS layer in `web/`). Exit (ROADMAP Phase 3): load `FalloutNV.esm`, `coc GSDocMitchellHouse`, tick for
+   the OPFS layer in `web/`). Exit: load `FalloutNV.esm`, `coc GSDocMitchellHouse`, tick for
    60 s, exit cleanly.
 3. **Browser.** The game in a worker (PROXY_TO_PTHREAD), files from the local dev server (`server/serve.mjs`,
    `pal_fs_web.cpp`), the D3D9 model sending a command ring that `web/recomp/renderer.js` draws with WebGPU and the
