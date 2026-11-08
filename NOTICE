@@ -1,0 +1,14 @@
+Scope of the MIT licence in LICENSE
+
+This licence covers only the original work of this project's contributors: the
+recompiler, the platform layer, the web runtime, the tools, the server and the
+documentation.
+
+It grants no rights in Fallout: New Vegas, its program (FalloutNV.exe), its data
+files, or anything generated from them (for example the lifted sources in out/).
+Those belong to their owners, and none of them are in this repository.
+
+Names, types and layouts that come from fnv_decomp
+(https://github.com/momusdigital/fnv_decomp) are used with its authors'
+permission and are not relicensed here. Third-party tools and libraries keep
+their own licences.
