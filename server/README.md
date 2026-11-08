@@ -22,6 +22,7 @@ The server prints a warning whenever it listens beyond localhost.
 ```bash
 python -B tools/recomp.py --exe "E:/Games/Fallout New Vegas/FalloutNV.exe" --shards 64   # only after recompiler changes
 python -B tools/recomp_build_web.py --target browser
+python -B tools/mobile_archives.py                     # optional: the phone version's archives -> out/mobile (about 30 s)
 python -B tools/recomp_bundle.py                       # -> out/dist (about 30 s)
 ```
 
@@ -33,6 +34,18 @@ python -B tools/recomp_bundle.py                       # -> out/dist (about 30 s
 - `VERSION.json`: the commit, build time and wasm SHA-256.
 
 It is derived data, so it is git-ignored. Copy it to the server with rsync or scp, never through git.
+
+## The phone version
+
+The page picks it on a phone or tablet; `?mobile=1` or `?mobile=0` overrides that. It sets `FNV_ARCHIVES=mobile`,
+and the file layer then reads `Data/mobile/<name>.bsa` instead of `Data/<name>.bsa` where the server has one.
+`tools/mobile_archives.py` makes those:
+- the two texture archives keep only the mip levels up to 256 pixels (128 for normal maps and distant terrain):
+  329 MB instead of 2.16 GB, and about a sixth of the GPU memory. Menus and fonts keep their full textures.
+- the sound archive has its 32–48 kHz WAVs at half the rate: 532 MB instead of 851 MB.
+
+It is blurrier and sounds duller, but it downloads less and fits in a phone's memory more easily. The wasm is the same
+one: a size-optimised build (`-Oz`) came out larger (175 MB against 95), and binaryen's `-Os` saved only 5%.
 
 ## Run it (on the server)
 
@@ -55,6 +68,7 @@ node server/serve.mjs --dist /srv/fnv/dist --game "/srv/fnv/Fallout New Vegas" -
 | `--host`, `--port` | bind address, by default `127.0.0.1:8093`. Keep the loopback address behind a reverse proxy. |
 | `--tls-cert`, `--tls-key` | serve HTTPS directly (PEM files) |
 | `--dlc` | load the DLC. It is off by default because the game enables any plugin with a `Data\<name>.NAM` file. |
+| `--mobile <dir>` | the phone version's texture archives (default `out/mobile`), served at `/game/data/mobile/` |
 | `--delay <ms>` | test only: add latency to every file request |
 
 The server also needs:

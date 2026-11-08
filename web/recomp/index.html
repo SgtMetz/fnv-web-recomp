@@ -122,6 +122,16 @@ log('WebGPU features: ' + features.join(', '));
 const env = {};
 for (const [k, v] of new URLSearchParams(location.search)) if (k.startsWith('FNV_')) env[k] = v;
 
+// the phone version, on a phone or tablet (?mobile=1 or ?mobile=0 overrides): smaller texture and sound archives
+// (tools/mobile_archives.py: textures up to 256 pixels, sounds at half rate), read in place of the full ones by
+// port/recomp/pal_fs_web.cpp where the server has them. Less to download and much less GPU memory; blurrier.
+const mobileParam = new URLSearchParams(location.search).get('mobile');
+const MOBILE = mobileParam === '1' ? true : mobileParam === '0' ? false
+  : navigator.userAgentData ? navigator.userAgentData.mobile || /Android/i.test(navigator.userAgentData.platform || '')
+  : /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
+if (MOBILE) env.FNV_ARCHIVES = 'mobile';
+log(MOBILE ? 'phone version: small textures and sounds' : 'desktop version');
+
 const t0 = performance.now();
 window.Module = {
   arguments: ['--exe', 'G:/game/FalloutNV.exe', '--docs', 'G:/docs'],
@@ -144,34 +154,39 @@ window.Module = {
 // {type: 'fnv-progress', ...}. Nothing changing for 20 s shows a note, and the log below has the details.
 const boot = window.fnvBoot = {
   phase: 'download', fraction: 0, text: 'Starting', detail: '', ready: false, failed: false, stalled: false,
-  download: { got: 0, total: 0, done: false }, runtime: false, stage: 0, kb: 0, fetches: 0, file: '',
+  download: { got: 0, total: 0, scale: 1, done: false }, runtime: false, stage: 0, kb: 0, fetches: 0, file: '',
   frames: 0, elapsed: 0, mode: 'normal',
   fail(m) { this.failed = true; this.failText = m; tickBoot(); },
 };
 const W_DOWNLOAD = 0.15, W_COMPILE = 0.05;   // shares of the bar; the game's loading gets the rest
-const DEFAULT_KB = { normal: 141000, quick: 1073000 };   // kilobytes fetched until ready, measured on the GOG 1.4.0.525 install
+// kilobytes fetched until ready, measured on the GOG 1.4.0.525 install (desktop, and the phone version's archives)
+const DEFAULT_KB = MOBILE ? { normal: 91000, quick: 358000 } : { normal: 141000, quick: 1073000 };
 const bootEl = { root: document.getElementById('boot'), phase: document.getElementById('bootPhase'),
   pct: document.getElementById('bootPct'), fill: document.getElementById('bootFill'), detail: document.getElementById('bootDetail') };
-const expectedKb = () => +localStorage.getItem('fnv.boot.kb.' + boot.mode) || DEFAULT_KB[boot.mode] || 0;
+const kbKey = () => 'fnv.boot.kb.' + boot.mode + (MOBILE ? '.mobile' : '');
+const expectedKb = () => +localStorage.getItem(kbKey()) || DEFAULT_KB[boot.mode] || 0;
 const mb = (bytes) => (bytes / 1048576).toFixed(bytes < 10485760 ? 1 : 0);
 const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const utf8 = new TextDecoder();
 let bootT0 = 0, lastChange = 0, lastSig = '', compileT0 = 0, bootTimer = 0;
 
-// count the wasm's bytes as the streaming compile reads them. A compressed response's Content-Length is the
-// compressed size, so then the uncompressed size comes from the bundle's VERSION.json (absent in development).
+// count the wasm's bytes as the streaming compile reads them, as downloaded (compressed) megabytes. When the server
+// compresses the response (Content-Encoding), the body arrives decoded: the counted bytes are scaled by the
+// compressed/uncompressed sizes in the bundle's VERSION.json (absent in development: then uncompressed MB).
 const realFetch = window.fetch.bind(window);
 window.fetch = async (input, init) => {
   const res = await realFetch(input, init);
   const url = typeof input === 'string' ? input : input.url;
   if (!/fnv_web\.wasm(\?|$)/.test(url) || !res.ok || !res.body) return res;
-  const enc = res.headers.get('content-encoding');
-  boot.download.total = !enc || enc === 'identity' ? +res.headers.get('content-length') || 0 : 0;
-  if (!boot.download.total) realFetch('/VERSION.json', { cache: 'no-store' }).then((r) => r.ok ? r.json() : null)
-    .then((v) => { if (v && v.wasm_bytes) boot.download.total = v.wasm_bytes; }).catch(() => {});
+  const enc = res.headers.get('content-encoding'), dl = boot.download;
+  if (!enc || enc === 'identity') dl.total = +res.headers.get('content-length') || 0;
+  else realFetch('/VERSION.json', { cache: 'no-store' }).then((r) => r.ok ? r.json() : null).then((v) => {
+    const full = v && v.wasm_bytes, packed = v && (enc === 'br' ? v.wasm_br_bytes : enc === 'gzip' ? v.wasm_gz_bytes : 0);
+    if (full) { dl.total = packed || full; dl.scale = packed ? packed / full : 1; }
+  }).catch(() => {});
   const count = new TransformStream({
-    transform(chunk, c) { boot.download.got += chunk.byteLength; c.enqueue(chunk); },
-    flush() { boot.download.done = true; compileT0 = performance.now(); },
+    transform(chunk, c) { dl.got += chunk.byteLength; c.enqueue(chunk); },
+    flush() { dl.done = true; compileT0 = performance.now(); },
   });
   return new Response(res.body.pipeThrough(count), { status: res.status, statusText: res.statusText, headers: res.headers });
 };
@@ -193,9 +208,10 @@ function tickBoot() {
   let frac, text, detail;
   if (!boot.runtime && !dl.done) {
     boot.phase = 'download';
-    frac = dl.total ? W_DOWNLOAD * Math.min(1, dl.got / dl.total) : 0;
+    const got = dl.got * dl.scale;
+    frac = dl.total ? W_DOWNLOAD * Math.min(1, got / dl.total) : 0;
     text = 'Downloading the game';
-    detail = dl.total ? `${mb(dl.got)} / ${mb(dl.total)} MB` : dl.got ? `${mb(dl.got)} MB` : 'Connecting';
+    detail = dl.total ? `${mb(got)} / ${mb(dl.total)} MB downloaded` : dl.got ? `${mb(got)} MB downloaded` : 'Connecting';
   } else if (!boot.stage) {
     boot.phase = 'compile';
     const s = compileT0 ? (now - compileT0) / 1000 : 0;
@@ -210,11 +226,13 @@ function tickBoot() {
     text = boot.stage >= 3 ? (boot.mode === 'quick' ? 'Going outside' : 'Loading the world')
       : boot.stage >= 2 ? "Starting a new game in Doc Mitchell's house"
       : 'Loading game data';
-    detail = `${mb(boot.kb * 1024)} MB read` + (boot.file ? ` · ${boot.file}` : '') + (boot.frames ? ` · ${boot.frames} frames` : '');
+    // game data: what the file layer has fetched, out of what this start needed last time on this browser (or the
+    // default); the total grows with the count when a start needs more than that
+    detail = `${mb(boot.kb * 1024)} / ${mb(Math.max(want, boot.kb) * 1024)} MB downloaded` + (boot.file ? ` · ${boot.file}` : '');
   }
   if (boot.stage >= readyStage && !boot.ready) {
     boot.ready = true;
-    if (boot.kb) localStorage.setItem('fnv.boot.kb.' + boot.mode, String(boot.kb));
+    if (boot.kb) localStorage.setItem(kbKey(), String(boot.kb));
     log(`ready in ${boot.elapsed.toFixed(1)} s (${boot.mode}): ${boot.kb} KB in ${boot.fetches} fetches`);
   }
   if (boot.ready) { frac = 1; text = 'Ready'; }

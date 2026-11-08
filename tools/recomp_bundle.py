@@ -102,6 +102,9 @@ def main():
         'built': time.strftime('%Y-%m-%dT%H:%M:%S'),
         'wasm_sha256': hashlib.sha256(wasm.read_bytes()).hexdigest(),
         'wasm_bytes': wasm.stat().st_size,
+        # what the page counts as downloaded when the server compresses the wasm (web/recomp/index.html)
+        'wasm_br_bytes': Path(str(wasm) + '.br').stat().st_size if Path(str(wasm) + '.br').exists() else None,
+        'wasm_gz_bytes': Path(str(wasm) + '.gz').stat().st_size,
         'shaders': len(seen),
     }
     (out / 'VERSION.json').write_text(json.dumps(version, indent=2) + '\n', encoding='utf-8')

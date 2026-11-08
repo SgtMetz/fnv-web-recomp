@@ -3,8 +3,8 @@
 // My Games\FalloutNV, writable). Built to stay usable with network latency:
 //   - stat and list under /game come from one index of the install (/fs/index, fetched once per thread), not one
 //     request each (start-up makes thousands);
-//   - reads go in 1 MB blocks through one block cache for all threads (in wasm memory): a block another thread is
-//     already fetching is waited for, not fetched again;
+//   - reads go in 1 MB blocks (256 KB in the phone version) through one block cache for all threads (in wasm
+//     memory): a block another thread is already fetching is waited for, not fetched again;
 //   - a read of an install file names the file's mtime (v=), so the browser's HTTP cache keeps it across sessions.
 #include "pal.h"
 #include "pal_fs.h"
@@ -24,7 +24,10 @@
 
 // one synchronous request, retried: a dropped connection must not kill the game thread that asked. Defined once per
 // worker (fs_init below).
-EM_JS(void, js_fs_init, (), {
+EM_JS(void, js_fs_init, (int mobile), {
+    // the phone version (FNV_ARCHIVES=mobile, web/recomp/index.html): /game/data/<name>.bsa is read from
+    // /game/data/mobile/<name>.bsa when the index has one (tools/mobile_archives.py: smaller textures and sounds)
+    globalThis.fnvMobile = !!mobile;
     globalThis.fnvXhr = function (method, url, body, binary) {
         for (var attempt = 0; attempt < 20; attempt++) {
             try {
@@ -56,6 +59,8 @@ EM_JS(void, js_fs_init, (), {
         if (k != '/game' && k.indexOf('/game/') != 0) return null;
         var ix = fnvGameIndex();
         if (!ix) return null;
+        if (fnvMobile && k.indexOf('/game/data/') == 0 && k.lastIndexOf('/') == 10 && k.substring(k.length - 4) == '.bsa'
+            && ix.f['/game/data/mobile/' + k.substring(11)]) return { file: ix.f['/game/data/mobile/' + k.substring(11)], path: '/game/data/mobile/' + k.substring(11) };
         if (ix.f[k]) return { file: ix.f[k] };
         if (ix.d[k]) return { dir: ix.d[k] };
         return { missing: true };
@@ -89,6 +94,7 @@ EM_JS(int, js_fs_fetch, (const char* path, double off, int len, uint8_t* dst), {
     var p = UTF8ToString(path);
     var hit = fnvGameLookup(p);
     var ver = hit && hit.file ? '&v=' + hit.file[1] : '';
+    if (hit && hit.path) p = hit.path;
     var x = fnvXhr('GET', '/fs/read?p=' + encodeURIComponent(p) + '&o=' + off + '&n=' + len + ver, null, true);
     if (x.status != 200) return -1;
     var data = new Uint8Array(x.response);
@@ -137,9 +143,16 @@ std::string g_cwd = "/game";
 
 // Windows path as the game writes it -> server path ("/game/...", "/docs/...")
 thread_local bool t_init;
+// the phone version (FNV_ARCHIVES=mobile): smaller archives, and smaller blocks (below), so the scattered small reads
+// of start-up fetch less that nobody asked for
+bool fs_mobile()
+{
+    static const bool m = [] { const char* a = getenv("FNV_ARCHIVES"); return a && !strcmp(a, "mobile"); }();
+    return m;
+}
 void fs_init()
 {
-    if (!t_init) { js_fs_init(); t_init = true; }
+    if (!t_init) { js_fs_init(fs_mobile()); t_init = true; }
 }
 
 std::string norm(const char* p)
@@ -173,7 +186,8 @@ std::string norm(const char* p)
 
 // ---- the shared block cache ------------------------------------------------------------------------------------
 namespace {
-constexpr int64_t kBlock = 1 << 20;
+// 1 MB, or 256 KB in the phone version
+int64_t block_size() { static const int64_t b = fs_mobile() ? 256 << 10 : 1 << 20; return b; }
 constexpr size_t kCacheMax = 256u << 20, kCacheLow = 192u << 20;
 struct Block { std::vector<uint8_t> data; bool ready = false, failed = false; uint64_t used = 0; };
 std::mutex g_bc_mx;
@@ -233,7 +247,7 @@ std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size
     auto b = std::make_shared<Block>();
     g_blocks[key] = b;
     lk.unlock();
-    int64_t want = std::min(kBlock, size - blk * kBlock);
+    int64_t want = std::min(block_size(), size - blk * block_size());
     b->data.resize((size_t)want);
     {
         // start-up progress: name the file before the fetch, so a slow one shows what is loading
@@ -241,7 +255,7 @@ std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size
         memcpy(g_pal_boot.file, path.data(), n);
         g_pal_boot.file[n] = 0;
     }
-    int got = js_fs_fetch(path.c_str(), (double)(blk * kBlock), (int)want, b->data.data());
+    int got = js_fs_fetch(path.c_str(), (double)(blk * block_size()), (int)want, b->data.data());
     lk.lock();
     auto it = g_blocks.find(key);
     bool listed = it != g_blocks.end() && it->second == b;
@@ -300,10 +314,10 @@ size_t pal_fs_read(void* buf, size_t n, PalFile* f)
     size_t done = 0;
     while (done < n && f->pos < f->size)
     {
-        int64_t blk = f->pos / kBlock;
+        int64_t blk = f->pos / block_size();
         std::shared_ptr<Block> b = bc_get(f->path, blk, f->size);
         if (!b) break;
-        int64_t start = f->pos - blk * kBlock;
+        int64_t start = f->pos - blk * block_size();
         int64_t k = std::min<int64_t>((int64_t)(n - done), (int64_t)b->data.size() - start);
         if (k <= 0) break;
         memcpy((uint8_t*)buf + done, b->data.data() + start, (size_t)k);

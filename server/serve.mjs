@@ -21,6 +21,7 @@
 //   --dist <dir>           bundle to serve (deployment)
 //   --game <dir>           the game install (default E:/Games/Fallout New Vegas, or FNV_GAME)
 //   --data <dir>           the writable My Games copy (default out/fnv_docs)
+//   --mobile <dir>         the phone version's archives (default out/mobile, tools/mobile_archives.py)
 //   --host <addr>          bind address (default 127.0.0.1; 0.0.0.0 exposes the server: see server/README.md)
 //   --port <n>             port (default 8093)
 //   --tls-cert/--tls-key   serve HTTPS directly (otherwise put a TLS reverse proxy in front for remote use)
@@ -48,6 +49,7 @@ const HOST = opt('--host', '127.0.0.1');
 const PORT = +opt('--port', 8093);
 const DLC = args.includes('--dlc') || process.env.FNV_DLC === '1';
 const DELAY = +opt('--delay', 0);
+const MOBILE = path.resolve(opt('--mobile', path.join(ROOT, 'out/mobile')));
 const TLS = opt('--tls-cert') && opt('--tls-key') ? { cert: fs.readFileSync(opt('--tls-cert')), key: fs.readFileSync(opt('--tls-key')) } : null;
 if (!DEV && !DIST) {
   console.error('usage: node server/serve.mjs --dev | --dist <bundle> [--game <install>] [--data <dir>] [--host a] [--port n]');
@@ -77,6 +79,9 @@ function indexGame(dir, key) {
   gameDirs.set(key, names);
 }
 indexGame(GAME, '/game');
+// the phone version's smaller texture and sound archives (tools/mobile_archives.py), at /game/data/mobile; not in the
+// /game/data listing, so only the file layer's FNV_ARCHIVES=mobile remap (port/recomp/pal_fs_web.cpp) reads them
+if (fs.existsSync(MOBILE)) { indexGame(MOBILE, '/game/data/mobile'); gameDirs.delete('/game/data/mobile'); }
 const gameIndexJson = JSON.stringify({
   f: Object.fromEntries([...gameFiles].map(([k, v]) => [k, [v.size, v.mtime]])),
   d: Object.fromEntries(gameDirs),

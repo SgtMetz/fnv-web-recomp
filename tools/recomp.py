@@ -336,7 +336,9 @@ class Recompiler(ls.Lifter):
             head += ['void f_%08x(FnvCpu& s);' % a for a in funcs]
             tail = ['', 'static const uint32_t kAddrs[] = {%s};' % ', '.join('0x%08xu' % a for a in funcs),
                     'static const FnvFn kFns[] = {%s};' % ', '.join('f_%08x' % a for a in funcs),
-                    'static struct Reg { Reg() { fnv_register_functions(kAddrs, kFns, %d); } } reg_;' % len(funcs)]
+                    '// in an anonymous namespace: one Reg type per shard. A global `struct Reg` would be the same type in all 64,',
+                    '// with an inline constructor each, and an -Oz build keeps one copy: every shard registered shard 0.',
+                    'namespace { struct Reg { Reg() { fnv_register_functions(kAddrs, kFns, %d); } } reg_; }' % len(funcs)]
             out.append('\n'.join(head) + '\n' + body + '\n' + '\n'.join(tail) + '\n')
         return out
 
