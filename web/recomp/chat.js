@@ -15,8 +15,9 @@
 // ({type: 'auth', pin} -> {type: 'auth', ok}); the PIN is never in this page. Once it is accepted, this browser keeps it
 // (fnv.chat.pin) to unlock the name again on the next connection. The owner's messages (owner: true) get a crown.
 //
-// Translation: every message goes out with its language (the browser's LanguageDetector when it is sure, else the
-// sender's browser language). Each reader sees messages in their own language: the browser's language by default, or
+// Translation: a message goes out with its language only when the browser's LanguageDetector is sure of it (a
+// browser set to English says nothing about what its player types); otherwise the reader's translator detects it.
+// A tag that cannot be right (a Latin-script language on Cyrillic, CJK, ... text) is ignored. Each reader sees messages in their own language: the browser's language by default, or
 // the one picked next to the Translate switch (fnv.chat.translate, fnv.chat.lang). Each reader's own browser does
 // the translating, so there is no shared daily limit: Chrome's on-device Translator API where it is ready, else
 // Google's free web translator (translate.googleapis.com, client=gtx: no key; it detects the language itself, and
@@ -181,9 +182,13 @@
 
     // a message is translated unless it is already in the reader's language; a message with no language (older ones)
     // goes to the web translator, which says what it was
+    const LATIN = new Set(['cs', 'da', 'de', 'en', 'es', 'fi', 'fr', 'hr', 'hu', 'id', 'it', 'ms', 'nl', 'no', 'pl', 'pt', 'ro', 'sk', 'sv', 'sw', 'tl', 'tr', 'vi']);
+    const OTHER_SCRIPT = /[\p{Script=Cyrillic}\p{Script=Greek}\p{Script=Arabic}\p{Script=Hebrew}\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}\p{Script=Thai}\p{Script=Devanagari}\p{Script=Bengali}]/u;
+    const srcOf = (m) => m.lang && !(LATIN.has(m.lang) && OTHER_SCRIPT.test(m.text)) ? m.lang : '';
+    let trFailed = 0, trWarned = false;
     function render(r) {
       const m = r.m, key = m.id + '|' + lang;
-      const want = trOn && m.lang !== lang;
+      const want = trOn && srcOf(m) !== lang;
       let tr = want ? tcache.get(key) : null;
       if (want && tr === undefined && m.tr && m.tr[lang]) tr = { text: m.tr[lang], from: m.lang };
       if (want && tr === undefined) translate(r, key);
@@ -201,12 +206,14 @@
     async function translate(r, key) {
       if (tpending.has(key)) return;
       tpending.add(key);
-      const to = lang, src = r.m.lang;
+      const to = lang, src = srcOf(r.m);
       let out = null;
       if (src) { const s = await onDevice(src, to, r.m.text); if (s) out = { text: s, from: src }; }
       if (!out) out = await viaWeb(src, to, r.m.text);
       if (!out && src) { const s = await viaServer(r.m.id, to); if (s) out = { text: s, from: src }; }
       tcache.set(key, out && out.from !== to ? out : null);
+      // nothing could translate it (an extension blocking translate.googleapis.com, say): say so once
+      if (!out && ++trFailed >= 3 && !trWarned) { trWarned = true; note('Some messages could not be translated: something in this browser may be blocking translate.googleapis.com.', true); }
       tpending.delete(key);
       if (to === lang) render(r);
     }
@@ -266,7 +273,7 @@
           }
         }
       } catch { detector = null; }
-      return browserLang;
+      return '';
     }
 
     // ---- messages -----------------------------------------------------------------------------------------------------
