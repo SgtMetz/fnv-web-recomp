@@ -30,6 +30,7 @@
 
   const CSS = `
   #chat { margin: 14px 0 20px; border: 1px solid #3a3528; background: #14130f; border-radius: 6px; display: flex; flex-direction: column; }
+  #chat.collapsed > :not(.head) { display: none; }
   #chat .head { display: flex; gap: 10px; align-items: baseline; padding: 8px 12px; border-bottom: 1px solid #2a271f; }
   #chat .head h2 { margin: 0; font-size: 14px; font-weight: 600; color: var(--accent, #e0a040); }
   #chat .head .online { color: var(--dim, #8a8478); }
@@ -79,7 +80,8 @@
     <div class="head"><h2>Chat</h2><span class="online" id="chatOnline">connecting…</span>
       <span class="tr"><label title="Show other players' messages in your language"><input type="checkbox" id="chatTr"> Translate to</label>
         <select id="chatLang" aria-label="Translate into"></select></span>
-      <span class="me">You are <button type="button" id="chatMe" title="Change your name"></button></span></div>
+      <span class="me">You are <button type="button" id="chatMe" title="Change your name"></button></span>
+      <button type="button" id="chatToggle" aria-expanded="true" aria-controls="chatMsgs">Hide chat</button></div>
     <div class="namebox" id="chatNameBox">
       <label for="chatName">Pick a name, or chat as Anonymous:</label>
       <input id="chatName" maxlength="${NAME_MAX}" placeholder="Anonymous" autocomplete="nickname" spellcheck="false">
@@ -108,6 +110,18 @@
     style.textContent = CSS;
     document.head.appendChild(style);
     anchor.innerHTML = HTML;
+    const chatToggle = document.getElementById('chatToggle');
+    const setCollapsed = (collapsed) => {
+      anchor.classList.toggle('collapsed', collapsed);
+      chatToggle.textContent = collapsed ? 'Show chat' : 'Hide chat';
+      chatToggle.setAttribute('aria-expanded', String(!collapsed));
+      chatToggle.setAttribute('aria-label', collapsed ? 'Show chat' : 'Hide chat');
+      try { localStorage.setItem('fnv.chat.collapsed', collapsed ? '1' : '0'); } catch { /* private mode */ }
+    };
+    let collapsed = false;
+    try { collapsed = localStorage.getItem('fnv.chat.collapsed') === '1'; } catch { /* private mode */ }
+    setCollapsed(collapsed);
+    chatToggle.addEventListener('click', () => setCollapsed(!anchor.classList.contains('collapsed')));
     const $ = (id) => document.getElementById(id);
     const msgs = $('chatMsgs'), online = $('chatOnline'), me = $('chatMe'), nameBox = $('chatNameBox'), nameIn = $('chatName');
     const form = $('chatForm'), textIn = $('chatText'), sendBtn = $('chatSend');
@@ -401,7 +415,10 @@
     let unread = 0, seenChat = false, inView = false;
     const jumpCount = () => { jump.innerHTML = ''; jump.append('💬 Chat'); if (unread) { const n = document.createElement('span'); n.className = 'n'; n.textContent = ` · ${unread} new`; jump.append(n); } };
     jumpCount();
-    jump.addEventListener('click', () => anchor.scrollIntoView({ behavior: 'smooth', block: 'end' }));
+    jump.addEventListener('click', () => {
+      if (anchor.classList.contains('collapsed')) setCollapsed(false);
+      anchor.scrollIntoView({ behavior: 'smooth', block: 'end' });
+    });
     const start = () => {
       if (started) return;
       started = true;
