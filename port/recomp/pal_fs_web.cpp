@@ -209,7 +209,16 @@ std::string norm(const char* p)
 namespace {
 // 1 MB, or 256 KB in the phone version
 int64_t block_size() { static const int64_t b = fs_mobile() ? 256 << 10 : 1 << 20; return b; }
-constexpr size_t kCacheMax = 256u << 20, kCacheLow = 192u << 20;
+size_t cache_max()
+{
+    static const size_t bytes = [] {
+        const char* value = getenv("FNV_FS_CACHE_MB");
+        char* end = nullptr;
+        const long mib = value ? strtol(value, &end, 10) : 0;
+        return size_t(value && end != value && !*end && mib >= 8 && mib <= 256 ? mib : 256) << 20;
+    }();
+    return bytes;
+}
 struct Block { std::vector<uint8_t> data; bool ready = false, failed = false; uint64_t used = 0; };
 std::mutex g_bc_mx;
 std::condition_variable g_bc_cv;
@@ -219,14 +228,16 @@ uint64_t g_bc_tick;
 
 void bc_evict_locked()
 {
-    if (g_bc_bytes <= kCacheMax) return;
+    const size_t max = cache_max();
+    if (g_bc_bytes <= max) return;
+    const size_t low = max * 3 / 4;
     std::vector<std::pair<uint64_t, std::string>> order;
     for (auto& kv : g_blocks)
         if (kv.second->ready) order.emplace_back(kv.second->used, kv.first);
     std::sort(order.begin(), order.end());
     for (auto& o : order)
     {
-        if (g_bc_bytes <= kCacheLow) break;
+        if (g_bc_bytes <= low) break;
         auto it = g_blocks.find(o.second);
         g_bc_bytes -= it->second->data.size();
         g_blocks.erase(it);

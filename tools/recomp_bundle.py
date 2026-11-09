@@ -48,10 +48,13 @@ def gz(path: Path):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--out', default=str(ROOT / 'out/dist'))
+    ap.add_argument('--build-dir', type=Path, default=ROOT / 'out/recomp/web_browser')
     a = ap.parse_args()
-    out = Path(a.out)
+    out = Path(a.out).resolve()
     t0 = time.time()
-    build = ROOT / 'out/recomp/web_browser'
+    build = a.build_dir.resolve()
+    if build == out or out in build.parents:
+        ap.error('--out cannot contain the build directory')
     for f in BUILD:
         if not (build / f).exists():
             sys.exit(f'missing {build / f}: build it with python -B tools/recomp_build_web.py --target browser')
