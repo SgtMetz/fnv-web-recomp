@@ -55,6 +55,7 @@ D3dRing* pal_d3d_ring();
 void pal_d3d_enable_ring(uint32_t bytes);
 
 const PalEntry* pal_d3d9_entries();    // Direct3DCreate9
+const char* pal_d3d9_adapter_name();
 const PalEntry* pal_d3dx_entries();    // pal_d3dx.cpp: the D3DX functions the game imports
 
 // for D3DX (pal_d3dx.cpp): create a texture on a device object and fill a level

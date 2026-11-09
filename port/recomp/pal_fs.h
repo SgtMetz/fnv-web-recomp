@@ -25,6 +25,7 @@ bool pal_fs_list(const char* dir, std::vector<std::string>& names);   // entry n
 bool pal_fs_mkdir(const char* path);
 bool pal_fs_remove(const char* path);
 bool pal_fs_rename(const char* from, const char* to);
+bool pal_fs_copy(const char* from, const char* to, bool fail_if_exists);
 std::string pal_fs_cwd();
 void pal_fs_chdir(const char* path);
 std::string pal_fs_resolve(const char* path);

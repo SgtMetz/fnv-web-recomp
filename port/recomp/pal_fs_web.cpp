@@ -672,6 +672,34 @@ std::string pal_fs_cwd()
     return g_cwd;
 }
 
+bool pal_fs_copy(const char* from, const char* to, bool fail_if_exists)
+{
+    const std::string source = norm(from), dest = norm(to);
+    if (!is_local(dest) || lower(source) == lower(dest)) return false;
+    PalStat st;
+    if (!pal_fs_stat(source.c_str(), &st) || st.dir || st.size > SIZE_MAX) return false;
+    PalFile* file = pal_fs_open(source.c_str(), "rb");
+    if (!file) return false;
+    auto copy = std::make_shared<LocalNode>();
+    copy->path = dest;
+    copy->mtime = now_s();
+    copy->data.resize((size_t)st.size);
+    const size_t got = st.size ? pal_fs_read(copy->data.data(), copy->data.size(), file) : 0;
+    pal_fs_close(file);
+    if (got != st.size) return false;
+
+    uint32_t remote[4];
+    const bool exists = js_fs_stat(dest.c_str(), remote);
+    std::lock_guard<std::mutex> lock(g_lc_mx);
+    const auto current = lc_find(dest);
+    if (current ? (!current->gone && (fail_if_exists || current->dir)) : (exists && (fail_if_exists || remote[0])))
+        return false;
+    g_local[lower(dest)] = copy;
+    lc_parents(dest);
+    ++g_changes;
+    return true;
+}
+
 // ---- the page's Save game and Load game buttons (web/recomp/index.html), on the browser's main thread -------------
 // every file this tab keeps, "path\tsize\tmtime\n"..., NUL-terminated: the bytes that needs (call again when > cap)
 extern "C" EMSCRIPTEN_KEEPALIVE int fnv_docs_list(char* out, int cap)

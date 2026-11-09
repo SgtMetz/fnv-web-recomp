@@ -80,6 +80,14 @@ bool pal_fs_mkdir(const char* path)
 }
 bool pal_fs_remove(const char* path) { ++g_changes; return remove(norm(path).c_str()) == 0; }
 bool pal_fs_rename(const char* from, const char* to) { ++g_changes; return rename(norm(from).c_str(), norm(to).c_str()) == 0; }
+bool pal_fs_copy(const char* from, const char* to, bool fail_if_exists)
+{
+    std::error_code ec;
+    const auto options = fail_if_exists ? fs::copy_options::none : fs::copy_options::overwrite_existing;
+    if (!fs::copy_file(norm(from), norm(to), options, ec)) return false;
+    ++g_changes;
+    return true;
+}
 std::string pal_fs_resolve(const char* path) { return norm(path); }
 void pal_fs_chdir(const char* path)
 {
