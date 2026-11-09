@@ -1,6 +1,6 @@
 // PAL user group: user32 (one main window, its class, a message queue, window procedures called on the guest), gdi32,
 // comctl32, shell32, ole32, winmm's mmio, and the libraries the browser build does without: WinSock (no network),
-// Bink (no movies yet), XInput (no pad), the Steam/Galaxy wrapper (no client), DirectShow (CoCreateInstance fails).
+// Bink (no movies yet), the Steam/Galaxy wrapper (no client), and browser XInput.
 #include "pal.h"
 #include "pal_fs.h"
 #ifdef __EMSCRIPTEN__
@@ -467,9 +467,42 @@ void b_void1(FnvCpu& s) { RET(0, 1); }
 void b_void2(FnvCpu& s) { RET(0, 2); }
 void b_BinkCopyToBufferRect(FnvCpu& s) { RET(0, 11); }
 
-// ---- XInput: no pad -------------------------------------------------------------------------------------------------
-void x_XInputGetState(FnvCpu& s) { RET(1167, 2); }          // ERROR_DEVICE_NOT_CONNECTED
-void x_XInputSetState(FnvCpu& s) { RET(1167, 2); }
+// ---- XInput: one browser gamepad, with the XINPUT_STATE layout --------------------------------------------------------
+#ifdef __EMSCRIPTEN__
+std::mutex g_gamepad_mutex;
+bool g_gamepad_connected;
+uint32_t g_gamepad_packet, g_gamepad_buttons, g_gamepad_left, g_gamepad_right;
+#endif
+
+void x_XInputGetState(FnvCpu& s)
+{
+#ifdef __EMSCRIPTEN__
+    if (A(0) == 0)
+    {
+        std::lock_guard<std::mutex> lock(g_gamepad_mutex);
+        if (g_gamepad_connected)
+        {
+            const uint32_t state = A(1);
+            if (!state) RET(87, 2); // ERROR_INVALID_PARAMETER
+            M32(state) = g_gamepad_packet;
+            M32(state + 4) = g_gamepad_buttons;
+            M32(state + 8) = g_gamepad_left;
+            M32(state + 12) = g_gamepad_right;
+            RET(0, 2);
+        }
+    }
+#endif
+    RET(1167, 2); // ERROR_DEVICE_NOT_CONNECTED
+}
+
+void x_XInputSetState(FnvCpu& s)
+{
+#ifdef __EMSCRIPTEN__
+    std::lock_guard<std::mutex> lock(g_gamepad_mutex);
+    if (A(0) == 0 && g_gamepad_connected) RET(50, 2); // ERROR_NOT_SUPPORTED (vibration)
+#endif
+    RET(1167, 2);
+}
 
 // ---- Steam API wrapper (cdecl): no client; interface getters return null ----------------------------------------
 void st_false(FnvCpu& s) { RETC(0); }
@@ -632,6 +665,20 @@ const PalEntry kUser[] = {
     {"SteamUtils", st_false}, {"D3DPERF_SetOptions", d_D3DPERF_SetOptions},
     {nullptr, nullptr}};
 } // namespace
+
+#ifdef __EMSCRIPTEN__
+extern "C" EMSCRIPTEN_KEEPALIVE void fnv_gamepad(int connected, uint32_t buttons, uint32_t left, uint32_t right)
+{
+    std::lock_guard<std::mutex> lock(g_gamepad_mutex);
+    if (g_gamepad_connected == bool(connected) && g_gamepad_buttons == buttons &&
+        g_gamepad_left == left && g_gamepad_right == right) return;
+    g_gamepad_connected = connected;
+    g_gamepad_buttons = buttons;
+    g_gamepad_left = left;
+    g_gamepad_right = right;
+    ++g_gamepad_packet;
+}
+#endif
 
 const PalEntry* pal_user_entries() { return kUser; }
 void pal_vorbis_enable_decoder() { g_ov_decoder = true; }
