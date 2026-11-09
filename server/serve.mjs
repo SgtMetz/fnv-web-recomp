@@ -48,6 +48,7 @@ const args = process.argv.slice(2);
 const opt = (name, def) => { const i = args.indexOf(name); return i >= 0 ? args[i + 1] : def; };
 const DEV = args.includes('--dev');
 const DIST = opt('--dist') ? path.resolve(opt('--dist')) : null;
+const BUILD = path.resolve(opt('--build-dir', path.join(ROOT, 'out/recomp/web_browser')));
 const GAME = path.resolve(opt('--game', process.env.FNV_GAME || 'E:/Games/Fallout New Vegas'));
 const DATA = path.resolve(opt('--data', path.join(ROOT, 'out/fnv_docs')));
 const HOST = opt('--host', '127.0.0.1');
@@ -246,7 +247,7 @@ if (DEV) {
     for (const [name, info] of Object.entries(m)) if (!devShaders.has(info.sha1)) devShaders.set(info.sha1, { pkg, name, info });
   }
 }
-const DEV_STATIC = [['/build/', path.join(ROOT, 'out/recomp/web_browser')], ['/', path.join(ROOT, 'web/recomp')]];
+const DEV_STATIC = [['/build/', BUILD], ['/', path.join(ROOT, 'web/recomp')]];
 
 async function handle(req, res) {
   // cross-origin isolation: SharedArrayBuffer (wasm threads) needs it

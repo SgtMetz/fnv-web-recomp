@@ -27,8 +27,8 @@ HEADERS = [ROOT / 'port/recomp/fnv_recomp.h', ROOT / 'port/recomp/fnv_recomp_hos
 PORT = ['fnv_recomp_rt.cpp', 'fnv_intrinsics.cpp', 'pal_kernel.cpp', 'pal_fs_std.cpp', 'pal_fs_web.cpp', 'pal_com.cpp', 'pal_user.cpp', 'pal_input.cpp', 'pal_start.cpp',
         'pal_dsound.cpp', 'pal_d3d9.cpp', 'pal_d3dx.cpp', 'pal_dshow.cpp', 'host_web.cpp']
 CFLAGS = [os.environ.get('FNV_WEB_OPT', '-O2'), '-fno-strict-aliasing', '-fwrapv', '-fno-delete-null-pointer-checks', '-fno-strict-float-cast-overflow', '-c', '-w', '-pthread', '-std=c++17', '-I' + str(ROOT / 'port/recomp')] +     (['-DFNV_CALL_TRACE'] if os.environ.get('FNV_CALL_TRACE') else [])
-LDFLAGS = ['-O1', '-pthread', '-sGLOBAL_BASE=22020096', '-sINITIAL_MEMORY=3221225472', '-sMAXIMUM_MEMORY=3221225472', '-sSTACK_SIZE=64MB',
-           '-sDEFAULT_PTHREAD_STACK_SIZE=4MB', '-sPTHREAD_POOL_SIZE=64',
+LDFLAGS = ['-O1', '-pthread', '-sGLOBAL_BASE=22020096', '-sSTACK_SIZE=64MB',
+           '-sDEFAULT_PTHREAD_STACK_SIZE=4MB',
            '-sEXIT_RUNTIME=1', '-sSUPPORT_LONGJMP=emscripten', '-sMALLOC=' + os.environ.get('FNV_WEB_MALLOC', 'dlmalloc'), '-sWASM_BIGINT=1',
            '-sERROR_ON_UNDEFINED_SYMBOLS=1', '--profiling-funcs',
            '--pre-js', str(ROOT / 'port/recomp/web_pre.js')]
@@ -61,7 +61,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--jobs', type=int, default=os.cpu_count())
     ap.add_argument('--target', choices=['node', 'browser', 'both'], default=os.environ.get('FNV_WEB_TARGET', 'both'))
+    ap.add_argument('--pthread-pool-size', type=int, default=64, help='browser workers preloaded at startup (1-64)')
+    ap.add_argument('--memory-mib', type=int, default=3072, help='fixed browser Wasm memory in MiB (2048-3072)')
+    ap.add_argument('--browser-out', type=Path, default=OUT / 'web_browser', help='browser build output directory')
     a = ap.parse_args()
+    if not 1 <= a.pthread_pool_size <= 64:
+        ap.error('--pthread-pool-size must be between 1 and 64')
+    if not 2048 <= a.memory_mib <= 3072:
+        ap.error('--memory-mib must be between 2048 and 3072')
     t0 = time.time()
     hdr = hashlib.sha1(b''.join(h.read_bytes() for h in HEADERS) + ' '.join(CFLAGS).encode()).hexdigest()
     srcs = [ROOT / 'port/recomp' / p for p in PORT] + sorted(OUT.glob('recomp_*.cpp'))
@@ -79,11 +86,14 @@ def main():
     print('compiled %d sources in %.0f s' % (len(jobs), time.time() - t0), flush=True)
     for target in (['node', 'browser'] if a.target == 'both' else [a.target]):
         sub, exclude, extra = TARGETS[target]
-        web = OUT / sub
-        web.mkdir(exist_ok=True)
+        web = a.browser_out.resolve() if target == 'browser' else OUT / sub
+        web.mkdir(parents=True, exist_ok=True)
         out = web / 'fnv_web.js'
         objs = [str(j[1]) for j in jobs if j[0].name != exclude]
-        r = subprocess.run(EMXX + LDFLAGS + extra + objs + ['-o', str(out)], capture_output=True, text=True,
+        memory = (a.memory_mib if target == 'browser' else 3072) * (1 << 20)
+        pool_size = a.pthread_pool_size if target == 'browser' else 64
+        runtime = [f'-sINITIAL_MEMORY={memory}', f'-sMAXIMUM_MEMORY={memory}', f'-sPTHREAD_POOL_SIZE={pool_size}']
+        r = subprocess.run(EMXX + LDFLAGS + runtime + extra + objs + ['-o', str(out)], capture_output=True, text=True,
                            errors='replace', env=ENV)
         if r.returncode:
             # the command line itself is huge: show the diagnostics, not the echo of the command

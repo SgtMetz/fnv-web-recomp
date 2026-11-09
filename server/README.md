@@ -37,6 +37,29 @@ It is derived data, so it is git-ignored. Copy it to the server with rsync or sc
 
 ## The phone version
 
+### Testing a lower-memory browser build
+
+If a device closes the tab while compiling or loading the game, try an isolated build with fewer
+preloaded workers and less fixed Wasm memory. This example also caps the shared file cache at 64 MiB.
+
+```bash
+python -B tools/recomp_build_web.py --target browser --pthread-pool-size 24 --memory-mib 2560 --browser-out out/recomp/web_browser_ipad
+node server/serve.mjs --dev --build-dir out/recomp/web_browser_ipad --game "/path/to/Fallout New Vegas"
+```
+
+Open `/?start=quick&quality=low&FNV_FS_CACHE_MB=64` on the test server. Use HTTPS for testing
+from another device, and keep the server behind the access controls described above.
+
+To bundle the same build, run
+`python -B tools/recomp_bundle.py --build-dir out/recomp/web_browser_ipad --out out/dist-ipad`
+and serve it with `--dist out/dist-ipad`. The worker pool setting controls how many workers are
+preloaded. It does not cap how many workers the game may create. Too few preloaded workers can stall
+startup, smaller heaps can run out of memory, and smaller file caches can increase reads. Change one
+setting at a time to isolate the effect. The defaults are 64 preloaded workers, 3072 MiB of fixed Wasm
+memory, and a 256 MiB file cache. `FNV_FS_CACHE_MB` accepts whole numbers from 8 to 256.
+
+### Lower-quality archives
+
 The page picks it on a phone or tablet; `?mobile=1` or `?mobile=0` overrides that. It sets `FNV_ARCHIVES=mobile`,
 and the file layer then reads `Data/mobile/<name>.bsa` instead of `Data/<name>.bsa` where the server has one.
 `tools/mobile_archives.py` makes those:
