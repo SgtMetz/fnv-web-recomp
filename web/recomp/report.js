@@ -240,6 +240,8 @@
     if (r) st.renderer = safe(() => ({ frames: r.frames, stats: r.stats, pipelines: r.pipelines && r.pipelines.size,
       textures: r.textures && r.textures.size, warnings: r.warned ? [...r.warned].slice(-100) : [],
       canvas: [r.canvas ? r.canvas.width : 0, r.canvas ? r.canvas.height : 0] }));
+    st.precheck = safe(() => window.fnvPrecheck ? { blockers: window.fnvPrecheck.result.blockers.map((b) => b.title),
+      warnings: window.fnvPrecheck.result.warnings.map((w) => w.title), info: window.fnvPrecheck.result.info } : null);
     st.saves = safe(() => window.fnvSaves ? window.fnvSaves.list().map((f) => ({ name: f.path.replace(/^.*\//, ''), size: f.size, mtime: f.mtime })) : null);
     return st;
   }
@@ -299,6 +301,54 @@
     rep.summary = safe(() => summaryText(rep));
     add('P', 'report: gathered ' + id);
     return { rep, log: logText(), shot: shot && !shot.error ? shot : null, save };
+  }
+
+  // ---- confetti, when a report is sent -------------------------------------------------------------------------------
+  // A burst from the middle of the screen. The canvas is a popover, so it draws above the modal dialog (the top layer);
+  // without popovers it goes inside the dialog. Smaller when the system asks for reduced motion.
+  function confetti(host) {
+    const few = matchMedia('(prefers-reduced-motion: reduce)').matches ? 0.4 : 1;
+    const c = document.createElement('canvas');
+    c.style.cssText = 'position:fixed;inset:0;width:100vw;height:100vh;margin:0;padding:0;border:0;background:transparent;pointer-events:none;z-index:2147483647;overflow:visible';
+    const popover = typeof c.showPopover === 'function';
+    if (popover) { c.setAttribute('popover', 'manual'); document.body.appendChild(c); c.showPopover(); }
+    else (host || document.body).appendChild(c);
+    const dpr = Math.min(2, devicePixelRatio || 1), W = innerWidth, H = innerHeight;
+    c.width = W * dpr; c.height = H * dpr;
+    const g = c.getContext('2d');
+    g.scale(dpr, dpr);
+    const colors = ['#e0a040', '#ffd27a', '#f25f5c', '#70c1b3', '#5aa9e6', '#b388eb', '#9bd35a', '#ffffff'];
+    const parts = [];
+    const burst = (x, y, n, speed) => {
+      for (let i = 0; i < n; i++) {
+        const a = Math.random() * Math.PI * 2, v = speed * (0.35 + Math.random() * 0.65);
+        parts.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v - speed * 0.35, w: 6 + Math.random() * 6, h: 3 + Math.random() * 5,
+          r: Math.random() * Math.PI, vr: (Math.random() - 0.5) * 0.4, color: colors[(Math.random() * colors.length) | 0],
+          wobble: Math.random() * 10, round: Math.random() < 0.25 });
+      }
+    };
+    const s = Math.min(W, H) / 45;
+    burst(W / 2, H / 2, Math.round(220 * few), s);                     // the explosion
+    setTimeout(() => { burst(W * 0.2, H * 0.55, Math.round(70 * few), s * 0.8); burst(W * 0.8, H * 0.55, Math.round(70 * few), s * 0.8); }, 180);
+    const t0 = performance.now(), LIFE = 3800;
+    let last = t0;
+    const frame = (now) => {
+      const dt = Math.min(2.5, (now - last) / 16.7), age = now - t0;
+      last = now;
+      g.clearRect(0, 0, W, H);
+      g.globalAlpha = age > LIFE - 900 ? Math.max(0, (LIFE - age) / 900) : 1;
+      for (const p of parts) {
+        p.vx *= Math.pow(0.985, dt); p.vy = p.vy * Math.pow(0.985, dt) + 0.28 * dt;
+        p.x += (p.vx + Math.sin((age / 180) + p.wobble) * 0.6) * dt; p.y += p.vy * dt; p.r += p.vr * dt;
+        g.save(); g.translate(p.x, p.y); g.rotate(p.r); g.fillStyle = p.color;
+        if (p.round) { g.beginPath(); g.arc(0, 0, p.h * 0.7, 0, Math.PI * 2); g.fill(); }
+        else g.fillRect(-p.w / 2, -p.h / 2 * Math.abs(Math.cos(p.r * 2)), p.w, p.h * Math.abs(Math.cos(p.r * 2)) + 0.5);
+        g.restore();
+      }
+      if (age < LIFE) requestAnimationFrame(frame);
+      else { if (popover) try { c.hidePopover(); } catch {} c.remove(); }
+    };
+    requestAnimationFrame(frame);
   }
 
   // ---- the dialog -----------------------------------------------------------------------------------------------------
@@ -414,6 +464,7 @@
         if (!r.ok || !answer.ok) throw new Error(answer.error || `the server answered ${r.status}`);
         add('P', 'report: sent ' + last.rep.id);
         say(`Sent, thank you. Reference ${answer.id || last.rep.id}.`, 'good');
+        safe(() => confetti(dlg));
         text.value = '';
         send.disabled = true;
         setTimeout(() => { if (dlg.open && !sending) dlg.close(); }, 4000);
@@ -428,7 +479,7 @@
     dlg.addEventListener('close', () => { const c = document.getElementById('screen'); if (c) c.focus(); });
   }
 
-  window.fnvReport = { add, logText, gather, errors, samples, open: () => {} };
+  window.fnvReport = { add, logText, gather, errors, samples, confetti, open: () => {} };
   add('P', `page opened ${OPENED.toISOString()} ${location.href}`);
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', ui); else ui();
 })();

@@ -12,6 +12,8 @@
 <!-- where "Report a problem" sends reports (web/recomp/report.js); the development server keeps them in out/reports -->
 <meta name="fnv-report" content="/report">
 <script src="report.js"></script>
+<!-- checks the device can run the game, and estimates the load time (web/recomp/precheck.js) -->
+<script src="precheck.js"></script>
 <style>
   :root { color-scheme: dark; --bg: #0d0d0d; --fg: #d8d2c4; --dim: #8a8478; --accent: #e0a040; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 system-ui, sans-serif; }
@@ -37,6 +39,8 @@
   #start button:hover, #start button:focus-visible { border-color: var(--accent); outline: none; }
   #start button b { display: block; color: var(--fg); font-weight: 600; }
   #start button span { color: var(--dim); }
+  #start button em.eta { display: block; margin-top: 3px; font-style: normal; font-size: 12px; color: var(--accent); }
+  #start button em.eta:empty { display: none; }
   #start [role="radiogroup"] button[aria-checked="true"] { border-color: var(--accent); background: #2a2516; }
   #start [hidden] { display: none; }
   #boot { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 18px 16px; background: linear-gradient(transparent, rgba(0, 0, 0, .85) 35%);
@@ -110,17 +114,17 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
           <h1>Choose a quality</h1>
           <p>Before the game loads. Your last choice is highlighted.</p>
           <div role="radiogroup" aria-label="Quality">
-            <button id="qHigh" role="radio" data-q="high"><b>High</b><span>Full textures and sounds</span></button>
-            <button id="qLow" role="radio" data-q="low"><b>Low</b><span>About a third of the download; blurrier</span></button>
+            <button id="qHigh" role="radio" data-q="high"><b>High</b><span>Full textures and sounds</span><em class="eta" data-q="high"></em></button>
+            <button id="qLow" role="radio" data-q="low"><b>Low</b><span>About a third of the download; blurrier</span><em class="eta" data-q="low"></em></button>
           </div>
         </div>
         <div id="stepStart" hidden>
         <h1>How do you want to start?</h1>
         <p>Choose where the game begins.</p>
-        <button id="startNormal"><b>Start normally</b><span>Main menu, then New Game, Continue or Load as usual.</span></button>
+        <button id="startNormal"><b>Start normally</b><span>Main menu, then New Game, Continue or Load as usual.</span><em class="eta" data-mode="normal"></em></button>
         <button id="startQuick"><b>Start outside Doc Mitchell's house</b><span>A new game with every default taken: Courier, SPECIAL 5s,
           default face, tag skills Guns, Speech and Sneak, no traits, casual mode, Pip-Boy on. The opening is done and
-          "Back in the Saddle" is next.</span></button>
+          "Back in the Saddle" is next.</span><em class="eta" data-mode="quick"></em></button>
         </div>
       </div>
     </div>
@@ -300,6 +304,8 @@ function tickBoot() {
   if (boot.stage >= readyStage && !boot.ready) {
     boot.ready = true;
     if (boot.kb) localStorage.setItem(kbKey(), String(boot.kb));
+    // how long this start took, for the next visit's load-time estimate (precheck.js)
+    localStorage.setItem(`fnv.boot.sec.${boot.mode}.${quality}`, String(Math.round(boot.elapsed)));
     log(`ready in ${boot.elapsed.toFixed(1)} s (${boot.mode}): ${boot.kb} KB in ${boot.fetches} fetches`);
   }
   if (boot.ready) { frac = 1; text = 'Ready'; }
@@ -777,9 +783,21 @@ const startMode = startParam === 'quick' || startParam === 'normal' ? startParam
   const qButtons = [document.getElementById('qHigh'), document.getElementById('qLow')];
   const stepQ = document.getElementById('stepQuality'), stepS = document.getElementById('stepStart');
   for (const b of qButtons) b.setAttribute('aria-checked', String(b.dataset.q === quality));
+  // estimated load times from the device precheck (precheck.js), filled in once it has measured
+  const showEta = () => {
+    const pc = window.fnvPrecheck;
+    if (!pc) return;
+    for (const el of panel.querySelectorAll('em.eta')) {
+      const e = el.dataset.q ? pc.estimate(el.dataset.q, 'normal') : pc.estimate(quality, el.dataset.mode);
+      el.textContent = !e ? 'Estimating load time…' : `Load time ${e.text}` + (e.last ? ' (last time here)' : '');
+    }
+  };
+  showEta();
+  window.fnvPrecheck?.ready.then(showEta);
   for (const b of qButtons) b.addEventListener('click', () => {
     quality = b.dataset.q; localStorage.setItem('fnv.quality', quality);
     stepQ.hidden = true; stepS.hidden = false;
+    showEta();
     document.getElementById('startNormal').focus();
   });
   const pick = (m) => { panel.hidden = true; canvas.focus(); resolve(m); };
