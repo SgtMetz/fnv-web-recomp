@@ -14,6 +14,9 @@
 <script src="report.js"></script>
 <!-- checks the device can run the game, and estimates the load time (web/recomp/precheck.js) -->
 <script src="precheck.js"></script>
+<!-- the players' chat under the game (web/recomp/chat.js): the WebSocket of a chat room; empty, no chat -->
+<meta name="fnv-chat" content="">
+<script src="chat.js"></script>
 <style>
   :root { color-scheme: dark; --bg: #0d0d0d; --fg: #d8d2c4; --dim: #8a8478; --accent: #e0a040; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 system-ui, sans-serif; }
@@ -136,6 +139,7 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
     <button id="reportIssue" type="button" title="Tell us what went wrong; the game's log is sent with it">Report a problem</button>
     <span id="savesMsg">Your saves stay in this browser tab: Save game puts a copy on your disk, Load game brings one back.</span>
   </div>
+  <section id="chat" aria-label="Chat with other players"></section>
   <div id="log"></div>
 </div>
 <script type="module">
