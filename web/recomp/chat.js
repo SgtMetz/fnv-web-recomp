@@ -17,12 +17,13 @@
 //
 // Translation: a message goes out with its language only when the browser's LanguageDetector is sure of it (a
 // browser set to English says nothing about what its player types); otherwise the reader's translator detects it.
-// A tag that cannot be right (a Latin-script language on Cyrillic, CJK, ... text) is ignored. Each reader sees messages in their own language: the browser's language by default, or
-// the one picked next to the Translate switch (fnv.chat.translate, fnv.chat.lang). Each reader's own browser does
-// the translating, so there is no shared daily limit: Chrome's on-device Translator API where it is ready, else
-// Google's free web translator (translate.googleapis.com, client=gtx: no key; it detects the language itself, and
-// limits only each player's own address), and only when both fail the chat server ({type: 'translate'}, capped per
-// day). "show original" under a translated message swaps it back.
+// A tag that cannot be right (a Latin-script language on Cyrillic, CJK, ... text) is ignored. Each reader sees
+// messages in their own language: the browser's language by default, or the one picked next to the Translate switch
+// (fnv.chat.translate, fnv.chat.lang). Translations come from
+// Chrome's on-device Translator API where it is ready, else the chat server ({type: 'translate'}), which translates
+// each message once per language with Google's free web translator and shares it with every reader (so one page load
+// does not send Google dozens of requests, which it throttles), else Google's translator straight from this browser.
+// "show original" under a translated message swaps it back.
 (() => {
   'use strict';
   const NAME_MAX = 24, TEXT_MAX = 300;
@@ -190,7 +191,7 @@
       const m = r.m, key = m.id + '|' + lang;
       const want = trOn && srcOf(m) !== lang;
       let tr = want ? tcache.get(key) : null;
-      if (want && tr === undefined && m.tr && m.tr[lang]) tr = { text: m.tr[lang], from: m.lang };
+      if (want && tr === undefined && m.tr && typeof m.tr[lang] === 'string') tr = m.tr[lang] ? { text: m.tr[lang], from: m.lang } : null;
       if (want && tr === undefined) translate(r, key);
       const has = !!(want && tr && tr.text && tr.text !== m.text);
       r.text.textContent = ': ' + (has && !r.orig ? tr.text : m.text);
@@ -209,9 +210,9 @@
       const to = lang, src = srcOf(r.m);
       let out = null;
       if (src) { const s = await onDevice(src, to, r.m.text); if (s) out = { text: s, from: src }; }
+      if (!out) out = await viaServer(r.m.id, to);
       if (!out) out = await viaWeb(src, to, r.m.text);
-      if (!out && src) { const s = await viaServer(r.m.id, to); if (s) out = { text: s, from: src }; }
-      tcache.set(key, out && out.from !== to ? out : null);
+      tcache.set(key, out && out.text && out.from !== to ? out : null);
       // nothing could translate it (an extension blocking translate.googleapis.com, say): say so once
       if (!out && ++trFailed >= 3 && !trWarned) { trWarned = true; note('Some messages could not be translated: something in this browser may be blocking translate.googleapis.com.', true); }
       tpending.delete(key);
@@ -365,7 +366,11 @@
             askPin(m.error || 'Wrong PIN.');
             if (!wanted) wanted = name;
           }
-        } else if (m.type === 'translation') { const f = trWait.get(m.id + '|' + m.to); if (f) f(m.text || ''); }
+        } else if (m.type === 'translation') {
+          // {text, from}; text '' with a language: nothing to translate; with none: the server could not
+          const f = trWait.get(m.id + '|' + m.to);
+          if (f) f(m.text ? { text: m.text, from: m.from || '' } : m.from ? { text: '', from: m.from } : null);
+        }
         else if (m.type === 'error' && m.code === 'reserved') { wanted = name; askPin(m.error); }
         else if (m.type === 'error') note(m.error, true);
       };
