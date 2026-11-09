@@ -425,6 +425,7 @@ void* game_main(void*)
 // ---- runtime and PAL hooks -------------------------------------------------------------------------------------------
 uint32_t fnv_host_base() { return 0xf0000000u; }
 void fnv_host_log(const char* text) { logf("%s", text); }
+bool fnv_host_is_main_thread() { return t_ht && t_ht == g_main_ht; }
 void fnv_host_unknown(FnvCpu& s, uint32_t addr) { fnv_rtrap(s, addr, "dispatch to an address with no function"); }
 [[noreturn]] void fnv_host_fatal(FnvCpu& s, uint32_t addr, const char* what)
 {

@@ -235,6 +235,7 @@
     };
     st.boot = copy(b);
     st.pump = copy(pump);
+    st.tuner = copy(window.fnvTuner);       // automatic quality (tuner.js): level, last frame times, what it changed
     if (a) st.audio = safe(() => ({ state: a.ctx ? a.ctx.state : 'none', sampleRate: a.ctx && a.ctx.sampleRate, baseLatency: a.ctx && a.ctx.baseLatency,
       peak: a.peak, underruns: a.underruns, decodes: a.decodes, tracks: a.tracks ? [...a.tracks.values()].map((t) => ({ path: t.path, playing: t.playing, duration: t.duration })) : [] }));
     if (r) st.renderer = safe(() => ({ frames: r.frames, stats: r.stats, pipelines: r.pipelines && r.pipelines.size,

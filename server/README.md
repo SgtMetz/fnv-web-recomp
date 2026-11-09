@@ -60,7 +60,8 @@ memory, and a 256 MiB file cache. `FNV_FS_CACHE_MB` accepts whole numbers from 8
 
 ### Lower-quality archives
 
-The page picks it on a phone or tablet; `?mobile=1` or `?mobile=0` overrides that. It sets `FNV_ARCHIVES=mobile`,
+The page picks it on a phone or tablet, and on a device that reports under 4 GB of memory; `?quality=low` or
+`?quality=high` (or the older `?mobile=1`/`?mobile=0`) overrides that. It sets `FNV_ARCHIVES=mobile`,
 and the file layer then reads `Data/mobile/<name>.bsa` instead of `Data/<name>.bsa` where the server has one.
 `tools/mobile_archives.py` makes those:
 - the two texture archives keep only the mip levels up to 256 pixels (128 for normal maps and distant terrain):

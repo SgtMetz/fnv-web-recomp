@@ -29,6 +29,10 @@
   /* the live page (the bundle, tools/recomp_bundle.py) has no log; ?debug in the address brings it back */
   html:not(.dev) #log { display: none; }
   #stage { position: relative; }
+  #stage:fullscreen { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; background: #000; }
+  #stage:fullscreen #screen { width: 100%; height: 100%; max-height: none !important; object-fit: contain; }
+  #fullscreen-exit { display: none; }
+  #stage:fullscreen #fullscreen-exit { display: block; position: absolute; top: 8px; right: 8px; z-index: 10; padding: 6px 10px; background: #1e1c16; color: #d8d2c4; border: 1px solid #6a5838; border-radius: 4px; cursor: pointer; }
   #start { position: absolute; inset: 0; display: flex; background: rgba(0, 0, 0, .82); overflow: auto; }
   #start .box { margin: auto; }
   /* a phone's game area is shorter than the panel: the panel takes the whole screen and scrolls */
@@ -44,7 +48,6 @@
   #start button span { color: var(--dim); }
   #start button em.eta { display: block; margin-top: 3px; font-style: normal; font-size: 12px; color: var(--accent); }
   #start button em.eta:empty { display: none; }
-  #start [role="radiogroup"] button[aria-checked="true"] { border-color: var(--accent); background: #2a2516; }
   #start [hidden] { display: none; }
   #boot { position: absolute; left: 0; right: 0; bottom: 0; padding: 14px 18px 16px; background: linear-gradient(transparent, rgba(0, 0, 0, .85) 35%);
     transition: opacity .6s; pointer-events: none; }
@@ -91,6 +94,13 @@
 </head>
 <body>
 <script>
+// The hosting page supplies the fullscreen button; fullscreen only the game and its overlays.
+document.addEventListener('click', (event) => {
+  if (!event.target.closest('#fullscreen-toggle, #fullscreen-exit')) return;
+  event.stopImmediatePropagation();
+  const action = document.fullscreenElement ? document.exitFullscreen() : document.getElementById('stage').requestFullscreen();
+  Promise.resolve(action).catch((error) => console.error('Fullscreen unavailable', error));
+}, true);
 // development page or live page: the bundle (tools/recomp_bundle.py) writes `false` here. ?debug shows the log anyway.
 if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) document.documentElement.classList.add('dev');
 </script>
@@ -98,6 +108,7 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
   <div id="bar"><b>FalloutNV.exe (recompiled to WebAssembly)</b><span id="status">starting…</span><a href="credits.html" target="_blank" rel="noopener" style="margin-left:auto;color:var(--dim)">Credits</a></div>
   <div id="stage">
     <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
+    <button id="fullscreen-exit" type="button">Exit fullscreen</button>
     <div id="boot" hidden role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Loading the game">
       <div class="phase"><span id="bootPhase">Starting</span><span id="bootPct"></span></div>
       <div class="track"><div class="fill" id="bootFill"></div></div>
@@ -113,21 +124,9 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
     </div>
     <div id="start" hidden>
       <div class="box">
-        <div id="stepQuality">
-          <h1>Choose a quality</h1>
-          <p>Before the game loads. Your last choice is highlighted.</p>
-          <div role="radiogroup" aria-label="Quality">
-            <button id="qHigh" role="radio" data-q="high"><b>High</b><span>Full textures and sounds</span><em class="eta" data-q="high"></em></button>
-            <button id="qLow" role="radio" data-q="low"><b>Low</b><span>About a third of the download; blurrier</span><em class="eta" data-q="low"></em></button>
-          </div>
-        </div>
-        <div id="stepStart" hidden>
-        <h1>How do you want to start?</h1>
-        <p>Choose where the game begins.</p>
-        <button id="startNormal"><b>Start normally</b><span>Main menu, then New Game, Continue or Load as usual.</span><em class="eta" data-mode="normal"></em></button>
-        <button id="startQuick"><b>Start outside Doc Mitchell's house</b><span>A new game with every default taken: Courier, SPECIAL 5s,
-          default face, tag skills Guns, Speech and Sneak, no traits, casual mode, Pip-Boy on. The opening is done and
-          "Back in the Saddle" is next.</span><em class="eta" data-mode="quick"></em></button>
+        <div id="stepStart">
+        <button id="startNormal"><b>Start normally</b></button>
+        <button id="startQuick"><b>Start in the wasteland</b></button>
         </div>
       </div>
     </div>
@@ -137,13 +136,16 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
     <button id="loadGame" type="button" title="Pick a .fos save from your disk">Load game</button>
     <input id="loadFile" type="file" accept=".fos" multiple hidden>
     <button id="reportIssue" type="button" title="Tell us what went wrong; the game's log is sent with it">Report a problem</button>
-    <span id="savesMsg">Your saves stay in this browser tab: Save game puts a copy on your disk, Load game brings one back.</span>
+    <label id="autoQLabel" title="Shortens the view distance when the game runs under 60 frames a second, and restores it when there is time to spare"><input id="autoQ" type="checkbox" disabled> Auto quality</label>
+    <span id="autoQState"></span>
+    <span id="savesMsg"></span>
   </div>
   <section id="chat" aria-label="Chat with other players"></section>
   <div id="log"></div>
 </div>
 <script type="module">
-import { Renderer, createDevice } from './renderer.js';
+import { Renderer, createDevice, OP } from './renderer.js';
+import { startTuner, startupIni, tunerEnabled } from './tuner.js';
 
 const logEl = document.getElementById('log'), status = document.getElementById('status');
 const DEV = document.documentElement.classList.contains('dev');
@@ -188,19 +190,21 @@ log('WebGPU features: ' + features.join(', '));
 const env = {};
 for (const [k, v] of new URLSearchParams(location.search)) if (k.startsWith('FNV_')) env[k] = v;
 
-// quality: High reads the game's own archives; Low reads smaller copies of the texture and sound archives
-// (tools/mobile_archives.py: textures up to 256 pixels, sounds at half rate) in their place where the server has them,
-// and fetches smaller blocks (port/recomp/pal_fs_web.cpp, FNV_ARCHIVES=mobile). Low is about a third of the download
-// and much less GPU memory; blurrier. Phones and tablets start on Low, everything else on High; the start panel
-// changes it (remembered on this browser), and ?quality=low|high (or the older ?mobile=1|0) sets it for one visit.
+// textures and sounds: "high" reads the game's own archives; "low" reads smaller copies of the texture and sound
+// archives (tools/mobile_archives.py: textures up to 256 pixels, sounds at half rate) in their place where the server
+// has them, and fetches smaller blocks (port/recomp/pal_fs_web.cpp, FNV_ARCHIVES=mobile). Low is about a third of the
+// download and much less memory; blurrier. The page picks it, with no question: low on phones, tablets and devices
+// that report under 4 GB of memory (the tab would not survive the full set), high everywhere else.
+// ?quality=low|high (or the older ?mobile=1|0) overrides it for one visit. The frame rate is tuner.js's business.
 const query = new URLSearchParams(location.search);
 const PHONE = navigator.userAgentData ? navigator.userAgentData.mobile || /Android/i.test(navigator.userAgentData.platform || '')
   : /Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent) || (/Macintosh/.test(navigator.userAgent) && navigator.maxTouchPoints > 1);
 const qualityParam = query.get('quality') || { 1: 'low', 0: 'high' }[query.get('mobile')];
-let quality = qualityParam === 'low' || qualityParam === 'high' ? qualityParam
-  : localStorage.getItem('fnv.quality') === 'low' || localStorage.getItem('fnv.quality') === 'high' ? localStorage.getItem('fnv.quality')
-  : PHONE ? 'low' : 'high';
-let LOW = quality === 'low';      // set for good when the game starts (below)
+const quality = qualityParam === 'low' || qualityParam === 'high' ? qualityParam
+  : PHONE || (navigator.deviceMemory && navigator.deviceMemory < 4) ? 'low' : 'high';
+const LOW = quality === 'low';
+window.fnvQuality = quality;      // for precheck.js's load-time estimate
+try { localStorage.removeItem('fnv.quality'); } catch { /* the old start-panel choice */ }
 
 const t0 = performance.now();
 window.Module = {
@@ -311,6 +315,9 @@ function tickBoot() {
     // how long this start took, for the next visit's load-time estimate (precheck.js)
     localStorage.setItem(`fnv.boot.sec.${boot.mode}.${quality}`, String(Math.round(boot.elapsed)));
     log(`ready in ${boot.elapsed.toFixed(1)} s (${boot.mode}): ${boot.kb} KB in ${boot.fetches} fetches`);
+    // automatic quality (tuner.js): view distance follows the frame rate from here on
+    tuner = startTuner({ renderer, pump: pumpInfo, log });
+    autoQ.disabled = false;
   }
   if (boot.ready) { frac = 1; text = 'Ready'; }
   if (boot.failed) text = boot.failText;
@@ -354,13 +361,61 @@ const yieldWaiters = [];
 yieldChannel.port1.onmessage = () => { const f = yieldWaiters.shift(); if (f) f(); };
 const yieldSoon = () => new Promise((res) => { yieldWaiters.push(res); yieldChannel.port2.postMessage(0); });
 const pumpInfo = window.fnvPump = { calls: 0, packets: 0, error: null };
+// automatic quality (tuner.js): the box under the game turns it off and on, and shows what it has changed
+let tuner = null;
+const autoQ = document.getElementById('autoQ'), autoQState = document.getElementById('autoQState');
+autoQ.checked = tunerEnabled();
+autoQ.addEventListener('change', () => {
+  if (tuner) tuner.setEnabled(autoQ.checked);
+  else try { localStorage.setItem('fnv.tuner.on', autoQ.checked ? '1' : '0'); } catch { /* private mode */ }
+});
+// Frame pacing at each Present (?pace=off turns it off):
+//   one frame per screen refresh  (paceRefresh, before the frame is drawn to the canvas) A second frame that is ready
+//                                 within the same refresh waits for the next one. Without this a game running faster
+//                                 than the screen has frames replaced before they were ever shown, at uneven moments,
+//                                 which shows as judder when the camera turns. (The game's own setting asks for
+//                                 this: iPresentInterval=1.) Only while animation frames arrive: a hidden page gets
+//                                 none, and the game keeps running there.
+//   two frames on the GPU at most  (paceGpu, before the game is released) The browser queues submitted work without
+//                                 limit. When the graphics side is the slower one the queue grew to most of a second
+//                                 (measured: 0.7-0.9 s), and then uploads blocked for 60-80 ms at a time: late input
+//                                 and frames in bursts.
+const PACE = new URLSearchParams(location.search).get('pace') !== 'off';
+let rafSeq = 0, rafAt = 0, presentSeq = -1;
+const rafWaiters = [], gpuFrames = [];
+const onRefresh = () => { rafSeq++; rafAt = performance.now(); for (const f of rafWaiters.splice(0)) f(); requestAnimationFrame(onRefresh); };
+requestAnimationFrame(onRefresh);
+const within = (ms, arm) => new Promise((res) => { let done = false; const f = () => { if (!done) { done = true; res(); } }; arm(f); setTimeout(f, ms); });
+async function paceRefresh() {
+  if (!PACE || presentSeq !== rafSeq || performance.now() - rafAt > 100) { presentSeq = rafSeq; return 0; }
+  const t0 = performance.now();
+  pumpInfo.vsyncWaits = (pumpInfo.vsyncWaits || 0) + 1;
+  await within(40, (f) => rafWaiters.push(f));
+  presentSeq = rafSeq;
+  return performance.now() - t0;
+}
+async function paceGpu() {
+  if (!PACE) return 0;
+  const t0 = performance.now();
+  const frame = { done: false, wake: null };
+  const fin = () => { frame.done = true; if (frame.wake) frame.wake(); };
+  device.queue.onSubmittedWorkDone().then(fin, fin);
+  gpuFrames.push(frame);
+  while (gpuFrames.length && gpuFrames[0].done) gpuFrames.shift();
+  if (gpuFrames.length <= 2) return 0;
+  while (gpuFrames.length > 2) {
+    const oldest = gpuFrames.shift();
+    if (!oldest.done) { pumpInfo.gpuWaits = (pumpInfo.gpuWaits || 0) + 1; await within(250, (f) => { oldest.wake = f; }); }
+  }
+  return performance.now() - t0;
+}
 async function pump() {
   pumpInfo.calls++;
   const M = window.Module;
   if (!ring) ring = M._fnv_ring();
   const H32 = M.HEAPU32, H8 = M.HEAPU8, F32 = M.HEAPF32, b = ring >>> 2;
   const t0p = performance.now(), deadline = t0p + 14;
-  let more = false;
+  let more = false, paced = 0;
   try {
     for (;;) {
       const data = Atomics.load(H32, b), wr = Atomics.load(H32, b + 2);
@@ -379,11 +434,17 @@ async function pump() {
         n++;
         if (!renderer.execHeap(op, H32, F32, pi + 2)) {
           const p = data + rd;
+          if (op === OP.PRESENT) { Atomics.store(H32, b + 3, rd); paced += await paceRefresh(); }
           let presented = renderer.exec(op, H32.subarray(pi + 2, pi + 2 + (len >>> 2)), H8.subarray(p + 8, p + 8 + len));
           if (presented && presented.then) presented = await presented;
           // a Present releases the game; keep going while it has more queued and the tick's budget lasts, so the
           // game is not held to one frame per display tick (only the last frame of a tick reaches the screen)
-          if (presented === true) { rd += 8 + len; Atomics.store(H32, b + 3, rd); Atomics.add(H32, b + 5, 1); continue; }
+          if (presented === true) {
+            rd += 8 + len; Atomics.store(H32, b + 3, rd);
+            paced += await paceGpu();
+            Atomics.add(H32, b + 5, 1);
+            continue;
+          }
         }
         rd += 8 + len;
         if ((n & 63) === 0) { Atomics.store(H32, b + 3, rd); if (performance.now() > deadline) break; }
@@ -397,13 +458,16 @@ async function pump() {
     log('renderer: ' + (e.stack || e), true);
   }
   const now = performance.now();
-  pumpInfo.busyMs = (pumpInfo.busyMs || 0) + (now - t0p);
+  pumpInfo.busyMs = (pumpInfo.busyMs || 0) + (now - t0p - paced);     // not the time spent holding a frame back
+  pumpInfo.pacedMs = (pumpInfo.pacedMs || 0) + paced;
   if (now - lastT > 1000) {
     fps = (renderer.frames - lastFrames) * 1000 / (now - lastT);
     lastFrames = renderer.frames; lastT = now;
     const snd = audio.ctx ? (audio.ctx.state === 'running' ? `sound ${(audio.peak * 100).toFixed(0)}%` : 'sound: click to start') : '';
-    if (boot.ready && !DEV) status.textContent = `${fps.toFixed(0)} fps`;
-    else if (boot.ready) status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped · ${snd}`;
+    const tl = tuner && tuner.enabled && tuner.label ? ` · ${tuner.label}` : '';
+    autoQState.textContent = !tuner || !tuner.enabled ? '' : tuner.pendingRes ? `lower resolution (${tuner.pendingRes}) from the next start` : tuner.label;
+    if (boot.ready && !DEV) status.textContent = `${fps.toFixed(0)} fps${tl}`;
+    else if (boot.ready) status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped · ${snd}${tl}`;
   }
   // the game waits on the renderer, and a hidden or embedded page may get no animation frames: whichever of the
   // next frame and a short timer comes first runs the pump
@@ -529,6 +593,15 @@ const key = (e, down) => {
 };
 canvas.addEventListener('keydown', (e) => { if (!e.repeat) key(e, true); });
 canvas.addEventListener('keyup', (e) => key(e, false));
+// Escape should reach the game even if a site control took focus, but never while typing in a form.
+document.addEventListener('keydown', (e) => {
+  if (e.code !== 'Escape' || e.repeat || e.target === canvas || e.target.closest('input, textarea, select, [contenteditable="true"]') || !boot.ready) return;
+  key(e, true);
+});
+document.addEventListener('keyup', (e) => {
+  if (e.code === 'Escape' && e.target !== canvas) key(e, false);
+});
+window.addEventListener('blur', () => window.Module?._fnv_key?.(1, 0));
 canvas.addEventListener('click', () => { canvas.focus(); if (document.pointerLockElement !== canvas) canvas.requestPointerLock?.(); });
 canvas.addEventListener('mousemove', (e) => {
   if (document.pointerLockElement === canvas && window.Module._fnv_mouse) window.Module._fnv_mouse(e.movementX, e.movementY, 0, -1, 0);
@@ -783,37 +856,29 @@ const startParam = new URLSearchParams(location.search).get('start');
 const startMode = startParam === 'quick' || startParam === 'normal' ? startParam : await new Promise((resolve) => {
   const panel = document.getElementById('start');
   panel.hidden = false;
-  status.textContent = 'choose quality and how to start';
-  const qButtons = [document.getElementById('qHigh'), document.getElementById('qLow')];
-  const stepQ = document.getElementById('stepQuality'), stepS = document.getElementById('stepStart');
-  for (const b of qButtons) b.setAttribute('aria-checked', String(b.dataset.q === quality));
+  status.textContent = 'choose how to start';
   // estimated load times from the device precheck (precheck.js), filled in once it has measured
   const showEta = () => {
     const pc = window.fnvPrecheck;
     if (!pc) return;
     for (const el of panel.querySelectorAll('em.eta')) {
-      const e = el.dataset.q ? pc.estimate(el.dataset.q, 'normal') : pc.estimate(quality, el.dataset.mode);
+      const e = pc.estimate(quality, el.dataset.mode);
       el.textContent = !e ? 'Estimating load time…' : `Load time ${e.text}` + (e.last ? ' (last time here)' : '');
     }
   };
   showEta();
   window.fnvPrecheck?.ready.then(showEta);
-  for (const b of qButtons) b.addEventListener('click', () => {
-    quality = b.dataset.q; localStorage.setItem('fnv.quality', quality);
-    stepQ.hidden = true; stepS.hidden = false;
-    showEta();
-    document.getElementById('startNormal').focus();
-  });
   const pick = (m) => { panel.hidden = true; canvas.focus(); resolve(m); };
   document.getElementById('startNormal').addEventListener('click', () => pick('normal'));
   document.getElementById('startQuick').addEventListener('click', () => pick('quick'));
-  (quality === 'low' ? qButtons[1] : qButtons[0]).focus();
+  document.getElementById('startNormal').focus();
 });
 if (startMode === 'quick') env.FNV_START = 'quick';
-LOW = quality === 'low';
-boot.quality = quality;
 if (LOW) env.FNV_ARCHIVES = 'mobile';
-log(LOW ? 'quality: low (small textures and sounds)' : 'quality: high');
+// automatic quality's start-up part: a lower resolution when earlier visits found the graphics side to be the limit
+const tunerIni = startupIni();
+if (tunerIni) { env.FNV_INI = env.FNV_INI ? env.FNV_INI + ';' + tunerIni : tunerIni; log('automatic quality: ' + tunerIni); }
+log(LOW ? 'textures and sounds: the small set (phone, tablet or little memory)' : 'textures and sounds: full');
 startBoot(startMode);
 log('start: ' + (startMode === 'quick' ? "outside Doc Mitchell's house (default character)" : 'main menu'));
 status.textContent = 'starting…';
