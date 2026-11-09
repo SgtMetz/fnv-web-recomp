@@ -4,11 +4,9 @@ The original `FalloutNV.exe` is **statically recompiled**: every function is lif
 hosts, native Win32 and WebAssembly. A platform layer (PAL) stands in for Windows, Direct3D 9, DirectSound and
 DirectShow.
 
-The browser build plays New Game through character creation into Doc Mitchell's house:
 - WebGPU rendering, including skinned meshes.
 - Keyboard and mouse.
 - Sound effects, music and voices.
-- About 45-60 fps in the heavy interior and about 95 fps in menus.
 - DLC is off by default.
 
 See `docs/RECOMP.md` for the design.
