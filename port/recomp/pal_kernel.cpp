@@ -437,7 +437,13 @@ void k_DeleteCriticalSection(FnvCpu& s)
 // ---- TLS ----------------------------------------------------------------------------------------------------------
 const uint32_t kTlsSlots = 1088;
 std::atomic<bool> g_tls_used[kTlsSlots];
+// Windows clears a slot in every thread when it is freed: TlsFree followed by a TlsAlloc that gets the same index
+// reads 0 everywhere, not what a thread stored for the slot's previous owner. A thread's value only counts when it
+// was stored in the slot's current generation. The model loader's queues keep a per-thread view in a slot: a save
+// load rebuilds them, and a stale view pointed at a freed queue (a jump to garbage at 0x0044ce65).
+std::atomic<uint32_t> g_tls_gen[kTlsSlots];
 thread_local uint32_t t_tls[kTlsSlots];
+thread_local uint32_t t_tls_gen[kTlsSlots];
 void k_TlsAlloc(FnvCpu& s)
 {
     for (uint32_t i = 0; i < kTlsSlots; ++i)
@@ -447,9 +453,29 @@ void k_TlsAlloc(FnvCpu& s)
     }
     RET(0xffffffffu, 0);
 }
-void k_TlsFree(FnvCpu& s) { if (A(0) < kTlsSlots) g_tls_used[A(0)] = false; RET(1, 1); }
-void k_TlsGetValue(FnvCpu& s) { set_err(0); RET(A(0) < kTlsSlots ? t_tls[A(0)] : 0, 1); }
-void k_TlsSetValue(FnvCpu& s) { if (A(0) < kTlsSlots) t_tls[A(0)] = A(1); RET(1, 2); }
+void k_TlsFree(FnvCpu& s)
+{
+    if (A(0) >= kTlsSlots || !g_tls_used[A(0)]) { set_err(87); RET(0, 1); }
+    g_tls_gen[A(0)].fetch_add(1);
+    g_tls_used[A(0)] = false;
+    RET(1, 1);
+}
+void k_TlsGetValue(FnvCpu& s)
+{
+    set_err(0);
+    uint32_t i = A(0);
+    RET(i < kTlsSlots && t_tls_gen[i] == g_tls_gen[i].load(std::memory_order_relaxed) ? t_tls[i] : 0, 1);
+}
+void k_TlsSetValue(FnvCpu& s)
+{
+    uint32_t i = A(0);
+    if (i < kTlsSlots)
+    {
+        t_tls[i] = A(1);
+        t_tls_gen[i] = g_tls_gen[i].load(std::memory_order_relaxed);
+    }
+    RET(1, 2);
+}
 
 // ---- waitable objects -------------------------------------------------------------------------------------------
 uint32_t named_or_new(const char* name, Obj* o, bool* existed)
