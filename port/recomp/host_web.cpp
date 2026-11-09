@@ -550,11 +550,23 @@ extern "C" EMSCRIPTEN_KEEPALIVE void fnv_dump_threads()
         if (!ht) continue;
         FnvCpu& s = ht->cpu;
         std::string line = "[web] thread " + std::to_string(i) + ":";
-        char b[16];
+        char b[64];
+        if (s.esp >= ht->stack_lo && s.esp + 16 <= ht->stack_hi)
+        {
+            snprintf(b, sizeof b, " [esp %08x: %08x %08x %08x %08x]", s.esp, M32(s.esp), M32(s.esp + 4), M32(s.esp + 8),
+                     M32(s.esp + 12));
+            line += b;
+        }
         for (uint32_t p = s.esp, shown = 0; p >= ht->stack_lo && p + 4 <= ht->stack_hi && shown < 14; p += 4)
         {
             uint32_t v = M32(p);
-            if (v >= g_image_lo + 0x1005 && v < 0x00fdf000u && M8(v - 5) == 0xe8)
+            if (v >= g_image_lo + 0x1006 && v < 0x00fdf000u && M8(v - 6) == 0xff && M8(v - 5) == 0x15)
+            {
+                snprintf(b, sizeof b, " *%08x", v);         // call dword ptr [import]
+                line += b;
+                ++shown;
+            }
+            else if (v >= g_image_lo + 0x1005 && v < 0x00fdf000u && M8(v - 5) == 0xe8)
             {
                 snprintf(b, sizeof b, " %08x", v);
                 line += b;

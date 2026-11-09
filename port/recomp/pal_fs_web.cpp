@@ -80,25 +80,30 @@ EM_JS(void, js_fs_init, (int mobile, uint32_t* retries), {
     };
 });
 
+// Pointers reach EM_JS code as signed numbers, and memory is 3 GB: an address at or above 2 GB arrives negative, and
+// HEAPU8.slice/set with it reads or writes the wrong place (slice counts from the end of memory). Every pointer used
+// to index the heap here goes through `>>> 0` first. (UTF8ToString and stringToUTF8 already do it.) Before this,
+// saves came out with their 4 KB CRT-buffered pieces zeroed (the buffer lives above 2 GB) and loading one never ended.
 EM_JS(int, js_fs_stat, (const char* path, uint32_t* out), {
     var p = UTF8ToString(path);
+    var o = (out >>> 0) >>> 2;
     var hit = fnvGameLookup(p);
     if (hit) {
         if (hit.missing) return 0;
         var size = hit.file ? hit.file[0] : 0;
-        HEAPU32[out >> 2] = hit.dir ? 1 : 0;
-        HEAPU32[(out >> 2) + 1] = size % 4294967296;
-        HEAPU32[(out >> 2) + 2] = Math.floor(size / 4294967296);
-        HEAPU32[(out >> 2) + 3] = hit.file ? hit.file[1] : 0;
+        HEAPU32[o] = hit.dir ? 1 : 0;
+        HEAPU32[o + 1] = size % 4294967296;
+        HEAPU32[o + 2] = Math.floor(size / 4294967296);
+        HEAPU32[o + 3] = hit.file ? hit.file[1] : 0;
         return 1;
     }
     var x = fnvXhr('GET', '/fs/stat?p=' + encodeURIComponent(p), null, false);
     if (x.status != 200) return 0;
     var j = JSON.parse(x.responseText);
-    HEAPU32[out >> 2] = j.dir ? 1 : 0;
-    HEAPU32[(out >> 2) + 1] = j.size % 4294967296;
-    HEAPU32[(out >> 2) + 2] = Math.floor(j.size / 4294967296);
-    HEAPU32[(out >> 2) + 3] = j.mtime;
+    HEAPU32[o] = j.dir ? 1 : 0;
+    HEAPU32[o + 1] = j.size % 4294967296;
+    HEAPU32[o + 2] = Math.floor(j.size / 4294967296);
+    HEAPU32[o + 3] = j.mtime;
     return 1;
 });
 
@@ -112,13 +117,13 @@ EM_JS(int, js_fs_fetch, (const char* path, double off, int len, uint8_t* dst), {
     if (x.status != 200) return -1;
     var data = new Uint8Array(x.response);
     var n = Math.min(len, data.length);
-    HEAPU8.set(data.subarray(0, n), dst);
+    HEAPU8.set(data.subarray(0, n), dst >>> 0);
     return n;
 });
 
 EM_JS(int, js_fs_write, (const char* path, double off, int len, const uint8_t* src), {
     var p = UTF8ToString(path);
-    var x = fnvXhr('POST', '/fs/write?p=' + encodeURIComponent(p) + '&o=' + off, HEAPU8.slice(src, src + len), false);
+    var x = fnvXhr('POST', '/fs/write?p=' + encodeURIComponent(p) + '&o=' + off, HEAPU8.slice(src >>> 0, (src >>> 0) + len), false);
     return x.status == 200 ? len : 0;
 });
 
