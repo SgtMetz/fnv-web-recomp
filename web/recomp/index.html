@@ -77,8 +77,9 @@
   #savesMsg { flex: 1 1 260px; }
   /* the built-in controls replace any touch bar the hosting page adds under the game */
   html.touch #touch-controls, html.touch #touch-hint { display: none !important; }
-  /* and the game gets the screen's height (less the header): the controls sit over and beside it */
-  html.touch #screen { max-height: calc(100dvh - 56px) !important; }
+  /* The touch overlay owns input. Keep the canvas from receiving touch even before the overlay is ready. */
+  @media (pointer: coarse) { #screen { pointer-events: none; } }
+  html.touch #screen { max-height: calc(100dvh - 56px) !important; pointer-events: none; }
 </style>
 </head>
 <body>
@@ -138,6 +139,8 @@ import { Renderer, createDevice } from './renderer.js';
 
 const logEl = document.getElementById('log'), status = document.getElementById('status');
 const DEV = document.documentElement.classList.contains('dev');
+const touchUI = matchMedia('(pointer: coarse)').matches || new URLSearchParams(location.search).get('touch') === '1';
+if (touchUI) document.documentElement.classList.add('touch');
 let logLines = 0;
 function log(m, err) {
   window.fnvReport?.add(err === 'stderr' ? '2' : err ? 'E' : '-', m);   // the report's log keeps everything (report.js)
@@ -525,14 +528,45 @@ canvas.addEventListener('mouseup', (e) => { if (document.pointerLockElement === 
 canvas.addEventListener('wheel', (e) => { e.preventDefault(); window.Module._fnv_mouse?.(0, 0, e.deltaY < 0 ? 120 : -120, -1, 0); }, { passive: false });
 canvas.addEventListener('contextmenu', (e) => e.preventDefault());
 
+// Feed standard-mapped controllers to the game's own XInput handling.
+if (navigator.getGamepads) {
+  const buttons = [0x1000, 0x2000, 0x4000, 0x8000, 0x100, 0x200, 0, 0,
+    0x20, 0x10, 0x40, 0x80, 0x1, 0x2, 0x4, 0x8];
+  const axis = (value) => Math.round(Math.max(-1, Math.min(1, value || 0)) * (value < 0 ? 32768 : 32767));
+  const stick = (x, y) => (axis(x) & 0xffff) | (axis(-y) << 16);
+  const disconnect = () => window.Module?._fnv_gamepad?.(0, 0, 0, 0);
+  let last = null;
+  function pollGamepad() {
+    requestAnimationFrame(pollGamepad);
+    const update = window.Module?._fnv_gamepad;
+    if (!update || !document.hasFocus() || document.hidden) return;
+    let pad;
+    try { pad = Array.from(navigator.getGamepads()).find((p) => p?.connected && p.mapping === 'standard'); }
+    catch { return; }  // the embedding page can disable the Gamepad API
+    if (!pad) { if (last) disconnect(); last = null; return; }
+    let digital = 0;
+    for (let i = 0; i < buttons.length; i++) if (pad.buttons[i]?.pressed) digital |= buttons[i];
+    const trigger = (i) => Math.round((pad.buttons[i]?.value || 0) * 255);
+    const state = [digital | (trigger(6) << 16) | (trigger(7) << 24),
+      stick(pad.axes[0], pad.axes[1]), stick(pad.axes[2], pad.axes[3])];
+    if (!last || state.some((value, i) => value !== last[i])) { update(1, ...state); last = state; }
+  }
+  const releaseGamepad = () => {
+    if (!last) return;
+    window.Module?._fnv_gamepad?.(1, 0, 0, 0);
+    last = [0, 0, 0];
+  };
+  window.addEventListener('blur', releaseGamepad);
+  document.addEventListener('visibilitychange', () => { if (document.hidden) releaseGamepad(); });
+  requestAnimationFrame(pollGamepad);
+}
+
 // ---- touch controls ---------------------------------------------------------------------------------------------------
 // On a touch screen (or with ?touch=1), once the game is ready: a joystick on the left half of the game (it starts where
 // the thumb lands) presses W/A/S/D, a drag anywhere else turns the view (or moves the menu cursor) and a short tap there
 // is a left click, and the buttons press their keys or mouse buttons. The game polls DirectInput state, so a tap is
 // held for 80 ms to be seen by at least one poll.
-const touchUI = matchMedia('(pointer: coarse)').matches || new URLSearchParams(location.search).get('touch') === '1';
 if (touchUI) {
-  document.documentElement.classList.add('touch');
   const pad = document.getElementById('touch'), stick = document.getElementById('stick'), knob = document.getElementById('knob');
   const keyTo = (dik, down) => window.Module?._fnv_key?.(dik, down ? 1 : 0);
   const mouseTo = (dx, dy, button, down) => window.Module?._fnv_mouse?.(dx, dy, 0, button, down ? 1 : 0);
