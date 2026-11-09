@@ -19,6 +19,7 @@ uint32_t fnv_guest_call(FnvCpu& s, uint32_t fn, const uint32_t* args, int nargs)
 uint32_t fnv_host_base();                                  // start of the reserved host-function address range
 void fnv_host_unknown(FnvCpu& s, uint32_t addr);           // dispatch to an address nobody claims
 void fnv_host_log(const char* text);
+bool fnv_host_is_main_thread();                            // the game's main thread (the one that draws the frames)
 [[noreturn]] void fnv_host_fatal(FnvCpu& s, uint32_t addr, const char* what);
 
 // stdcall helpers for host functions

@@ -59,8 +59,21 @@ On a touch screen (or with `?touch=1`) the page adds touch controls once the gam
 for W/A/S/D, a drag elsewhere to look (a short tap is a click), and buttons for Fire, Aim, Use, Jump, Reload, Crouch,
 Pip-Boy, VATS and Menu.
 
-Before the game loads, the page asks for a quality, then how to start. `?start=normal` or `?start=quick` in the address skips the
-question.
+**Automatic quality** (`web/recomp/tuner.js`, the "Auto quality" box under the game): while the world is on screen the
+page watches the frame rate and shortens the view distance (the game's object, item and actor fade distances, down
+to its own Low preset) when it stays under 60 fps, and restores it when there is time to spare. If the game keeps
+waiting for the renderer even at the shortest distance, the next start uses a lower resolution (960x540, then
+854x480). `?tuner=off` turns it off for one visit, and `?target=30` changes the target. `?FNV_INI=key:Section=value;...`
+overrides any setting the game reads at start-up (`port/recomp/pal_kernel.cpp`).
+
+**Frame pacing** (the pump in `web/recomp/index.html`): the page shows one game frame per screen refresh and keeps at
+most two frames of work queued on the GPU, and the game runs one frame ahead of the renderer. `?pace=off` turns the
+pacing off.
+
+Before the game loads, the page asks how to start. `?start=normal` or `?start=quick` in the address skips the
+question. There is no quality question: phones, tablets and devices with under 4 GB of memory get the smaller texture
+and sound archives where the server has them (`?quality=low` or `?quality=high` overrides that), and automatic
+quality looks after the frame rate.
 - **Normal:** the main menu, after about 60 s.
 - **Quick:** a new game on Doc Mitchell's porch with every default taken, about 60 s after the choice. The opening is
   complete and "Back in the Saddle" is active. `port/recomp/pal_start.cpp` does this through the game's console
@@ -72,6 +85,9 @@ question.
   - `d.keys([...DIK codes])`, `d.mouse(dx, dy)` and `d.click()` send input.
   - `d.snap('name')` saves a screenshot to `out/recomp/name.png`.
 - `renderer.traceFrame()` captures a frame's draws.
+- `d.average()` measures the frame (game thread, renderer pump, draws), `d.ab(a, b)` alternates two states and
+  averages each, and `d.getF`/`d.setF`/`d.getI`/`d.setI('name:Section')` read and write a game setting in memory.
+  `window.fnvTuner` shows what automatic quality measured and changed.
 - `Module.ccall('fnv_console', null, ['string'], ['GetStage 00104C1C'])` runs a console line on the main thread.
   - Name base forms and quests by form ID: only references keep their editor IDs at runtime.
   - The console's own text isn't drawn yet. Its output lines are a linked list at `ConsoleManager` (`*0x011d8ce8`)
@@ -100,7 +116,7 @@ headless. The log goes to `out/recomp/run.log`.
 | `tools/recomp*.py`, `tools/gen_*.py` | **Active.** The recompiler, the builds (`recomp_bundle.py`: the deployment bundle), and the generated tables. |
 | `server/` | **Active.** `serve.mjs`, the web server for both development and deployment, and `README.md`, the deployment guide. |
 | `port/recomp/` | **Active.** Runtime and PAL: `fnv_recomp_rt.cpp` (CPU state, calls), `pal_kernel/user/fs/com/input.cpp`, `pal_d3d9.cpp` (writes the D3D9 command ring), `pal_dsound.cpp`, `pal_dshow.cpp`, and the hosts `host_win32.cpp` and `host_web.cpp`. |
-| `web/recomp/` | **Active.** The browser page: `index.html` (worker start-up, ring pump, audio), `renderer.js` (WebGPU D3D9 renderer), `audio-worklet.js`, `debug.js`, and `replay.html` (plays a captured ring). |
+| `web/recomp/` | **Active.** The browser page: `index.html` (worker start-up, ring pump, audio), `renderer.js` (WebGPU D3D9 renderer), `tuner.js` (automatic quality), `audio-worklet.js`, `debug.js`, and `replay.html` (plays a captured ring). |
 | `tools/shader_*.py`, `tools/vkd3d_patches/`, `tools/build_vkd3d.py` | Shader translation from d3dbc to WGSL (`docs/SHADERS.md`). |
 | `port/loader/`, `port/runtime/`, `port/compat/`, most other `tools/*.py` | **Dormant: Phases 1-2.** The native relink of the decomp C++ plus the lifter. It reached the Mojave natively, but it cannot target wasm because clang has no MSVC C++ ABI there. Kept for reference and for its analysis scans. |
 | `web/` (outside `recomp/`), `web/README.md` | An earlier browser shell: install importer, saves, and an OPFS file layer. It is not wired to the recompiled build. |

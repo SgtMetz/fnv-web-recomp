@@ -283,8 +283,40 @@ uint32_t ini_copy(char* out, uint32_t size, const std::vector<std::string>& item
     return pos;
 }
 
+// FNV_INI="uGridsToLoad:General=3;iSize W:Display=960": settings in the game's own "key:section" notation that answer
+// before any file does. The page's quality tuner (web/recomp/tuner.js) sets it for the settings the game reads only
+// at start-up, so no settings file has to be rewritten.
+struct IniOverride { std::string key, section, value; };
+const std::vector<IniOverride>& ini_overrides()
+{
+    static const std::vector<IniOverride> v = [] {
+        std::vector<IniOverride> list;
+        const char* env = getenv("FNV_INI");
+        std::string text = env ? env : "";
+        size_t at = 0;
+        while (at < text.size())
+        {
+            size_t end = text.find(';', at);
+            std::string item = text.substr(at, end == std::string::npos ? std::string::npos : end - at);
+            at = end == std::string::npos ? text.size() : end + 1;
+            size_t colon = item.find(':'), eq = item.find('=', colon == std::string::npos ? 0 : colon);
+            if (colon == std::string::npos || eq == std::string::npos) continue;
+            list.push_back({trim(item.substr(0, colon)), trim(item.substr(colon + 1, eq - colon - 1)), trim(item.substr(eq + 1))});
+        }
+        return list;
+    }();
+    return v;
+}
+
 bool ini_lookup(const char* file, const char* app, const char* key, std::vector<std::string>& out)
 {
+    if (app && key)
+        for (const IniOverride& o : ini_overrides())
+            if (!strcasecmp_portable(o.key.c_str(), key) && !strcasecmp_portable(o.section.c_str(), app))
+            {
+                out.push_back(o.value);
+                return true;
+            }
     std::lock_guard<std::mutex> lk(g_ini_mx);
     const Ini& ini = load_ini(host_path(file));
     if (!app)

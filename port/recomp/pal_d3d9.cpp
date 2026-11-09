@@ -573,9 +573,10 @@ void dv_Present(FnvCpu& s)
     {
         emit(OP_PRESENT, {d->frame});
         __atomic_add_fetch(&g_ring.frames_sent, 1, __ATOMIC_RELEASE);
-        // stay at most two frames ahead of the renderer
+        // stay at most one frame ahead of the renderer: the page releases one frame per screen refresh
+        // (web/recomp/index.html pace()), and every frame queued beyond that is 17 ms of late input
         auto t0 = std::chrono::steady_clock::now();
-        while (g_ring.frames_sent - __atomic_load_n(&g_ring.frames_done, __ATOMIC_ACQUIRE) > 2)
+        while (g_ring.frames_sent - __atomic_load_n(&g_ring.frames_done, __ATOMIC_ACQUIRE) > 1)
             std::this_thread::sleep_for(std::chrono::microseconds(500));
         auto t1 = std::chrono::steady_clock::now();
         static auto last = t1;

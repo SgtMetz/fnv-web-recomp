@@ -94,3 +94,55 @@ export async function jsProfile(ms = 5000, top = 30) {
   }
   return [...self].sort((a, b) => b[1] - a[1]).slice(0, top).map(([k, n]) => [k, +(100 * n / t.samples.length).toFixed(1)]);
 }
+
+// ---- settings and frame-time experiments (how web/recomp/tuner.js's levers were measured) ----------------------------
+// A game setting ("fGrassStartFadeDistance:Grass") is an object {vtable, value, name*} in .data: its address is found
+// through its name string in .rdata. Most settings are read once at start-up, so writing one often changes nothing.
+const settingAt = {};
+export function setting(name) {
+  if (settingAt[name] !== undefined) return settingAt[name];
+  const M = window.Module, H8 = M.HEAPU8, H32 = M.HEAPU32, b = new TextEncoder().encode(name + '\0');
+  let str = 0;
+  outer: for (let a = 0xfdf000; a < 0x1182000; a++) {
+    if (H8[a] !== b[0]) continue;
+    for (let i = 1; i < b.length; i++) if (H8[a + i] !== b[i]) continue outer;
+    str = a; break;
+  }
+  let at = 0;
+  if (str) for (let p = 0x1183000 >>> 2; p < (0x1272000 >>> 2); p++) if (H32[p] === str) { at = p * 4 - 8; break; }
+  return (settingAt[name] = at);
+}
+export const getF = (n) => setting(n) ? window.Module.HEAPF32[(setting(n) + 4) >>> 2] : null;
+export const getI = (n) => setting(n) ? window.Module.HEAPU32[(setting(n) + 4) >>> 2] : null;
+export const setF = (n, v) => { if (setting(n)) window.Module.HEAPF32[(setting(n) + 4) >>> 2] = v; };
+export const setI = (n, v) => { if (setting(n)) window.Module.HEAPU32[(setting(n) + 4) >>> 2] = v; };
+export const con = (line) => window.Module.ccall('fnv_console', null, ['string'], [line]);
+
+// one measurement: game-thread ms, renderer-pump ms and draws per frame. The mouse nudge keeps the idle camera
+// (which orbits the player after a while and changes what is in view) from starting.
+export async function measure(ms = 2500) {
+  const M = window.Module, H32 = M.HEAPU32, w = M._fnv_perf() >>> 2, r = window.renderer, p = window.fnvPump;
+  M._fnv_mouse(3, 0, 0, -1, 0); await sleep(60); M._fnv_mouse(-3, 0, 0, -1, 0); await sleep(800);
+  const read = () => [0, 1, 2].map((i) => H32[w + 2 * i] + H32[w + 2 * i + 1] * 4294967296);
+  const a = read(), d0 = r.stats.draws, f0 = r.frames, b0 = p.busyMs;
+  await sleep(ms);
+  const b = read(), fr = b[0] - a[0], rf = r.frames - f0;
+  return { fps: fr * 1000 / ms, gameMs: (b[1] - a[1] - (b[2] - a[2])) / fr / 1000, waitMs: (b[2] - a[2]) / fr / 1000,
+    draws: (r.stats.draws - d0) / rf, pumpMs: (p.busyMs - b0) / rf };
+}
+
+// average of several measurements, as text
+export async function average(rounds = 4, ms = 2500) {
+  const s = { fps: 0, gameMs: 0, waitMs: 0, draws: 0, pumpMs: 0 };
+  for (let i = 0; i < rounds; i++) { const m = await measure(ms); for (const k in s) s[k] += m[k] / rounds; }
+  return `${s.fps.toFixed(1)} fps, game ${s.gameMs.toFixed(1)} ms, wait ${s.waitMs.toFixed(1)} ms, pump ${s.pumpMs.toFixed(1)} ms, ${s.draws.toFixed(0)} draws`;
+}
+
+// A/B: alternates two states (the machine's speed drifts by 10% or more between single measurements) and averages each
+export async function ab(a, b, rounds = 3, settle = 3000) {
+  const sum = [{ gameMs: 0, pumpMs: 0, draws: 0 }, { gameMs: 0, pumpMs: 0, draws: 0 }];
+  for (let i = 0; i < rounds; i++)
+    for (const [k, f] of [[0, a], [1, b]]) { f(); await sleep(settle); const m = await measure(); for (const x in sum[k]) sum[k][x] += m[x] / rounds; }
+  a();
+  return sum.map((s) => `game ${s.gameMs.toFixed(1)} ms, pump ${s.pumpMs.toFixed(1)} ms, ${s.draws.toFixed(0)} draws`).join('  ->  ');
+}

@@ -820,15 +820,16 @@ export class Renderer {
         const vsl = this.stageLayout(vs, 0, texKinds.slice(0, nvs)), psl = this.stageLayout(ps, 1, texKinds.slice(nvs));
         const layout = this.dev.createPipelineLayout({ bindGroupLayouts: [vsl, psl] });
         const stripFormat = topology === 'triangle-strip' || topology === 'line-strip' ? (indexed ? (stripBits === 32 ? 'uint32' : 'uint16') : undefined) : undefined;
-        this.dev.pushErrorScope('validation');
-        const p = this.dev.createRenderPipeline({
+        const desc = {
           layout,
           vertex: { module: this.module(this.vsCode(vs, vstate.patches), vs.name), entryPoint: 'main', buffers: vstate.buffers },
           fragment: { module: this.module(this.psCode(ps, vs, alpha), ps.name), entryPoint: 'main',
             targets: colorFormats.map((f, i) => f ? { format: f, blend: f.includes('32float') ? undefined : blend, writeMask: writeMasks[i] } : null) },
           primitive: { topology, cullMode: cull, frontFace, stripIndexFormat: fanIndex != null ? undefined : stripFormat },
           depthStencil: this.depthStencil(depthFormat),
-        });
+        };
+        this.dev.pushErrorScope('validation');
+        const p = this.dev.createRenderPipeline(desc);
         pipe = { p, vsl, psl };
         this.pipelines.set(key, pipe);
         this.dev.popErrorScope().then((err) => { if (err) { this.warn(`pipeline ${vs.name} + ${ps.name}: ${err.message.slice(0, 300)}`); this.pipelines.set(key, null); } });
@@ -919,7 +920,7 @@ export class Renderer {
     if (isUP) this.streams[0] = savedStream0;
     this.stats.draws++;
     if (this.trace) this.trace.push({ vs: vs.name, ps: ps.name, prim, count, rt: this.rt.map((r) => r && r.id), depth: this.depth,
-      tex: texViews.map((v, i) => { const st = i < vs.info.bindings.samplers.length ? 16 + vs.info.bindings.samplers[i].n : ps.info.bindings.samplers[i - vs.info.bindings.samplers.length].n; const tx = this.textures.get(this.tex[st]); return tx ? `${tx.id}:${tx.fmt}:${tx.w}x${tx.h}${v === tx.sampleView ? '' : '(dummy)'}` : 'none'; }),
+      tex: texViews.slice(0, ti0).map((v, i) => { const st = i < vs.info.bindings.samplers.length ? 16 + vs.info.bindings.samplers[i].n : ps.info.bindings.samplers[i - vs.info.bindings.samplers.length].n; const tx = this.textures.get(this.tex[st]); return tx ? `${tx.id}:${tx.fmt}:${tx.w}x${tx.h}${v === tx.sampleView ? '' : '(dummy)'}` : 'none'; }),
       blend: rs[RS.ALPHABLENDENABLE] ? `${rs[RS.SRCBLEND]}/${rs[RS.DESTBLEND]}` : 'off', alpha, z: `${rs[RS.ZENABLE]}${rs[RS.ZWRITEENABLE]}${rs[RS.ZFUNC]}`, stencil: rs[RS.STENCILENABLE] });
     if (fanIndex != null) {
       pass.setIndexBuffer(this.vertexArena, 'uint32', fanIndex); ps_.ib = null;

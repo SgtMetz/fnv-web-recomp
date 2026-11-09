@@ -11,6 +11,9 @@
 #include "pal_fs.h"
 
 #include <emscripten.h>
+#include <stdio.h>
+#include <chrono>
+#include "fnv_recomp_host.h"
 #include <stdlib.h>
 #include <string.h>
 
@@ -260,9 +263,24 @@ void bc_invalidate(const std::string& path)
     }
 }
 
+// The game's main thread waiting for the network is a frame that does not come: once the world is up, each such
+// wait is logged (the first 300), with the file, so the stalls a player sees while walking can be named.
+void main_wait_note(const std::chrono::steady_clock::time_point& t0, const std::string& path, int64_t blk, const char* how)
+{
+    static std::atomic<int> lines{0};
+    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+    if (ms < 15 || g_pal_boot.stage < 3 || lines.fetch_add(1) >= 300) return;
+    char buf[300];
+    snprintf(buf, sizeof buf, "[fs] main thread waited %d ms: %s block %d (%s)%c", (int)ms, path.c_str(), (int)blk, how, 10);
+    fnv_host_log(buf);
+}
+
 std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size)
 {
     std::string key = path + '#' + std::to_string(blk);
+    const bool main = fnv_host_is_main_thread();
+    const auto t0 = std::chrono::steady_clock::now();
+    bool waited = false;
     std::unique_lock<std::mutex> lk(g_bc_mx);
     for (;;)
     {
@@ -272,8 +290,10 @@ std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size
         if (b->ready)
         {
             b->used = ++g_bc_tick;
+            if (main && waited) { lk.unlock(); main_wait_note(t0, path, blk, "another thread's fetch"); }
             return b->failed ? nullptr : b;
         }
+        waited = true;
         g_bc_cv.wait(lk);                                  // another thread is fetching it
     }
     auto b = std::make_shared<Block>();
@@ -308,6 +328,7 @@ std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size
     bc_evict_locked();
     lk.unlock();
     g_bc_cv.notify_all();
+    if (main) main_wait_note(t0, path, blk, "its own fetch");
     return b->failed ? nullptr : b;
 }
 } // namespace

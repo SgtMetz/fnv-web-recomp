@@ -129,7 +129,7 @@
         if (adapter.isFallbackAdapter || ai.isFallbackAdapter) {
           warn('Software graphics', 'The browser is drawing with the CPU instead of a graphics card, so the game will be very slow. Turn on hardware acceleration in the browser\'s settings, or update your graphics driver.');
         }
-        if (!info.bc) warn('Slower textures', 'This graphics chip cannot read the game\'s compressed textures directly, so they are unpacked on the CPU. The game works, but loading takes longer. Low quality helps.');
+        if (!info.bc) warn('Slower textures', 'This graphics chip cannot read the game\'s compressed textures directly, so they are unpacked on the CPU. The game works, but loading takes longer.');
       }
     }
 
@@ -137,18 +137,18 @@
     info.cores = n.hardwareConcurrency || 0;
     info.memoryGB = n.deviceMemory || 0;          // Chrome rounds this, and reports at most 8
     if (info.memoryGB && info.memoryGB < 4) {
-      warn('Little memory', `This device reports about ${info.memoryGB} GB of memory. The game needs about 3 GB for itself, so the browser may close the tab while it loads. Choose Low quality and close other tabs and apps.`);
+      warn('Little memory', `This device reports about ${info.memoryGB} GB of memory. The game needs about 3 GB for itself, so the browser may close the tab while it loads. The page uses smaller textures and sounds on this device; close other tabs and apps.`);
     } else if (info.mobile && info.memoryGB && info.memoryGB < 8) {
-      warn('Phone memory', 'Phones and tablets often close a tab that uses as much memory as this game. Low quality uses much less; close other apps first.');
+      warn('Phone memory', 'Phones and tablets often close a tab that uses as much memory as this game. The page uses smaller textures and sounds here, which need much less; close other apps first.');
     }
     if (info.cores && info.cores < 4) warn('Few CPU cores', `This device has ${info.cores} CPU threads. The game uses several at once, so it will load and run slowly.`);
     info.benchMs = +bench().toFixed(1);
     info.cpuFactor = Math.max(0.5, info.benchMs / REF_BENCH_MS) * (info.cores && info.cores < 4 ? 1.5 : 1);
-    if (info.cpuFactor > 3) warn('Slow CPU', 'This device\'s processor tested several times slower than a typical desktop\'s. Expect a long load and a low frame rate; Low quality helps.');
+    if (info.cpuFactor > 3) warn('Slow CPU', 'This device\'s processor tested several times slower than a typical desktop\'s. Expect a long load and a low frame rate. Auto quality (under the game) shortens the view distance to help.');
 
     // ---- the connection -----------------------------------------------------------------------------------------------
     const c = n.connection;
-    if (c && c.saveData) warn('Data saver is on', 'The game downloads hundreds of megabytes (Low quality) to over a gigabyte (High). Use Wi-Fi if your data is limited.');
+    if (c && c.saveData) warn('Data saver is on', 'The game downloads hundreds of megabytes on a phone or tablet, and over a gigabyte on a computer. Use Wi-Fi if your data is limited.');
     const version = await timeout(fetch('VERSION.json', { cache: 'no-store' }).then((r) => (r.ok ? r.json() : null)), 3000);
     info.wasmMB = version && version.wasm_br_bytes ? version.wasm_br_bytes / 1048576 : WASM_MB;
     // measuring competes with the game's own download, so only while the start panel is still waiting
@@ -156,7 +156,7 @@
     info.rttMs = Math.round((await measureRtt()) || (c && c.rtt) || 100);
     info.mbps = measured ? +measured.toFixed(2) : c && c.downlink ? +(c.downlink / 8).toFixed(2) : 2;
     info.bandwidthMeasured = !!measured;
-    if (info.mbps < 0.6) warn('Slow connection', `The download measured about ${(info.mbps * 8).toFixed(1)} Mbit/s. The game fetches a lot of data while it loads, so this will take a long time; Low quality downloads about a third as much.`);
+    if (info.mbps < 0.6) warn('Slow connection', `The download measured about ${(info.mbps * 8).toFixed(1)} Mbit/s. The game fetches a lot of data while it loads, so this will take a long time.`);
     if (info.rttMs > 400) warn('High latency', `Each request to the server takes about ${info.rttMs} ms, and the game makes over a thousand of them while it loads.`);
   }
 
@@ -208,13 +208,16 @@
   const esc = (s) => String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[ch]);
 
   function etaHtml() {
-    const qual = localStorage.getItem('fnv.quality') || (result.info.mobile ? 'low' : 'high');
+    // the page's own pick (index.html), or the same rule when this runs first
+    const asked = query.get('quality') || { 1: 'low', 0: 'high' }[query.get('mobile')];
+    const qual = window.fnvQuality || (asked === 'low' || asked === 'high' ? asked
+      : result.info.mobile || (result.info.memoryGB && result.info.memoryGB < 4) ? 'low' : 'high');
     const e = estimate(qual, 'normal');
     if (!e) return '';
     const i = result.info;
     const how = e.last ? 'how long it took last time on this browser'
       : `your connection (${i.bandwidthMeasured ? 'measured ' : ''}about ${(i.mbps * 8).toFixed(1)} Mbit/s, ${i.rttMs} ms) and a quick test of your processor`;
-    return `<p class="eta">Estimated load time to the main menu at ${qual === 'low' ? 'Low' : 'High'} quality: <b>${esc(e.text)}</b>
+    return `<p class="eta">Estimated load time to the main menu: <b>${esc(e.text)}</b>
       <small>From ${esc(how)}.</small></p>`;
   }
 
