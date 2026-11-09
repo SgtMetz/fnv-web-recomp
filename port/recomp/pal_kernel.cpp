@@ -889,6 +889,16 @@ void k_CreateDirectoryA(FnvCpu& s)
 }
 void k_DeleteFileA(FnvCpu& s) { RET(pal_fs_remove(host_path(gstr(A(0))).c_str()), 1); }
 void k_MoveFileA(FnvCpu& s) { RET(pal_fs_rename(host_path(gstr(A(0))).c_str(), host_path(gstr(A(1))).c_str()), 2); }
+void k_CopyFileA(FnvCpu& s)
+{
+    const std::string from = host_path(gstr(A(0))), to = host_path(gstr(A(1)));
+    if (pal_fs_copy(from.c_str(), to.c_str(), A(2) != 0)) RET(1, 3);
+    PalStat st;
+    if (!stat_path(from, st)) set_err(2); // ERROR_FILE_NOT_FOUND
+    else if (A(2) && stat_path(to, st)) set_err(80); // ERROR_FILE_EXISTS
+    else set_err(5); // ERROR_ACCESS_DENIED
+    RET(0, 3);
+}
 void k_FindFirstFileA(FnvCpu& s)
 {
     std::string pat = host_path(gstr(A(0)));
@@ -1164,6 +1174,7 @@ const PalEntry kKernel[] = {
     {"GetFileSize", k_GetFileSize}, {"GetFileSizeEx", k_GetFileSizeEx}, {"FlushFileBuffers", k_FlushFileBuffers},
     {"SetEndOfFile", k_SetEndOfFile}, {"GetFileTime", k_GetFileTime}, {"GetFileAttributesA", k_GetFileAttributesA},
     {"CreateDirectoryA", k_CreateDirectoryA}, {"DeleteFileA", k_DeleteFileA}, {"MoveFileA", k_MoveFileA},
+    {"CopyFileA", k_CopyFileA},
     {"FindFirstFileA", k_FindFirstFileA}, {"FindNextFileA", k_FindNextFileA}, {"FindClose", k_FindClose},
     {"GetPrivateProfileStringA", k_GetPrivateProfileStringA}, {"GetPrivateProfileIntA", k_GetPrivateProfileIntA},
     {"WritePrivateProfileStringA", k_WritePrivateProfileStringA},

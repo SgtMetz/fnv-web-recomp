@@ -1243,6 +1243,11 @@ const PalEntry kD3d9[] = {{"Direct3DCreate9", p_Direct3DCreate9}, {nullptr, null
 } // namespace
 
 const PalEntry* pal_d3d9_entries() { return kD3d9; }
+const char* pal_d3d9_adapter_name()
+{
+    // D3DADAPTER_IDENTIFIER9 starts with Driver[512], followed by Description[512].
+    return reinterpret_cast<const char*>(kIdentifier + 512);
+}
 D3dRing* pal_d3d_ring() { return &g_ring; }
 void pal_d3d_enable_ring(uint32_t bytes)
 {

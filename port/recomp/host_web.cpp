@@ -392,8 +392,26 @@ bool map_exe(const char* path)
     return true;
 }
 
+void seed_browser_prefs()
+{
+    // The PC launcher writes the display mode before running FalloutNV.exe.
+    // A new browser data folder has no launcher. The game needs both the virtual adapter name
+    // and a canvas-sized windowed mode to select its Direct3D device.
+    const std::string path = g_docs + "/My Games/FalloutNV/FalloutPrefs.ini";
+    PalStat st;
+    if (pal_fs_stat(path.c_str(), &st)) return;
+    if (PalFile* file = pal_fs_open(path.c_str(), "w+b"))
+    {
+        const std::string prefs = std::string("[Display]\r\nbFull Screen=0\r\niSize W=1280\r\niSize H=720\r\nsD3DDevice=\"") +
+                                  pal_d3d9_adapter_name() + "\"\r\n";
+        pal_fs_write(prefs.data(), prefs.size(), file);
+        pal_fs_close(file);
+    }
+}
+
 void* game_main(void*)
 {
+    if (g_browser) seed_browser_prefs();
     t_ht = g_main_ht = new_thread(16u << 20);
     run_tls_callbacks(t_ht, 1);
     pal_boot_stage(kBootMain);
