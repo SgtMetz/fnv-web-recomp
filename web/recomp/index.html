@@ -62,6 +62,13 @@
     #stick { width: 96px; height: 96px; margin: -48px 0 0 -48px; }
     #knob { width: 42px; height: 42px; margin: -21px 0 0 -21px; }
   }
+  /* save and load, under the game */
+  #saves { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; padding: 8px 0 2px; color: var(--dim); }
+  #saves button { font: inherit; color: var(--fg); background: #1e1c16; border: 1px solid #3a3528; border-radius: 4px;
+    padding: 6px 14px; cursor: pointer; }
+  #saves button:hover:not(:disabled), #saves button:focus-visible { border-color: var(--accent); outline: none; }
+  #saves button:disabled { opacity: .5; cursor: default; }
+  #savesMsg { flex: 1 1 260px; }
   /* the built-in controls replace any touch bar the hosting page adds under the game */
   html.touch #touch-controls, html.touch #touch-hint { display: none !important; }
   /* and the game gets the screen's height (less the header): the controls sit over and beside it */
@@ -110,6 +117,12 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
         </div>
       </div>
     </div>
+  </div>
+  <div id="saves">
+    <button id="saveGame" type="button" disabled title="Quicksave, then download the save to your disk">Save game</button>
+    <button id="loadGame" type="button" title="Pick a .fos save from your disk">Load game</button>
+    <input id="loadFile" type="file" accept=".fos" multiple hidden>
+    <span id="savesMsg">Your saves stay in this browser tab: Save game puts a copy on your disk, Load game brings one back.</span>
   </div>
   <div id="log"></div>
 </div>
@@ -570,6 +583,128 @@ if (touchUI) {
   window.addEventListener('blur', () => { move = look = null; setMove(new Set()); rest(); });
   window.addEventListener('resize', () => { if (!move) rest(); });
   window.addEventListener('fnv-progress', (e) => { if (e.detail.ready && pad.hidden) { pad.hidden = false; rest(); } });
+}
+
+// ---- saves on the player's disk ---------------------------------------------------------------------------------------
+// The server's saves and settings are only read: what the game writes to them stays in this tab (port/recomp/
+// pal_fs_web.cpp, the local /docs layer), because every player shares the server's copy. Save game quicksaves (F5),
+// waits for the save to be written and downloads it (or the newest save made in this tab, when the game cannot
+// quicksave right then). Load game puts .fos files from the player's disk in the Saves folder, where the game's own
+// Load menu lists them; picked before the game has started, they go in once it has.
+{
+  const DEFAULT_DIR = '/docs/My Games/FalloutNV/Saves';
+  const saveBtn = document.getElementById('saveGame'), loadBtn = document.getElementById('loadGame');
+  const loadFile = document.getElementById('loadFile'), msgEl = document.getElementById('savesMsg');
+  const msg = (m) => { msgEl.textContent = m; };
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const M = () => window.Module;
+  const ready = () => boot.runtime && !!M()._fnv_docs_list;
+  const cstr = (s) => {
+    const b = new TextEncoder().encode(s + '\0'), p = M()._malloc(b.length) >>> 0;
+    M().HEAPU8.set(b, p);
+    return p;
+  };
+  // the .fos files this tab keeps, newest first: {path, size, mtime}
+  const kept = () => {
+    if (!ready()) return [];
+    let cap = 65536, p, need;
+    for (;;) {
+      p = M()._malloc(cap) >>> 0;
+      need = M()._fnv_docs_list(p, cap);
+      if (need <= cap) break;
+      M()._free(p); cap = need;
+    }
+    const text = utf8.decode(M().HEAPU8.slice(p, p + need - 1));
+    M()._free(p);
+    return text.split('\n').filter(Boolean).map((l) => { const [path, size, mtime] = l.split('\t'); return { path, size: +size, mtime: +mtime }; })
+      .filter((f) => /\.fos$/i.test(f.path)).sort((a, b) => b.mtime - a.mtime);
+  };
+  const readKept = (path) => {
+    const p = cstr(path);
+    const size = M()._fnv_docs_read(p, 0, 0);
+    let bytes = null;
+    if (size >= 0) {
+      const d = M()._malloc(Math.max(1, size)) >>> 0;
+      if (M()._fnv_docs_read(p, d, size) === size) bytes = M().HEAPU8.slice(d, d + size);
+      M()._free(d);
+    }
+    M()._free(p);
+    return bytes;
+  };
+  const baseName = (path) => path.slice(path.lastIndexOf('/') + 1);
+  const download = (f) => {
+    const bytes = readKept(f.path);
+    if (!bytes) return false;
+    const url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    const a = document.createElement('a');
+    a.href = url; a.download = baseName(f.path);
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 30000);
+    return true;
+  };
+  const sig = (f) => `${f.path}|${f.mtime}|${f.size}`;
+  let busy = false;
+  saveBtn.addEventListener('click', async () => {
+    if (busy || !boot.ready) return;
+    busy = true; saveBtn.disabled = true;
+    try {
+      const before = new Set(kept().map(sig));
+      msg('Saving…');
+      M()._fnv_key(63, 1); await sleep(100); M()._fnv_key(63, 0);        // F5, the game's quicksave
+      // a new or changed save, once its size has held for half a second (written)
+      let found = null, last = '';
+      for (const t = performance.now(); performance.now() - t < 15000;) {
+        await sleep(500);
+        const fresh = kept().find((f) => !before.has(sig(f)));
+        if (fresh && sig(fresh) === last) { found = fresh; break; }
+        last = fresh ? sig(fresh) : '';
+      }
+      if (found && download(found)) msg(`Saved to your disk: ${baseName(found.path)}`);
+      else {
+        const newest = kept()[0];
+        if (newest && download(newest)) msg(`The game could not quicksave just now (it cannot in menus, dialogue or combat), so your last save went to your disk: ${baseName(newest.path)}`);
+        else msg('Nothing to save yet: the game quicksaves once you are playing, not in a menu or dialogue. Try again in the world.');
+      }
+    } catch (e) {
+      msg('Saving failed: ' + e);
+      log('save: ' + (e.stack || e), true);
+    }
+    busy = false; saveBtn.disabled = false;
+    canvas.focus();
+  });
+  const pending = [];
+  const putPending = () => {
+    if (!pending.length || !ready()) return;
+    const k = kept()[0], dir = k ? k.path.slice(0, k.path.lastIndexOf('/')) : DEFAULT_DIR;
+    const names = [];
+    for (const s of pending.splice(0)) {
+      const p = cstr(`${dir}/${s.name}`), d = M()._malloc(Math.max(1, s.bytes.length)) >>> 0;
+      M().HEAPU8.set(s.bytes, d);
+      if (M()._fnv_docs_put(p, d, s.bytes.length)) names.push(s.name);
+      M()._free(p); M()._free(d);
+    }
+    msg(`Ready to load: ${names.join(', ')}. Open Load in the game (on the main menu, or Esc in game) and pick it.`);
+  };
+  loadBtn.addEventListener('click', () => loadFile.click());
+  loadFile.addEventListener('change', async () => {
+    const files = [...loadFile.files];
+    loadFile.value = '';
+    const bad = [];
+    for (const file of files) {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      if (utf8.decode(bytes.subarray(0, 11)) !== 'FO3SAVEGAME') { bad.push(file.name); continue; }
+      pending.push({ name: file.name.replace(/[\\/:*?"<>|]/g, '_'), bytes });
+    }
+    const skipped = bad.length ? ` Not a New Vegas save (.fos), skipped: ${bad.join(', ')}.` : '';
+    if (!pending.length) { msg(skipped.trim()); return; }
+    if (ready()) putPending();
+    else msg(`${pending.length === 1 ? pending[0].name + ' goes' : pending.length + ' saves go'} in once the game has started; then choose Load on the main menu.`);
+    msgEl.textContent += skipped;
+  });
+  window.addEventListener('fnv-progress', (e) => {
+    putPending();
+    if (e.detail.ready) saveBtn.disabled = busy;
+  });
 }
 
 // start mode, chosen before the game loads: ?start=normal|quick, or the panel over the canvas. Quick sets FNV_START,
