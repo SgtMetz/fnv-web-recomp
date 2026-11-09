@@ -1,6 +1,7 @@
 // pal_fs backend for the browser (pal_fs.h): synchronous requests from the game's worker threads to the web server
 // (server/serve.mjs), which serves two roots: /game (the player's install, read-only) and /docs (the private copy of
-// My Games\FalloutNV, writable). Built to stay usable with network latency:
+// My Games\FalloutNV). The game's writes to /docs stay in the browser tab (the local layer below), so the server's
+// copy, shared by every player, is never changed. Built to stay usable with network latency:
 //   - stat and list under /game come from one index of the install (/fs/index, fetched once per thread), not one
 //     request each (start-up makes thousands);
 //   - reads go in 1 MB blocks (256 KB in the phone version) through one block cache for all threads (in wasm
@@ -13,9 +14,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <time.h>
+
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -144,7 +148,10 @@ EM_JS(int, js_fs_op, (const char* op, const char* a, const char* b), {
     return x.status == 200 ? 1 : 0;
 });
 
-struct PalFile { std::string path; int64_t pos, size; bool writable; };
+// a /docs file or folder kept in this browser tab (below)
+struct LocalNode { bool dir = false, gone = false; std::vector<uint8_t> data; uint32_t mtime = 0; std::string path; };
+
+struct PalFile { std::string path; int64_t pos, size; bool writable; std::shared_ptr<LocalNode> local; };
 
 namespace {
 std::mutex g_cwd_mx;
@@ -289,6 +296,106 @@ std::shared_ptr<Block> bc_get(const std::string& path, int64_t blk, int64_t size
 }
 } // namespace
 
+
+// ---- /docs in this browser tab ---------------------------------------------------------------------------------
+// The server's /docs (settings and saves) is only read. Everything the game writes there stays in this tab's memory,
+// over the server's copy: a file is copied in when the game first changes it, and a removed one is remembered as
+// gone. The server's files are shared by every player, so nothing a player does goes back to it. The page's
+// Save game and Load game buttons (web/recomp/index.html) move saves between this layer and the player's own disk
+// (fnv_docs_* at the end). FNV_DOCS=server writes to the server as before (development).
+static std::atomic<uint64_t> g_changes;
+namespace {
+std::mutex g_lc_mx;
+std::map<std::string, std::shared_ptr<LocalNode>> g_local;   // lowercased path -> node (the game is case-insensitive)
+
+bool docs_local()
+{
+    static const bool v = [] { const char* a = getenv("FNV_DOCS"); return !(a && !strcmp(a, "server")); }();
+    return v;
+}
+std::string lower(std::string s)
+{
+    for (char& c : s)
+        if (c >= 'A' && c <= 'Z') c += 32;
+    return s;
+}
+bool is_local(const std::string& p)
+{
+    if (!docs_local()) return false;
+    std::string k = lower(p);
+    return k == "/docs" || k.compare(0, 6, "/docs/") == 0;
+}
+uint32_t now_s() { return (uint32_t)time(nullptr); }
+
+// (lock held) the node kept for a path, or nullptr
+std::shared_ptr<LocalNode> lc_find(const std::string& p)
+{
+    auto it = g_local.find(lower(p));
+    return it == g_local.end() ? nullptr : it->second;
+}
+// (lock held) the folders above a path exist here
+void lc_parents(const std::string& p)
+{
+    for (size_t i = p.rfind('/'); i != std::string::npos && i > 0; i = p.rfind('/', i - 1))
+    {
+        std::shared_ptr<LocalNode>& n = g_local[lower(p.substr(0, i))];
+        if (n && !n->gone) break;
+        n = std::make_shared<LocalNode>();
+        n->dir = true;
+        n->path = p.substr(0, i);
+        n->mtime = now_s();
+    }
+}
+// (lock held) a path and everything under it is gone (open handles keep their own nodes)
+void lc_gone(const std::string& p)
+{
+    auto mark = [](const std::string& path) {
+        auto n = std::make_shared<LocalNode>();
+        n->gone = true;
+        n->path = path;
+        return n;
+    };
+    std::string pre = lower(p) + "/";
+    for (auto it = g_local.lower_bound(pre); it != g_local.end() && it->first.compare(0, pre.size(), pre) == 0; ++it)
+        if (!it->second->gone) it->second = mark(it->second->path);
+    g_local[lower(p)] = mark(p);
+}
+// a server file's bytes, read in 1 MB pieces
+bool server_bytes(const std::string& p, const uint32_t st[4], std::vector<uint8_t>& out)
+{
+    int64_t size = (int64_t)st[1] + ((int64_t)st[2] << 32);
+    out.resize((size_t)size);
+    for (int64_t off = 0; off < size;)
+    {
+        int want = (int)std::min<int64_t>(1 << 20, size - off);
+        int got = js_fs_fetch(p.c_str(), (double)off, want, out.data() + off);
+        if (got <= 0) return false;
+        off += got;
+    }
+    return true;
+}
+// the node for a path the game is about to change: kept here already, or copied from the server; nullptr: none
+std::shared_ptr<LocalNode> lc_take(const std::string& p)
+{
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        if (auto n = lc_find(p)) return n->gone ? nullptr : n;
+    }
+    uint32_t st[4];
+    if (!js_fs_stat(p.c_str(), st)) return nullptr;
+    auto n = std::make_shared<LocalNode>();
+    n->path = p;
+    n->dir = st[0] != 0;
+    n->mtime = st[3];
+    if (!n->dir && !server_bytes(p, st, n->data)) return nullptr;
+    std::lock_guard<std::mutex> lk(g_lc_mx);
+    if (auto m = lc_find(p)) return m->gone ? nullptr : m;    // another thread got there first
+    g_local[lower(p)] = n;
+    lc_parents(p);
+    return n;
+}
+} // namespace
+
 std::string pal_fs_resolve(const char* path) { return norm(path); }
 void pal_fs_chdir(const char* path)
 {
@@ -297,15 +404,49 @@ void pal_fs_chdir(const char* path)
     g_cwd = n;
 }
 
-static std::atomic<uint64_t> g_changes;
 uint64_t pal_fs_change_count() { return g_changes.load(); }
 PalFile* pal_fs_open(const char* path, const char* mode)
 {
     if (strpbrk(mode, "wa+")) ++g_changes;
     std::string p = norm(path);
+    bool write = strchr(mode, 'w') || strchr(mode, '+');
+    if (is_local(p))
+    {
+        std::shared_ptr<LocalNode> n;
+        if (mode[0] == 'w')
+        {
+            std::lock_guard<std::mutex> lk(g_lc_mx);
+            n = lc_find(p);
+            if (n && !n->gone && n->dir) return nullptr;
+            if (!n || n->gone)
+            {
+                n = std::make_shared<LocalNode>();
+                n->path = p;
+                g_local[lower(p)] = n;
+                lc_parents(p);
+            }
+            n->data.clear();
+            n->mtime = now_s();
+            return new PalFile{p, 0, 0, true, n};
+        }
+        if (write) n = lc_take(p);
+        else
+        {
+            std::lock_guard<std::mutex> lk(g_lc_mx);
+            n = lc_find(p);
+            if (n && n->gone) return nullptr;
+        }
+        if (n)
+        {
+            if (n->dir) return nullptr;
+            std::lock_guard<std::mutex> lk(g_lc_mx);
+            return new PalFile{p, 0, (int64_t)n->data.size(), write, n};
+        }
+        if (write) return nullptr;
+        // only read and not changed here: the server's copy, through the block cache (below)
+    }
     uint32_t st[4];
     bool exists = js_fs_stat(p.c_str(), st) && !st[0];
-    bool write = strchr(mode, 'w') || strchr(mode, '+');
     if (mode[0] == 'w')
     {
         bool ok = js_fs_op("truncate", p.c_str(), nullptr);
@@ -318,6 +459,16 @@ PalFile* pal_fs_open(const char* path, const char* mode)
 }
 size_t pal_fs_read(void* buf, size_t n, PalFile* f)
 {
+    if (f->local)
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        const std::vector<uint8_t>& d = f->local->data;
+        if (f->pos >= (int64_t)d.size()) return 0;
+        size_t k = std::min(n, d.size() - (size_t)f->pos);
+        memcpy(buf, d.data() + f->pos, k);
+        f->pos += (int64_t)k;
+        return k;
+    }
     if (f->pos >= f->size) return 0;
     fs_init();
     size_t done = 0;
@@ -339,6 +490,17 @@ size_t pal_fs_write(const void* buf, size_t n, PalFile* f)
 {
     ++g_changes;
     if (!f->writable) return 0;
+    if (f->local)
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        std::vector<uint8_t>& d = f->local->data;
+        if ((size_t)f->pos + n > d.size()) d.resize((size_t)f->pos + n);
+        memcpy(d.data() + f->pos, buf, n);
+        f->local->mtime = now_s();
+        f->pos += (int64_t)n;
+        f->size = (int64_t)d.size();
+        return n;
+    }
     fs_init();
     int put = js_fs_write(f->path.c_str(), (double)f->pos, (int)n, (const uint8_t*)buf);
     bc_invalidate(f->path);
@@ -348,6 +510,11 @@ size_t pal_fs_write(const void* buf, size_t n, PalFile* f)
 }
 int pal_fs_seek(PalFile* f, int64_t off, int whence)
 {
+    if (f->local)
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        f->size = (int64_t)f->local->data.size();
+    }
     int64_t base = whence == 0 ? 0 : whence == 1 ? f->pos : f->size;
     if (base + off < 0) return -1;
     f->pos = base + off;
@@ -358,8 +525,21 @@ void pal_fs_flush(PalFile*) {}
 void pal_fs_close(PalFile* f) { delete f; }
 bool pal_fs_stat(const char* path, PalStat* st)
 {
+    std::string p = norm(path);
+    if (is_local(p))
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        if (auto n = lc_find(p))
+        {
+            if (n->gone) return false;
+            st->dir = n->dir;
+            st->size = n->data.size();
+            st->mtime = n->mtime;
+            return true;
+        }
+    }
     uint32_t r[4];
-    if (!js_fs_stat(norm(path).c_str(), r)) return false;
+    if (!js_fs_stat(p.c_str(), r)) return false;
     st->dir = r[0] != 0;
     st->size = (uint64_t)r[1] | ((uint64_t)r[2] << 32);
     st->mtime = r[3];
@@ -368,22 +548,84 @@ bool pal_fs_stat(const char* path, PalStat* st)
 bool pal_fs_list(const char* dir, std::vector<std::string>& names)
 {
     std::string p = norm(dir);
+    // what this tab keeps directly in the folder: names here, and names gone here (hidden from the server's listing)
+    bool local = is_local(p), here = false;
+    std::vector<std::string> mine, gone;
+    if (local)
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        if (auto n = lc_find(p))
+        {
+            if (n->gone || !n->dir) return false;
+            here = true;
+        }
+        std::string pre = lower(p) + "/";
+        for (auto it = g_local.lower_bound(pre); it != g_local.end() && it->first.compare(0, pre.size(), pre) == 0; ++it)
+        {
+            if (it->first.find('/', pre.size()) != std::string::npos) continue;
+            const std::string& full = it->second->path;
+            (it->second->gone ? gone : mine).push_back(full.substr(full.rfind('/') + 1));
+        }
+    }
     std::vector<char> buf(65536);
     int need = js_fs_list(p.c_str(), buf.data(), (int)buf.size());
-    if (need < 0) return false;
     if (need > (int)buf.size())
     {
         buf.resize(need);
         need = js_fs_list(p.c_str(), buf.data(), (int)buf.size());
     }
-    for (const char* q = buf.data(); *q; q += strlen(q) + 1) names.push_back(q);
+    if (need < 0 && !(here || !mine.empty())) return false;
+    std::vector<std::string> skip;
+    for (auto& s : mine) skip.push_back(lower(s));
+    for (auto& s : gone) skip.push_back(lower(s));
+    if (need >= 0)
+        for (const char* q = buf.data(); *q; q += strlen(q) + 1)
+            if (std::find(skip.begin(), skip.end(), lower(q)) == skip.end()) names.push_back(q);
+    for (auto& s : mine) names.push_back(s);
     return true;
 }
-bool pal_fs_mkdir(const char* path) { ++g_changes; return js_fs_op("mkdir", norm(path).c_str(), nullptr); }
+bool pal_fs_mkdir(const char* path)
+{
+    ++g_changes;
+    std::string p = norm(path);
+    if (!is_local(p)) return js_fs_op("mkdir", p.c_str(), nullptr);
+    bool removed;                                          // removed here: made again here, whatever the server has
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        auto n = lc_find(p);
+        if (n && !n->gone) return n->dir;
+        removed = n != nullptr;
+    }
+    uint32_t st[4];
+    if (!removed && js_fs_stat(p.c_str(), st)) return st[0] != 0;   // already on the server
+    std::lock_guard<std::mutex> lk(g_lc_mx);
+    auto n = std::make_shared<LocalNode>();
+    n->dir = true;
+    n->path = p;
+    n->mtime = now_s();
+    g_local[lower(p)] = n;
+    lc_parents(p);
+    return true;
+}
 bool pal_fs_remove(const char* path)
 {
     ++g_changes;
     std::string p = norm(path);
+    if (is_local(p))
+    {
+        bool known;
+        {
+            std::lock_guard<std::mutex> lk(g_lc_mx);
+            auto n = lc_find(p);
+            if (n && n->gone) return false;
+            known = n != nullptr;
+        }
+        uint32_t st[4];
+        if (!known && !js_fs_stat(p.c_str(), st)) return false;
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        lc_gone(p);
+        return true;
+    }
     bool ok = js_fs_op("remove", p.c_str(), nullptr);
     bc_invalidate(p);
     return ok;
@@ -392,6 +634,28 @@ bool pal_fs_rename(const char* from, const char* to)
 {
     ++g_changes;
     std::string a = norm(from), b = norm(to);
+    if (is_local(a) || is_local(b))
+    {
+        if (!is_local(a) || !is_local(b)) return false;   // into or out of /docs: not done
+        std::shared_ptr<LocalNode> n = lc_take(a);
+        if (!n) return false;
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        // a folder's contents kept here move with it (its files only on the server do not)
+        std::vector<std::shared_ptr<LocalNode>> kids;
+        std::string pre = lower(a) + "/";
+        for (auto it = g_local.lower_bound(pre); it != g_local.end() && it->first.compare(0, pre.size(), pre) == 0; ++it)
+            if (!it->second->gone) kids.push_back(it->second);
+        lc_gone(a);
+        n->path = b;
+        g_local[lower(b)] = n;
+        lc_parents(b);
+        for (auto& k : kids)
+        {
+            k->path = b + k->path.substr(a.size());
+            g_local[lower(k->path)] = k;
+        }
+        return true;
+    }
     bool ok = js_fs_op("rename", a.c_str(), b.c_str());
     bc_invalidate(a);
     bc_invalidate(b);
@@ -401,4 +665,47 @@ std::string pal_fs_cwd()
 {
     std::lock_guard<std::mutex> lk(g_cwd_mx);
     return g_cwd;
+}
+
+// ---- the page's Save game and Load game buttons (web/recomp/index.html), on the browser's main thread -------------
+// every file this tab keeps, "path\tsize\tmtime\n"..., NUL-terminated: the bytes that needs (call again when > cap)
+extern "C" EMSCRIPTEN_KEEPALIVE int fnv_docs_list(char* out, int cap)
+{
+    std::string s;
+    {
+        std::lock_guard<std::mutex> lk(g_lc_mx);
+        for (auto& kv : g_local)
+        {
+            const LocalNode& n = *kv.second;
+            if (n.gone || n.dir) continue;
+            s += n.path + '\t' + std::to_string(n.data.size()) + '\t' + std::to_string(n.mtime) + '\n';
+        }
+    }
+    int need = (int)s.size() + 1;
+    if (need <= cap) memcpy(out, s.c_str(), (size_t)need);
+    return need;
+}
+// a kept file's bytes into dst when they fit; its size, or -1
+extern "C" EMSCRIPTEN_KEEPALIVE int fnv_docs_read(const char* path, uint8_t* dst, int cap)
+{
+    std::lock_guard<std::mutex> lk(g_lc_mx);
+    auto n = lc_find(path);
+    if (!n || n->gone || n->dir) return -1;
+    if ((int)n->data.size() <= cap) memcpy(dst, n->data.data(), n->data.size());
+    return (int)n->data.size();
+}
+// a file from the player's disk, kept at path ("/docs/..."); 1, or 0 for a path outside /docs
+extern "C" EMSCRIPTEN_KEEPALIVE int fnv_docs_put(const char* path, const uint8_t* src, int len)
+{
+    std::string p = path;
+    if (!is_local(p)) return 0;
+    ++g_changes;
+    std::lock_guard<std::mutex> lk(g_lc_mx);
+    auto n = std::make_shared<LocalNode>();
+    n->path = p;
+    n->data.assign(src, src + len);
+    n->mtime = now_s();
+    g_local[lower(p)] = n;
+    lc_parents(p);
+    return 1;
 }
