@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PAGE = ['index.html', 'credits.html', 'renderer.js', 'audio-worklet.js', 'debug.js']
+PAGE = ['index.html', 'credits.html', 'renderer.js', 'audio-worklet.js', 'debug.js', 'report.js']
 BUILD = ['fnv_web.js', 'fnv_web.wasm']
 BROTLI = r"""
 const fs = require('fs'), zlib = require('zlib');
