@@ -45,12 +45,13 @@ CRT_MATH = {0x00ec6054: ('sqrt', 1), 0x00ec6cde: ('fabs', 1), 0x00ec9010: ('atan
             0x00ecae30: ('exp', 1), 0x00ecbc80: ('log10', 1)}
 
 
-# CRT memory/string primitives with host implementations (port/recomp/fnv_intrinsics.cpp), by address from
-# port/compat/crt_map.json: the recompiled function only calls the host one and returns (cdecl)
+# Cdecl routines with host implementations in port/recomp/fnv_intrinsics.cpp. The CRT addresses come from
+# port/compat/crt_map.json. The lifted wrapper calls the host routine and pops the guest return address.
 INTRINSICS = {0x00ec44d0: 'memmove', 0x00ec7230: 'memmove', 0x00ec61c0: 'memset', 0x00ec4835: 'memcmp',
               0x00ec6130: 'strlen', 0x00ec6370: 'strcpy', 0x00ec6380: 'strcat', 0x00ec6da0: 'strcmp',
               0x00ec7690: 'strchr', 0x00ec6e30: 'strrchr', 0x00ec7750: 'strstr', 0x00ec8a19: 'strncmp',
-              0x00ecc7b0: 'strncpy', 0x00ecbf20: 'strpbrk', 0x00ecdb00: 'wcslen'}
+              0x00ecc7b0: 'strncpy', 0x00ecbf20: 'strpbrk', 0x00ecdb00: 'wcslen',
+              0x00af6e50: 'archive_sort'}
 
 
 class Recompiler(ls.Lifter):
@@ -78,7 +79,7 @@ class Recompiler(ls.Lifter):
     def lift(self, entry):
         if entry in INTRINSICS:
             self.lifted[entry] = ('void fnv_i_%s(FnvCpu& s);\nvoid f_%08x(FnvCpu& s) { fnv_i_%s(s); s.esp += 4; }  '
-                                  '// CRT %s (host)' % (INTRINSICS[entry], entry, INTRINSICS[entry], INTRINSICS[entry]))
+                                  '// %s (host)' % (INTRINSICS[entry], entry, INTRINSICS[entry], INTRINSICS[entry]))
             return
         # the base class bounds initializer-region entries by +0x2000; here every entry uses its function's end
         end = self._end(entry)

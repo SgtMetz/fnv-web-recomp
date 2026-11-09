@@ -1,6 +1,5 @@
-// Host implementations of the exe's CRT memory and string primitives (addresses: tools/recomp.py INTRINSICS, from
-// port/compat/crt_map.json). They replace the recompiled bodies: native memmove is far faster than lifted x86, and the
-// originals dispatch through unrolled jump tables. All are cdecl: arguments at esp+4, result in eax; the caller pops.
+// Host implementations of guest routines (addresses: tools/recomp.py INTRINSICS).
+// All are cdecl: arguments start at esp+4, and the caller pops them.
 // "C" locale semantics, as the game's CRT runs without setlocale.
 #include "fnv_recomp.h"
 
@@ -31,4 +30,46 @@ void fnv_i_wcslen(FnvCpu& s)
     uint32_t n = 0;
     while (p[n]) ++n;
     R(n);
+}
+
+namespace {
+uint64_t archive_key(uint32_t entry)
+{
+    return (uint64_t(M32(entry + 4u)) << 32) | M32(entry);
+}
+
+void archive_sort(uint32_t* entries, int first, int last)
+{
+    // Keep the original first-pivot partition and its ordering of equal keys. Only recurse into
+    // the smaller range so sorted or equal keys cannot grow the host stack linearly.
+    while (first < last)
+    {
+        int left = first, right = last;
+        const uint32_t pivot = entries[first];
+        const uint64_t key = archive_key(pivot);
+        while (left < right)
+        {
+            while (left < right && archive_key(entries[right]) >= key) --right;
+            if (left < right) entries[left++] = entries[right];
+            while (left < right && archive_key(entries[left]) <= key) ++left;
+            if (left < right) entries[right--] = entries[left];
+        }
+        entries[left] = pivot;
+        if (left - first < last - left)
+        {
+            archive_sort(entries, first, left - 1);
+            first = left + 1;
+        }
+        else
+        {
+            archive_sort(entries, left + 1, last);
+            last = left - 1;
+        }
+    }
+}
+} // namespace
+
+void fnv_i_archive_sort(FnvCpu& s)
+{
+    archive_sort((uint32_t*)(uintptr_t)A(0), (int32_t)A(1), (int32_t)A(2));
 }
