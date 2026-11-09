@@ -28,6 +28,9 @@
 //   --dlc                  load the DLC (FNV_DLC=1 too). Off by default: the game enables any plugin whose
 //                          Data\<name>.NAM exists, so the server answers as if no .nam file existed
 //   --delay <ms>           add latency to every /fs request (to test how the game behaves on a remote server)
+//   --reports <dir>        keep problem reports (the page's Report a problem, web/recomp/report.js) in <dir>/<id>/.
+//                          On in development (out/reports); a deployment without it answers the page's POST /report
+//                          with 404, and the page offers the report as a download instead
 //   --flaky <percent>      that share of /fs/read requests fails, half with a 503 and half by never answering (to
 //                          test the file layer's timeouts and retries, port/recomp/pal_fs_web.cpp)
 //
@@ -52,6 +55,7 @@ const PORT = +opt('--port', 8093);
 const DLC = args.includes('--dlc') || process.env.FNV_DLC === '1';
 const DELAY = +opt('--delay', 0);
 const FLAKY = +opt('--flaky', 0) / 100;
+const REPORTS = opt('--reports') ? path.resolve(opt('--reports')) : DEV ? path.join(ROOT, 'out/reports') : null;
 const MOBILE = path.resolve(opt('--mobile', path.join(ROOT, 'out/mobile')));
 const TLS = opt('--tls-cert') && opt('--tls-key') ? { cert: fs.readFileSync(opt('--tls-cert')), key: fs.readFileSync(opt('--tls-key')) } : null;
 if (!DEV && !DIST) {
@@ -256,6 +260,7 @@ async function handle(req, res) {
   try { p = decodeURIComponent(url.pathname); } catch { res.writeHead(400).end(); return; }
   if (p.startsWith('/fs/')) return fsApi(req, res, p.slice(4), url.searchParams);
   if (p.includes('..') || p.includes('\0')) { res.writeHead(400).end(); return; }
+  if (p === '/report' && req.method === 'POST') return saveReport(req, res);
   if (req.method !== 'GET' && req.method !== 'HEAD' && !(DEV && p === '/snap')) { res.writeHead(405).end(); return; }
   if (p.startsWith('/shader/')) {
     const sha = p.slice(8);
@@ -277,6 +282,37 @@ async function handle(req, res) {
   if (DIST) return serveFile(req, res, path.join(DIST, p === '/' ? 'index.html' : p.slice(1)));
   for (const [prefix, dir] of DEV_STATIC) if (p.startsWith(prefix)) return serveFile(req, res, path.join(dir, p.slice(prefix.length)));
   res.writeHead(404).end();
+}
+
+// a problem report from the page (web/recomp/report.js): multipart form data -> <REPORTS>/<id>/
+async function saveReport(req, res) {
+  const answer = (code, o) => res.writeHead(code, { 'content-type': 'application/json' }).end(JSON.stringify(o));
+  if (!REPORTS) return answer(404, { ok: false, error: 'this server does not take reports' });
+  let form;
+  try {
+    const buf = await body(req, 40 << 20);
+    form = await new Request('http://local/', { method: 'POST', headers: { 'content-type': req.headers['content-type'] || '' }, body: buf }).formData();
+  } catch (e) { return answer(400, { ok: false, error: 'bad report: ' + e.message }); }
+  const id = String(form.get('id') || '').replace(/[^\w-]/g, '').slice(0, 40) || 'report-' + Date.now();
+  const dir = path.join(REPORTS, id);
+  await fsp.mkdir(dir, { recursive: true });
+  const text = `${form.get('description') || ''}
+
+Contact: ${form.get('contact') || '-'}
+
+${form.get('summary') || ''}
+`;
+  await fsp.writeFile(path.join(dir, 'description.txt'), text);
+  const files = [];
+  for (const field of ['report', 'log', 'screenshot', 'save']) {
+    const f = form.get(field);
+    if (!f || typeof f === 'string') continue;
+    const name = field === 'save' ? 'save-' + (f.name || 'save.fos').replace(/[^\w. -]/g, '_') : f.name;
+    await fsp.writeFile(path.join(dir, name), Buffer.from(await f.arrayBuffer()));
+    files.push(`${name} ${f.size}`);
+  }
+  console.log(`[report] ${id}: ${files.join(', ')} -> ${dir}`);
+  answer(200, { ok: true, id });
 }
 
 const server = TLS ? https.createServer(TLS, handle) : http.createServer(handle);

@@ -6,6 +6,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>New Vegas Recompiled</title>
+<!-- where "Report a problem" sends reports (web/recomp/report.js); the development server keeps them in out/reports -->
+<meta name="fnv-report" content="/report">
+<script src="report.js"></script>
 <style>
   :root { color-scheme: dark; --bg: #0d0d0d; --fg: #d8d2c4; --dim: #8a8478; --accent: #e0a040; }
   body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 system-ui, sans-serif; }
@@ -122,6 +125,7 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
     <button id="saveGame" type="button" disabled title="Quicksave, then download the save to your disk">Save game</button>
     <button id="loadGame" type="button" title="Pick a .fos save from your disk">Load game</button>
     <input id="loadFile" type="file" accept=".fos" multiple hidden>
+    <button id="reportIssue" type="button" title="Tell us what went wrong; the game's log is sent with it">Report a problem</button>
     <span id="savesMsg">Your saves stay in this browser tab: Save game puts a copy on your disk, Load game brings one back.</span>
   </div>
   <div id="log"></div>
@@ -133,6 +137,7 @@ const logEl = document.getElementById('log'), status = document.getElementById('
 const DEV = document.documentElement.classList.contains('dev');
 let logLines = 0;
 function log(m, err) {
+  window.fnvReport?.add(err === 'stderr' ? '2' : err ? 'E' : '-', m);   // the report's log keeps everything (report.js)
   if (logLines++ > 4000) return;
   const d = document.createElement('div');
   if (err) d.className = 'err';
@@ -142,7 +147,24 @@ function log(m, err) {
 }
 
 if (!crossOriginIsolated) log('page is not cross-origin isolated: SharedArrayBuffer (wasm threads) is unavailable', true);
-const { device, features } = await createDevice();
+let device, features, adapter;
+try {
+  ({ device, features, adapter } = await createDevice());
+} catch (e) {
+  // no WebGPU (or no adapter): say so where the player looks, not only in the hidden log
+  status.textContent = 'cannot start: ' + e.message;
+  log('WebGPU: ' + (e.stack || e), true);
+  const bootRoot = document.getElementById('boot');
+  bootRoot.hidden = false; bootRoot.classList.add('failed');
+  document.getElementById('bootPhase').textContent = 'This browser cannot run the game: ' + e.message;
+  document.getElementById('bootDetail').textContent = 'It needs WebGPU: a recent Chrome or Edge on a desktop, or Chrome on Android. Report a problem (below) if you think it should work.';
+  throw e;
+}
+// for problem reports (report.js): the adapter the game runs on
+window.fnvGpu = { info: { vendor: adapter.info?.vendor, architecture: adapter.info?.architecture, device: adapter.info?.device,
+  description: adapter.info?.description }, fallback: adapter.isFallbackAdapter, features: [...adapter.features], required: features,
+  limits: Object.fromEntries(Object.keys(Object.getPrototypeOf(adapter.limits)).filter((k) => typeof adapter.limits[k] === 'number').map((k) => [k, adapter.limits[k]])) };
+device.lost.then((i) => log(`WebGPU device lost (${i.reason}): ${i.message}`, true));
 const canvas = document.getElementById('screen');
 const renderer = new Renderer(device, canvas, { log: (m) => log('[renderer] ' + m, true) });
 window.renderer = renderer;
@@ -171,7 +193,7 @@ window.Module = {
   arguments: ['--exe', 'G:/game/FalloutNV.exe', '--docs', 'G:/docs'],
   fnvEnv: env,
   print: (m) => log(m),
-  printErr: (m) => log(m, true),
+  printErr: (m) => log(m, 'stderr'),
   onAbort: (m) => { status.textContent = 'aborted'; log('abort: ' + m, true); boot.fail('The game stopped: ' + m); },
   onRuntimeInitialized: () => { log(`runtime ready in ${((performance.now() - t0) / 1000).toFixed(1)} s`); boot.runtime = true; pump(); startAudio(); },
 };
@@ -631,6 +653,7 @@ if (touchUI) {
     M()._free(p);
     return bytes;
   };
+  window.fnvSaves = { list: kept, read: readKept };    // for problem reports (report.js)
   const baseName = (path) => path.slice(path.lastIndexOf('/') + 1);
   const download = (f) => {
     const bytes = readKept(f.path);

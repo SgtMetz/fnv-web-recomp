@@ -70,6 +70,7 @@ node server/serve.mjs --dist /srv/fnv/dist --game "/srv/fnv/Fallout New Vegas" -
 | `--dlc` | load the DLC. It is off by default because the game enables any plugin with a `Data\<name>.NAM` file. |
 | `--mobile <dir>` | the phone version's texture archives (default `out/mobile`), served at `/game/data/mobile/` |
 | `--delay <ms>` | test only: add latency to every file request |
+| `--reports <dir>` | keep the page's problem reports (Report a problem, `web/recomp/report.js`) in `<dir>/<id>/`. On in development (`out/reports`); without it a deployment answers 404 and the page offers the report as a download |
 
 The server also needs:
 - **HTTPS:** the game needs `SharedArrayBuffer`, which browsers allow only on cross-origin-isolated pages served
