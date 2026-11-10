@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<script async src="https://pagead2.googlesyndication.com/pagead/js/adsbygoogle.js?client=ca-pub-3495050274738508"
+     crossorigin="anonymous"></script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="icon-192.png" sizes="192x192">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<title>About New Vegas Recompiled</title>
+<meta name="description" content="What New Vegas Recompiled is, how it runs Fallout: New Vegas in a web browser from your own copy of the game, and what it needs.">
+<style>
+  :root { color-scheme: dark; --bg: #0d0d0d; --fg: #d8d2c4; --dim: #8a8478; --accent: #e0a040; --line: #3a3528; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 15px/1.6 system-ui, sans-serif; }
+  main { max-width: 720px; margin: 0 auto; padding: 24px 16px 24px; box-sizing: border-box; }
+  h1 { color: var(--accent); font-size: 24px; font-weight: 600; margin: 0 0 4px; }
+  h2 { color: var(--accent); font-size: 17px; font-weight: 600; margin: 32px 0 6px; padding-top: 16px; border-top: 1px solid var(--line); }
+  .dim { color: var(--dim); }
+  a { color: var(--accent); }
+  ul, ol { padding-left: 22px; }
+  .back { display: inline-block; margin-bottom: 20px; }
+  footer { max-width: 720px; margin: 0 auto; padding: 16px; border-top: 1px solid var(--line); color: var(--dim); font-size: 13px; box-sizing: border-box; }
+  footer a { color: var(--dim); margin-right: 14px; }
+</style>
+</head>
+<body>
+<main>
+  <a class="back" href="./">&larr; Back to the game</a>
+  <h1>About New Vegas Recompiled</h1>
+  <p class="dim">Fallout: New Vegas in a web browser, from your own copy of the game.</p>
+
+  <h2>What it is</h2>
+  <p>New Vegas Recompiled is a fan engineering project. It takes the program of the 2010 role-playing game
+    <i>Fallout: New Vegas</i> (<code>FalloutNV.exe</code>, the GOG release, version 1.4.0.525) and translates it ahead of time
+    into WebAssembly, the code format web browsers run. The game's graphics calls, which were written for Direct3D 9, are
+    translated to WebGPU, and its sound, input and file access are connected to browser features. The result runs in a tab,
+    with no installation.</p>
+
+  <h2>It needs your own copy of the game</h2>
+  <p>This site contains no game content: no maps, models, textures, sounds, scripts or quests. To play you pick the
+    folder of your own installed copy (the one that holds <code>FalloutNV.exe</code> and <code>Data</code>), and the browser
+    reads the files straight from that folder on your computer. Without a legitimate copy of the game there is nothing to
+    play. <a href="how-to-play.html">How to play</a> walks through the steps.</p>
+
+  <h2>How it works, briefly</h2>
+  <ul>
+    <li><b>Recompilation.</b> A tool reads the machine code of the original program and writes equivalent WebAssembly for every
+      function, so the game's own logic runs as the developers made it. It is not a rewrite or a clone.</li>
+    <li><b>A community decompilation.</b> The effort builds on <a href="https://github.com/momusdigital/fnv_decomp">fnv_decomp</a>,
+      which gives the game's functions, types and data layouts their names. See the <a href="credits.html">credits</a>.</li>
+    <li><b>Graphics.</b> The game's Direct3D 9 shaders and draw calls are translated to WebGPU, so a browser with WebGPU and a
+      reasonably modern graphics card is required.</li>
+    <li><b>Saves.</b> Saves are kept in your browser and can be downloaded to, and loaded from, a file on your disk.</li>
+    <li><b>Automatic quality.</b> The page watches the frame rate and shortens the view distance when the game runs slowly.</li>
+  </ul>
+
+  <h2>What you need</h2>
+  <ul>
+    <li>A computer with a recent version of Chrome or Edge, which have WebGPU. Phones and tablets get touch controls, but a
+      desktop is far better.</li>
+    <li>A graphics card that WebGPU supports, and several gigabytes of free memory.</li>
+    <li>Your own installed copy of Fallout: New Vegas.</li>
+  </ul>
+
+  <h2>Status</h2>
+  <p>The project is under active development and not every part of the game is complete. You can start a new game and walk
+    around the Mojave, and the remaining problems are being worked through. If something goes wrong, use the
+    <b>Report a problem</b> button under the game; it sends the game's log so the cause can be found.</p>
+
+  <h2>Not affiliated</h2>
+  <p>Fallout: New Vegas was developed by Obsidian Entertainment and published by Bethesda Softworks. "Fallout" and
+    "Fallout: New Vegas" are trademarks of their owners. This project is not affiliated with or endorsed by Bethesda
+    Softworks, ZeniMax Media, Obsidian Entertainment or Microsoft. Its own code is open source under the MIT licence at
+    <a href="https://github.com/SgtMetz/fnv-web-recomp">github.com/SgtMetz/fnv-web-recomp</a>.</p>
+</main>
+<footer><a href="./">Game</a><a href="about.html">About</a><a href="how-to-play.html">How to play</a><a href="credits.html">Credits</a><a href="privacy.html">Privacy policy</a><a href="terms.html">Terms</a><a href="contact.html">Contact</a></footer>
+</body>
+</html>

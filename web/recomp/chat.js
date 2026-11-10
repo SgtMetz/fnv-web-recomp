@@ -432,7 +432,7 @@
       if (inView) { start(); seenChat = true; unread = 0; jumpCount(); }
       else seenChat = false;
       // the corner button: once the player has scrolled down the page (not while the game fills the screen at the top)
-      jump.hidden = inView || scrollY < 40;
+      jump.hidden = inView || scrollY < 40 || anchor.hidden;
     };
     let queued = false;
     const soon = () => { if (!queued) { queued = true; setTimeout(() => { queued = false; check(); }, 100); } };
