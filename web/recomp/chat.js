@@ -101,6 +101,7 @@
       <span class="tr"><label title="Show other players' messages in your language"><input type="checkbox" id="chatTr"> Translate to</label>
         <select id="chatLang" aria-label="Translate into"></select></span>
       <span class="me">You are <button type="button" id="chatMe" title="Where your name comes from"></button></span>
+      <button type="button" id="chatDashboard" hidden>Activity dashboard</button>
       <button type="button" id="chatToggle" aria-expanded="true" aria-controls="chatMsgs">Hide chat</button></div>
     <div class="roster" id="chatRoster" hidden></div>
     <div class="namebox" id="chatNameBox" hidden>
@@ -163,7 +164,12 @@
     }
     const pinIn = $('chatPin'), nameErr = $('chatNameErr');
     let owner = false, name = '';
-    const showName = () => { me.textContent = name || '…'; };
+    const dashboard = $('chatDashboard');
+    let dashboardTimer;
+    const showName = () => {
+      me.textContent = name || '…';
+      dashboard.hidden = !owner || name !== 'Metz' || !url.startsWith('wss:');
+    };
     showName();
     const sendAuth = (pin) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'auth', pin })); };
     $('chatPinGo').addEventListener('click', () => {
@@ -430,6 +436,16 @@
 
     // ---- the connection -----------------------------------------------------------------------------------------------
     let ws = null, started = false, retry = 0;
+    const resetDashboard = () => {
+      clearTimeout(dashboardTimer);
+      dashboard.disabled = false;
+    };
+    dashboard.addEventListener('click', () => {
+      if (!owner || ws?.readyState !== WebSocket.OPEN) return;
+      dashboard.disabled = true;
+      ws.send(JSON.stringify({ type: 'dashboard' }));
+      dashboardTimer = setTimeout(resetDashboard, 8000);
+    });
     const setOnline = (n) => { online.textContent = `${n} online`; };
     const enable = (on) => { textIn.disabled = sendBtn.disabled = !on; };
     function connect() {
@@ -441,6 +457,7 @@
         try { m = JSON.parse(e.data); } catch { return; }
         if (m.type === 'hello') {
           owner = false;
+          showName();
           ws.send(JSON.stringify({ type: 'join', token }));
           // the owner on this browser: unlock the owner's name again with the kept PIN
           if (store.get('fnv.chat.pin')) sendAuth(store.get('fnv.chat.pin'));
@@ -456,6 +473,14 @@
           showName();
           if (changed) redraw();
           enable(true);
+        } else if (m.type === 'dashboard' && owner && dashboard.disabled && typeof m.pass === 'string') {
+          resetDashboard();
+          const target = new URL(url);
+          target.protocol = 'https:';
+          target.pathname = '/play/dashboard';
+          target.search = '';
+          target.hash = new URLSearchParams({ pass: m.pass }).toString();
+          location.assign(target);
         } else if (m.type === 'msg' || m.type === 'dm') {
           addMsg(m);
         } else if (m.type === 'online') {
@@ -479,6 +504,9 @@
         else if (m.type === 'error') note(m.error, true);
       };
       ws.onclose = () => {
+        owner = false;
+        resetDashboard();
+        showName();
         enable(false);
         online.textContent = 'reconnecting…';
         const wait = Math.min(30000, 1000 * 2 ** retry++);
