@@ -29,6 +29,8 @@
 (() => {
   'use strict';
   const TEXT_MAX = 300;
+  const WELCOME_BOT = 'Lichtsteiner #1';
+  const WELCOME_LINK = 'https://bit.ly/4zjj3sN';
 
   const CSS = `
   #chat { margin: 14px 0 20px; border: 1px solid #3a3528; background: #14130f; border-radius: 6px; display: flex; flex-direction: column; }
@@ -259,6 +261,16 @@
     let trFailed = 0, trWarned = false;
     function render(r) {
       const m = r.m, key = m.id + '|' + lang;
+      if (m.type === 'dm' && m.name === WELCOME_BOT && m.text === WELCOME_LINK) {
+        const link = document.createElement('a');
+        link.href = WELCOME_LINK;
+        link.textContent = WELCOME_LINK;
+        link.target = '_blank';
+        link.rel = 'noopener noreferrer';
+        r.text.replaceChildren(': ', link);
+        r.note.hidden = true;
+        return;
+      }
       const want = trOn && srcOf(m) !== lang;
       let tr = want ? tcache.get(key) : null;
       if (want && tr === undefined && m.tr && typeof m.tr[lang] === 'string') tr = m.tr[lang] ? { text: m.tr[lang], from: m.lang } : null;
