@@ -713,6 +713,28 @@ window.fnvMusic = (id, cmd, path, volume, pos) => {
   else if (cmd === 5 && t.playing) start(pos);
 };
 
+// Report recent game input using a random ID that lasts only for this page load.
+const activityURL = (() => {
+  try {
+    const url = new URL(document.querySelector('meta[name="fnv-chat"]').content);
+    return url.protocol === 'wss:' ? new URL('/play/pulse', `https://${url.host}`) : null;
+  } catch { return null; }
+})();
+const activitySession = activityURL && crypto.randomUUID();
+let nextActivityPulse = 0;
+function notePlayInput() {
+  const now = performance.now();
+  if (now < nextActivityPulse || !activityURL || !boot.ready || boot.failed || document.hidden || canvas.closest('[hidden]')) return;
+  nextActivityPulse = now + 15000;
+  fetch(activityURL, { method: 'POST', body: activitySession, credentials: 'omit', keepalive: true }).catch(() => {});
+}
+canvas.addEventListener('keydown', (e) => { if (e.isTrusted) notePlayInput(); });
+canvas.addEventListener('pointerdown', (e) => { if (e.isTrusted) notePlayInput(); });
+canvas.addEventListener('wheel', (e) => { if (e.isTrusted) notePlayInput(); });
+canvas.addEventListener('mousemove', (e) => {
+  if (e.isTrusted && document.pointerLockElement === canvas && (e.movementX || e.movementY)) notePlayInput();
+});
+
 // input: DirectInput scan codes, mouse deltas under pointer lock
 const DIK = { Escape: 1, Digit1: 2, Digit2: 3, Digit3: 4, Digit4: 5, Digit5: 6, Digit6: 7, Digit7: 8, Digit8: 9, Digit9: 10,
   Digit0: 11, Minus: 12, Equal: 13, Backspace: 14, Tab: 15, KeyQ: 16, KeyW: 17, KeyE: 18, KeyR: 19, KeyT: 20, KeyY: 21,
@@ -772,6 +794,7 @@ if (navigator.getGamepads) {
     const trigger = (i) => Math.round((pad.buttons[i]?.value || 0) * 255);
     const state = [digital | (trigger(6) << 16) | (trigger(7) << 24),
       stick(pad.axes[0], pad.axes[1]), stick(pad.axes[2], pad.axes[3])];
+    if (digital || trigger(6) > 32 || trigger(7) > 32 || pad.axes.some((value) => Math.abs(value) > 0.25)) notePlayInput();
     if (!last || state.some((value, i) => value !== last[i])) { update(1, ...state); last = state; }
   }
   const releaseGamepad = () => {
@@ -806,6 +829,10 @@ if (touchUI) {
     knob.style.transform = ''; stick.classList.add('idle');
   };
   let move = null, look = null;
+  pad.addEventListener('pointerdown', (e) => { if (e.isTrusted) notePlayInput(); }, { capture: true });
+  pad.addEventListener('pointermove', (e) => {
+    if (e.isTrusted && (e.pointerId === move?.id || e.pointerId === look?.id)) notePlayInput();
+  });
   pad.addEventListener('pointerdown', (e) => {
     if (e.target.closest('button')) return;
     e.preventDefault(); wakeAudio();
