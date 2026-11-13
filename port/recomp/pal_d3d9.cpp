@@ -12,6 +12,10 @@
 #include <thread>
 #include <vector>
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten/threading.h>
+#endif
+
 #include "../../out/recomp/d3d9_caps.inc"
 
 uint32_t g_device_obj;          // the game's device (one per game)
@@ -576,8 +580,18 @@ void dv_Present(FnvCpu& s)
         // stay at most one frame ahead of the renderer: the page releases one frame per screen refresh
         // (web/recomp/index.html pace()), and every frame queued beyond that is 17 ms of late input
         auto t0 = std::chrono::steady_clock::now();
-        while (g_ring.frames_sent - __atomic_load_n(&g_ring.frames_done, __ATOMIC_ACQUIRE) > 1)
+        // (woken by the page the moment it shows a frame: a timed sleep here can overrun by a whole operating
+        // system timer tick, 15.6 ms on Windows, which is a late frame)
+        for (;;)
+        {
+            uint32_t done = __atomic_load_n(&g_ring.frames_done, __ATOMIC_ACQUIRE);
+            if (g_ring.frames_sent - done <= 1) break;
+#ifdef __EMSCRIPTEN__
+            emscripten_futex_wait(&g_ring.frames_done, done, 4.0);
+#else
             std::this_thread::sleep_for(std::chrono::microseconds(500));
+#endif
+        }
         auto t1 = std::chrono::steady_clock::now();
         static auto last = t1;
         g_present_stats[0]++;
