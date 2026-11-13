@@ -119,9 +119,19 @@
     } else if (!n.gpu) {
       block('No WebGPU', 'The game draws with WebGPU, and this browser does not have it. Use a recent Chrome or Edge on a computer, or Chrome on Android. On Linux, WebGPU may need to be turned on in chrome://flags.');
     } else {
-      const adapter = await timeout(n.gpu.requestAdapter({ powerPreference: 'high-performance' }), 5000);
+      // the same order as the renderer (renderer.js requestGpuAdapter): a full adapter, else a compatibility one
+      const TIMEOUT = {};
+      let adapter = await timeout(n.gpu.requestAdapter({ powerPreference: 'high-performance' }), 8000, TIMEOUT);
+      if (adapter === TIMEOUT) info.adapterTimedOut = true;
+      if (!adapter || adapter === TIMEOUT) {
+        adapter = await timeout(n.gpu.requestAdapter({ featureLevel: 'compatibility' }), 8000, TIMEOUT);
+        if (adapter === TIMEOUT) { info.adapterTimedOut = true; adapter = null; }
+        else if (adapter && !adapter.features.has('core-features-and-limits')) info.compat = true;
+      }
       if (!adapter) {
-        block('No graphics adapter', 'This browser has WebGPU, but it would not give the game a graphics card. Your graphics driver may be too old or blocked by the browser: update it, and check that hardware acceleration is on in the browser\'s settings.');
+        block('No graphics adapter', (info.adapterTimedOut ? 'This browser has WebGPU, but it did not answer the game\'s request for a graphics card. ' : 'This browser has WebGPU, but it would not give the game a graphics card. ')
+          + (info.mobile ? 'Update the browser and restart it: after a graphics crash it turns WebGPU off until it restarts. Chrome may also have blocked the phone\'s graphics driver (chrome://gpu says so).'
+            : 'Your graphics driver may be too old or blocked by the browser: update it, and check that hardware acceleration is on in the browser\'s settings.'));
       } else {
         const ai = adapter.info || {};
         info.gpu = [ai.vendor, ai.architecture, ai.description].filter(Boolean).join(' ') || 'unknown';
@@ -129,6 +139,7 @@
         if (adapter.isFallbackAdapter || ai.isFallbackAdapter) {
           warn('Software graphics', 'The browser is drawing with the CPU instead of a graphics card, so the game will be very slow. Turn on hardware acceleration in the browser\'s settings, or update your graphics driver.');
         }
+        if (info.compat) warn('Older graphics mode', 'This browser offers only WebGPU\'s compatibility mode here (OpenGL ES). The game runs in it, but a few effects that need full WebGPU are left out.');
         if (!info.bc) warn('Slower textures', 'This graphics chip cannot read the game\'s compressed textures directly, so they are unpacked on the CPU. The game works, but loading takes longer.');
       }
     }

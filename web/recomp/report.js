@@ -116,10 +116,17 @@
     const g = { webgpu: !!navigator.gpu };
     if (window.fnvGpu) g.used = window.fnvGpu;            // the adapter the renderer took (index.html)
     else if (navigator.gpu) {
-      const a = await timeout(navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }), 4000);
-      if (a && !a.error) g.adapter = { info: safe(() => ({ ...a.info, vendor: a.info.vendor, architecture: a.info.architecture, device: a.info.device, description: a.info.description })),
+      // the renderer's order (renderer.js requestGpuAdapter): a full adapter, else a compatibility one
+      const TIMEOUT = 'no adapter (timed out)';
+      let a = await timeout(navigator.gpu.requestAdapter({ powerPreference: 'high-performance' }), 4000, TIMEOUT);
+      if (!a || a === TIMEOUT) {
+        const c = await timeout(navigator.gpu.requestAdapter({ featureLevel: 'compatibility' }), 4000, TIMEOUT);
+        g.compatAdapter = c && c !== TIMEOUT && !c.error ? true : c || 'none';
+        if (c && c !== TIMEOUT && !c.error) a = c;
+      }
+      if (a && a !== TIMEOUT && !a.error) g.adapter = { info: safe(() => ({ ...a.info, vendor: a.info.vendor, architecture: a.info.architecture, device: a.info.device, description: a.info.description })),
         features: [...a.features], limits: plainLimits(a.limits), fallback: a.isFallbackAdapter };
-      else g.adapter = a || 'no adapter (timed out)';
+      else g.adapter = a || 'none';
     }
     g.preferredFormat = safe(() => navigator.gpu && navigator.gpu.getPreferredCanvasFormat());
     g.webgl = safe(() => {
@@ -222,7 +229,8 @@
 
   function pageState() {
     const b = window.fnvBoot, r = window.renderer, a = window.fnvAudio, pump = window.fnvPump;
-    const copy = (o) => safe(() => JSON.parse(JSON.stringify(o, (k, v) => (typeof v === 'function' ? undefined : v))));
+    // absent objects stay absent: JSON.stringify(undefined) is undefined, which JSON.parse rejects
+    const copy = (o) => (o == null ? o : safe(() => JSON.parse(JSON.stringify(o, (k, v) => (typeof v === 'function' ? undefined : v)))));
     const st = {
       url: location.href, referrer: document.referrer, title: document.title, embedded: window.parent !== window,
       status: safe(() => document.getElementById('status').textContent), visibility: document.visibilityState,
@@ -270,9 +278,9 @@
     if (ua.uaData) L.push(`OS: ${ua.uaData.platform} ${ua.uaData.platformVersion || ''}${win11} ${ua.uaData.architecture || ''}${ua.uaData.bitness ? '-' + ua.uaData.bitness : ''}${ua.uaData.model ? ' model ' + ua.uaData.model : ''}${ua.uaData.mobile ? ' (mobile)' : ''}`);
     L.push(`Device: ${ua.hardwareConcurrency} threads, ${ua.deviceMemoryGB || '?'} GB, screen ${rep.browser.screen.width}x${rep.browser.screen.height} @${rep.browser.screen.dpr}, touch ${ua.maxTouchPoints}`);
     const ad = gpu.used || gpu.adapter || {}, info = ad.info || {};
-    L.push(`GPU: ${gpu.webgpu ? [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' / ') || 'WebGPU (no adapter info)' : 'no WebGPU'}; WebGL ${gpu.webgl && gpu.webgl.renderer || '-'}`);
+    L.push(`GPU: ${gpu.webgpu ? [info.vendor, info.architecture, info.device, info.description].filter(Boolean).join(' / ') || 'WebGPU (no adapter info)' : 'no WebGPU'}${gpu.used && gpu.used.compat ? ' (compatibility mode)' : ''}; WebGL ${gpu.webgl && gpu.webgl.renderer || '-'}`);
     L.push(`Page: ${rep.page.url}  up ${rep.page.uptimeSec} s, ${rep.page.visibility}, isolated ${rep.browser.caps.crossOriginIsolated}`);
-    L.push(`Start-up: quality ${b.quality}, mode ${b.mode}, phase ${b.phase}, stage ${b.stage}, ready ${b.ready}, failed ${b.failed}${b.failText ? ' (' + b.failText + ')' : ''}, stalled ${b.stalled}, ${b.kb} KB in ${b.fetches} fetches, ${b.retries} retries`);
+    if (rep.page.boot) L.push(`Start-up: quality ${b.quality}, mode ${b.mode}, phase ${b.phase}, stage ${b.stage}, ready ${b.ready}, failed ${b.failed}${b.failText ? ' (' + b.failText + ')' : ''}, stalled ${b.stalled}, ${b.kb} KB in ${b.fetches} fetches, ${b.retries} retries`);
     L.push(`Status bar: ${rep.page.status}`);
     const s = rep.samples[rep.samples.length - 1];
     if (s) L.push(`Last sample: ${s.fps} fps, frame ${s.frames}, heap ${s.heapMB} MB, JS ${s.jsMB} MB`);

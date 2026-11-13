@@ -23,9 +23,9 @@ const log = (m) => { logEl.textContent += m + '\n'; console.log(m); };
 const q = new URLSearchParams(location.search);
 const skipTo = +(q.get('frame') || 0);
 try {
-  const { device, features } = await createDevice();
-  log('features: ' + features.join(', '));
-  const r = new Renderer(device, document.getElementById('c'), { log });
+  const { device, features, compat } = await createDevice();
+  log('features: ' + features.join(', ') + (compat ? ' (compatibility mode)' : ''));
+  const r = new Renderer(device, document.getElementById('c'), { log, compat });
   window.renderer = r;
   const buf = await (await fetch('/ring.bin')).arrayBuffer();
   const u32 = new Uint32Array(buf), u8 = new Uint8Array(buf);
