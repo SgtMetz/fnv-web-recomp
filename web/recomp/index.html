@@ -306,9 +306,9 @@ function log(m, err) {
 }
 
 if (!crossOriginIsolated) log('page is not cross-origin isolated: SharedArrayBuffer (wasm threads) is unavailable', true);
-let device, features, adapter;
+let device, features, adapter, compat;
 try {
-  ({ device, features, adapter } = await createDevice());
+  ({ device, features, adapter, compat } = await createDevice());
 } catch (e) {
   // no WebGPU (or no adapter): say so where the player looks, not only in the hidden log
   status.textContent = 'cannot start: ' + e.message;
@@ -316,18 +316,23 @@ try {
   const bootRoot = document.getElementById('boot');
   bootRoot.hidden = false; bootRoot.classList.add('failed');
   document.getElementById('bootPhase').textContent = 'This browser cannot run the game: ' + e.message;
-  document.getElementById('bootDetail').textContent = 'It needs WebGPU: a recent Chrome or Edge on a desktop, or Chrome on Android. Report a problem (below) if you think it should work.';
+  document.getElementById('bootDetail').textContent = /Android/i.test(navigator.userAgent)
+    ? 'It needs WebGPU, and this browser gave the page no graphics adapter. Update Chrome, then restart it (a browser that '
+      + 'had a graphics crash turns WebGPU off until it restarts). If it still fails, Chrome may have blocked your phone\'s '
+      + 'graphics driver: chrome://gpu says so, and the chrome://flags option "Unsafe WebGPU Support" lifts the block. '
+      + 'Report a problem (below) if none of this helps.'
+    : 'It needs WebGPU: a recent Chrome or Edge on a desktop, or Chrome on Android. Report a problem (below) if you think it should work.';
   throw e;
 }
 // for problem reports (report.js): the adapter the game runs on
 window.fnvGpu = { info: { vendor: adapter.info?.vendor, architecture: adapter.info?.architecture, device: adapter.info?.device,
-  description: adapter.info?.description }, fallback: adapter.isFallbackAdapter, features: [...adapter.features], required: features,
+  description: adapter.info?.description }, fallback: adapter.isFallbackAdapter, compat, features: [...adapter.features], required: features,
   limits: Object.fromEntries(Object.keys(Object.getPrototypeOf(adapter.limits)).filter((k) => typeof adapter.limits[k] === 'number').map((k) => [k, adapter.limits[k]])) };
 device.lost.then((i) => log(`WebGPU device lost (${i.reason}): ${i.message}`, true));
 const canvas = document.getElementById('screen');
-const renderer = new Renderer(device, canvas, { log: (m) => log('[renderer] ' + m, true) });
+const renderer = new Renderer(device, canvas, { log: (m) => log('[renderer] ' + m, true), compat });
 window.renderer = renderer;
-log('WebGPU features: ' + features.join(', '));
+log('WebGPU features: ' + features.join(', ') + (compat ? ' (compatibility mode: no full WebGPU adapter here)' : ''));
 
 // FNV_* settings from the query string (?FNV_TRACE_IMPORTS=1), read by the game's getenv
 const env = {};

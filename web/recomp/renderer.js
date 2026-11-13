@@ -263,6 +263,9 @@ export class Renderer {
     this.dev = device;
     // BC (DXT) textures stay compressed on the GPU when it can sample them; otherwise they are decoded to BGRA8
     this.bc = device.features.has('texture-compression-bc');
+    // WebGPU compatibility mode (OpenGL ES phones whose browser offers no full adapter): stricter rules on texture
+    // views, blending and depth sampling (createDevice says which kind of device this is)
+    this.compat = !!opts.compat;
     this.canvas = canvas;
     this.ctx = canvas.getContext('webgpu');
     this.canvasFormat = navigator.gpu.getPreferredCanvasFormat();
@@ -322,7 +325,8 @@ export class Renderer {
 
   makeDummies() {
     const mk = (dim, layers) => {
-      const t = this.dev.createTexture({ size: [1, 1, layers], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, dimension: dim === '3d' ? '3d' : '2d' });
+      const t = this.dev.createTexture({ size: [1, 1, layers], format: 'rgba8unorm', usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST, dimension: dim === '3d' ? '3d' : '2d',
+        textureBindingViewDimension: dim });
       for (let l = 0; l < layers; l++) this.dev.queue.writeTexture({ texture: t, origin: [0, 0, l] }, new Uint8Array([0, 0, 0, 255]), { bytesPerRow: 4 }, [1, 1, 1]);
       return t.createView({ dimension: dim });
     };
@@ -389,7 +393,7 @@ export class Renderer {
     let gpu;
     try {
       gpu = this.dev.createTexture({ size: [w, h, layers], format: gpuFormat, usage: u, mipLevelCount: Math.min(levels, maxLevels),
-        dimension: kind === 2 ? '3d' : '2d' });
+        dimension: kind === 2 ? '3d' : '2d', textureBindingViewDimension: kind === 1 ? 'cube' : kind === 2 ? '3d' : '2d' });
     } catch (e) {
       this.warn(`texture ${w}x${h} fmt ${fmt} (${gpuFormat}): ${e.message}`);
       return;
@@ -795,7 +799,10 @@ export class Renderer {
           let inUse = a.depth && a.depth.t === t;
           for (let ci = 0; !inUse && ci < a.colors.length; ci++) inUse = a.colors[ci] && a.colors[ci].t === t;
           const dimOk = ((s.dim === 'cube') === (t.kind === 1)) && ((s.dim === '3d') === (t.kind === 2));
-          if (!inUse && dimOk) { view = t.sampleView; uf = !!(t.info.unfilterable || t.isDepth); }
+          // compatibility mode cannot sample depth through an ordinary sampler: those draws see the dummy
+          const depthOk = !(this.compat && t.isDepth);
+          if (!depthOk) this.warn('depth texture sampled (compatibility mode): dummy bound');
+          if (!inUse && dimOk && depthOk) { view = t.sampleView; uf = !!(t.info.unfilterable || t.isDepth); }
           this.used.add(t.id);
         }
         texKinds += uf ? 'u' : 'f';
@@ -814,7 +821,9 @@ export class Renderer {
     let pipe = this.pipelines.get(key);
     if (pipe === undefined) {
       const writeMasks = [RS.COLORWRITEENABLE, 190, 191, 192].map((r) => rs[r] & 15);
-      const blend = this.blendState();
+      let blend = this.blendState();
+      // compatibility mode: every colour target shares one blend state and write mask
+      if (this.compat) { writeMasks.fill(writeMasks[0]); if (colorFormats.some((f) => f && f.includes('32float'))) blend = undefined; }
       try {
         const nvs = vs.info.bindings.samplers.length;
         const vsl = this.stageLayout(vs, 0, texKinds.slice(0, nvs)), psl = this.stageLayout(ps, 1, texKinds.slice(nvs));
@@ -1036,12 +1045,14 @@ export class Renderer {
     const sw = Math.max(1, s.w >> sl), sh = Math.max(1, s.h >> sl), dw = Math.max(1, d.w >> dl), dh = Math.max(1, d.h >> dl);
     const full = (dx1 | 0) === -1 || dx1 === 0xffffffff;
     const rect = full ? null : [dx0, dy0, dx1 - dx0, dy1 - dy0];
-    if (!rect && sw === dw && sh === dh && s.gpuFormat === d.gpuFormat) {
+    if (!rect && sw === dw && sh === dh && s.gpuFormat === d.gpuFormat && !(this.compat && s.gpuFormat.startsWith('bc'))) {
       this.endPass();
       this.encoder.copyTextureToTexture({ texture: s.gpu, mipLevel: sl, origin: [0, 0, sf] }, { texture: d.gpu, mipLevel: dl, origin: [0, 0, df] }, [sw, sh, 1]);
       return;
     }
     if (!(d.gpu.usage & GPUTextureUsage.RENDER_ATTACHMENT)) return;
+    // compatibility mode samples a texture only through a view of all its layers: no single cube face
+    if (this.compat && s.kind === 1) { this.warn('stretch from a cube face (compatibility mode): skipped'); return; }
     const view = s.gpu.createView({ dimension: '2d', baseMipLevel: sl, mipLevelCount: 1, baseArrayLayer: sf, arrayLayerCount: 1 });
     this.blit(view, this.targetView(d, df, dl), d.gpuFormat, rect);
   }
@@ -1142,12 +1153,15 @@ export class Renderer {
 // GPU device with the features the game's formats need
 export async function createDevice() {
   if (!navigator.gpu) throw new Error('WebGPU is not available in this browser');
-  const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+  const query = typeof location !== 'undefined' ? new URLSearchParams(location.search) : new URLSearchParams();
+  const { adapter, compat } = await requestGpuAdapter(query.has('compat'));
   if (!adapter) throw new Error('no WebGPU adapter');
   const want = ['texture-compression-bc', 'float32-filterable', 'depth-clip-control'];
   // ?nobc tests the path phones take: no BC texture support, so DXT textures are decoded on the CPU
-  const noBc = typeof location !== 'undefined' && new URLSearchParams(location.search).has('nobc');
+  const noBc = query.has('nobc');
   const requiredFeatures = want.filter((f) => adapter.features.has(f) && !(noBc && f === 'texture-compression-bc'));
+  // a compatibility adapter on hardware that can do more still gives a full device when asked for one
+  if (compat === 'adapter' && adapter.features.has('core-features-and-limits')) requiredFeatures.push('core-features-and-limits');
   const device = await adapter.requestDevice({ requiredFeatures, requiredLimits: {
     maxBindGroups: Math.min(4, adapter.limits.maxBindGroups),
     maxSampledTexturesPerShaderStage: adapter.limits.maxSampledTexturesPerShaderStage,
@@ -1155,5 +1169,20 @@ export async function createDevice() {
     maxUniformBufferBindingSize: adapter.limits.maxUniformBufferBindingSize,
     maxBufferSize: adapter.limits.maxBufferSize,
   } });
-  return { adapter, device, features: requiredFeatures };
+  return { adapter, device, features: requiredFeatures, compat: !!compat && !requiredFeatures.includes('core-features-and-limits') };
+}
+
+// The adapter to run on. Some phones' browsers (Chrome on Android with a blocklisted Vulkan driver) give no full
+// adapter but do give a compatibility one (WebGPU on OpenGL ES, Chrome 146+), so that is the fallback.
+// forceCompat (?compat) takes the compatibility path on any machine, to test it on a desktop.
+// compat: false (a full adapter), 'adapter' (a compatibility adapter) or 'forced'.
+export async function requestGpuAdapter(forceCompat = false) {
+  let adapter = null;
+  if (!forceCompat) {
+    adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (!adapter) adapter = await navigator.gpu.requestAdapter();
+    if (adapter) return { adapter, compat: false };
+  }
+  adapter = await navigator.gpu.requestAdapter({ featureLevel: 'compatibility' });
+  return { adapter, compat: adapter ? (forceCompat ? 'forced' : 'adapter') : false };
 }
