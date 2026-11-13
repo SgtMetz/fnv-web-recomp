@@ -282,6 +282,12 @@ export class Renderer {
     this.layouts = new Map();
     this.samplers = new Map();
     this.bindGroups = new Map();
+    this.bgByTex = new Map();            // texture id -> keys of the bind groups that hold one of its views
+    this.texIds = [];
+    // Pipelines for the world's geometry are compiled in the background once this is set (index.html, when the game
+    // is on screen): see draw(). Until then everything compiles on the spot, behind the loading screen.
+    this.asyncPipelines = false;
+    this.pendingPipelines = 0;
     this.vstates = new Map();            // vertex layouts by shader, declaration and stream strides
     this.fvfDecls = new Map();
     this.objIds = new WeakMap(); this.nextObjId = 1;
@@ -459,7 +465,13 @@ export class Renderer {
   }
   destroy(id) {
     const t = this.textures.get(id);
-    if (t && id !== 1) { this.endPass(); this.pendingDestroy = (this.pendingDestroy || []).concat([t.gpu]); this.textures.delete(id); this.bindGroups.clear(); }
+    if (t && id !== 1) {
+      this.endPass(); this.pendingDestroy = (this.pendingDestroy || []).concat([t.gpu]); this.textures.delete(id);
+      // only the bind groups made with this texture go (all of them went before: thousands were remade after every
+      // cell that unloaded)
+      const keys = this.bgByTex.get(id);
+      if (keys) { for (const k of keys) this.bindGroups.delete(k); this.bgByTex.delete(id); }
+    }
     const b = this.buffers.get(id);
     if (b) { this.pendingDestroy = (this.pendingDestroy || []).concat([b.gpu]); this.buffers.delete(id); }
     this.shaders.delete(id);
@@ -806,6 +818,7 @@ export class Renderer {
           this.used.add(t.id);
         }
         texKinds += uf ? 'u' : 'f';
+        this.texIds[ti0] = view === this.dummy[s.dim] || !t ? 0 : t.id;
         texViews[ti0] = view;
         samplers[ti0] = this.sampler(stage, uf);
         ti0++;
@@ -837,6 +850,23 @@ export class Renderer {
           primitive: { topology, cullMode: cull, frontFace, stripIndexFormat: fanIndex != null ? undefined : stripFormat },
           depthStencil: this.depthStencil(depthFormat),
         };
+        // A pipeline is compiled when it is first drawn with, and the browser's GPU process does nothing else
+        // meanwhile: every frame queued behind it waits (measured: 50-170 ms without a frame, a few times a minute
+        // while walking into new places). So a new combination met in the world compiles in the background, and
+        // its draws are left out until it is ready: an object appears a few frames late instead of the picture
+        // stopping. Quads (two triangles: the image-space passes, the interface, the sky's sun test) still compile
+        // on the spot, since a missing full-screen pass would be a wrong picture.
+        if (this.asyncPipelines && count > 6 && this.dev.createRenderPipelineAsync) {
+          this.pipelines.set(key, false);                       // false: compiling
+          this.pendingPipelines++;
+          const label = `${vs.name} + ${ps.name}`;
+          this.dev.createRenderPipelineAsync(desc).then(
+            (p) => { this.pendingPipelines--; this.pipelines.set(key, { p, vsl, psl }); },
+            (err) => { this.pendingPipelines--; this.pipelines.set(key, null); this.warn(`pipeline ${label}: ${String(err.message || err).slice(0, 300)}`); });
+          this.stats.deferred = (this.stats.deferred || 0) + 1;
+          if (isUP) this.streams[0] = savedStream0;
+          return;
+        }
         this.dev.pushErrorScope('validation');
         const p = this.dev.createRenderPipeline(desc);
         pipe = { p, vsl, psl };
@@ -848,7 +878,7 @@ export class Renderer {
         pipe = null;
       }
     }
-    if (!pipe) { this.stats.skipped++; if (isUP) this.streams[0] = savedStream0; return; }
+    if (!pipe) { if (pipe === false) this.stats.deferred++; else this.stats.skipped++; if (isUP) this.streams[0] = savedStream0; return; }
 
     // room for both stages' constants now: a flush once the pass is open would end it mid-draw
     if (this.uniformUsed + 2 * 4352 > this.uniformStage.length) this.flush();
@@ -893,9 +923,16 @@ export class Renderer {
           entries.push({ binding: smps[i].texture_binding, resource: texViews[ti + i] });
           entries.push({ binding: smps[i].sampler_binding, resource: samplers[ti + i] });
         }
-        if (this.bindGroups.size > 50000) this.bindGroups.clear();
+        if (this.bindGroups.size > 50000) { this.bindGroups.clear(); this.bgByTex.clear(); }
         bg = this.dev.createBindGroup({ layout, entries });
         this.bindGroups.set(bkey, bg);
+        for (let i = 0; i < smps.length; i++) {
+          const tid = this.texIds[ti + i];
+          if (!tid) continue;
+          let set = this.bgByTex.get(tid);
+          if (!set) this.bgByTex.set(tid, set = new Set());
+          set.add(bkey);
+        }
       }
       ti += smps.length;
       // constants unchanged since this pass last uploaded at least as many: reuse that upload, and skip the call
