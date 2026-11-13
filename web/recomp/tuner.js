@@ -132,14 +132,14 @@ export function startTuner({ renderer, pump, log = () => {} }) {
   requestAnimationFrame(onRaf);
 
   const perf = () => { const h = H32(), w = M._fnv_perf() >>> 2; return [0, 1, 2].map((i) => h[w + 2 * i] + h[w + 2 * i + 1] * 4294967296); };
-  let last = { t: performance.now(), p: perf(), draws: renderer.stats.draws, frames: renderer.frames, busy: pump.busyMs || 0, raf: 0 };
+  let last = { t: performance.now(), p: perf(), draws: renderer.stats.draws, frames: renderer.frames, busy: pump.busyMs || 0, paced: pump.pacedMs || 0, raf: 0 };
   let lowRun = 0, highRun = 0, boundRun = 0, settle = 2, steppedUpAt = 0, worldSince = 0;
   const holdUntil = [], holdMs = [];          // per level: when stepping up from it may be tried again
   const note = (m) => { t.history.push(`${new Date().toISOString().slice(11, 19)} ${m}`); if (t.history.length > 40) t.history.shift(); log('tuner: ' + m); };
 
   function tick() {
     const now = performance.now();
-    const cur = { t: now, p: perf(), draws: renderer.stats.draws, frames: renderer.frames, busy: pump.busyMs || 0, raf: rafCount };
+    const cur = { t: now, p: perf(), draws: renderer.stats.draws, frames: renderer.frames, busy: pump.busyMs || 0, paced: pump.pacedMs || 0, raf: rafCount };
     const dt = cur.t - last.t, frames = cur.p[0] - last.p[0], shown = cur.frames - last.frames;
     const prev = last;
     last = cur;
@@ -160,8 +160,10 @@ export function startTuner({ renderer, pump, log = () => {} }) {
     // the display (or the browser's frame pacing) is the cap: the game waits for it and nothing here would help
     const displayCapped = hz > 10 && hz < target * 0.95 && fps >= hz * 0.92;
     const low = fps < target * 0.92 && !displayCapped;
-    // the game spends a good part of each frame waiting for the renderer: the graphics side is the limit
-    const rendererBound = low && waitMs > frameMs * 0.25;
+    // the game spends a good part of each frame waiting for the renderer: the graphics side is the limit. (Not the
+    // time the page holds a finished frame back for its place in the cadence: that is the frame pacing, index.html.)
+    const pacedMs = (cur.paced - prev.paced) / shown;
+    const rendererBound = low && waitMs - pacedMs > frameMs * 0.25;
     // one level costs the game thread roughly 5-8% (20% over the four), so 12% in hand is room for one
     const spare = !low && gameMs < budget * 0.88 && pumpMs < budget * 0.7;
     lowRun = low ? lowRun + 1 : 0;

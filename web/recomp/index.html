@@ -459,6 +459,8 @@ function tickBoot() {
   }
   if (boot.stage >= readyStage && !boot.ready) {
     boot.ready = true;
+    // from here on a new shader combination compiles in the background (renderer.js draw); ?pipelines=sync for the old way
+    renderer.asyncPipelines = query.get('pipelines') !== 'sync';
     if (boot.kb) localStorage.setItem(kbKey(), String(boot.kb));
     // how long this start took, for the next visit's load-time estimate (precheck.js)
     localStorage.setItem(`fnv.boot.sec.${boot.mode}.${quality}`, String(Math.round(boot.elapsed)));
@@ -518,28 +520,94 @@ autoQ.addEventListener('change', () => {
   else try { localStorage.setItem('fnv.tuner.on', autoQ.checked ? '1' : '0'); } catch { /* private mode */ }
 });
 // Frame pacing at each Present (?pace=off turns it off):
-//   one frame per screen refresh  (paceRefresh, before the frame is drawn to the canvas) A second frame that is ready
-//                                 within the same refresh waits for the next one. Without this a game running faster
-//                                 than the screen has frames replaced before they were ever shown, at uneven moments,
-//                                 which shows as judder when the camera turns. (The game's own setting asks for
-//                                 this: iPresentInterval=1.) Only while animation frames arrive: a hidden page gets
-//                                 none, and the game keeps running there.
+//   an even cadence               (paceRefresh, before the frame is drawn to the canvas) Frames are shown every N
+//                                 screen refreshes, the same N every time, so each one is on screen for the same
+//                                 length of time. N is the smallest that keeps a frame at least 9.9 ms long: the
+//                                 game's own frame limiter (BSTimer::Update, 0x00aa4ee0) sleeps away what is left of
+//                                 10 ms, so it cannot go faster, and trying to makes every frame a different length.
+//                                 60 Hz and 100 Hz screens get every refresh, 120 and 144 Hz every second one (60 and
+//                                 72 fps), 240 Hz every third (80 fps). Measured on a 210 Hz screen before this: frames
+//                                 4 to 28 ms apart, one refresh, then three, then two (judder); now every third.
+//                                 ?fps=60 asks for a lower rate. A game that cannot keep its cadence (more than one
+//                                 frame in ten late) gets one refresh more per frame, and one less again once it
+//                                 has that much time to spare. Only while animation frames arrive: a hidden page
+//                                 gets none, and the game keeps running there.
 //   two frames on the GPU at most  (paceGpu, before the game is released) The browser queues submitted work without
 //                                 limit. When the graphics side is the slower one the queue grew to most of a second
 //                                 (measured: 0.7-0.9 s), and then uploads blocked for 60-80 ms at a time: late input
 //                                 and frames in bursts.
 const PACE = new URLSearchParams(location.search).get('pace') !== 'off';
-let rafSeq = 0, rafAt = 0, presentSeq = -1;
-const rafWaiters = [], gpuFrames = [];
-const onRefresh = () => { rafSeq++; rafAt = performance.now(); for (const f of rafWaiters.splice(0)) f(); requestAnimationFrame(onRefresh); };
+const FRAME_FLOOR_MS = 9.9;
+const fpsCap = +new URLSearchParams(location.search).get('fps') || 0;
+const pace = window.fnvPace = { refreshMs: 0, every: 1, extra: 0, shown: 0, lateTotal: 0, stallTotal: 0, history: [] };
+let rafSeq = 0, rafAt = 0, rafT = 0, presentSeq = -1, inFrame = false;
+const rafWaiters = [], rafGaps = [], gpuFrames = [];
+function paceEvery() {
+  const r = pace.refreshMs || 16.7;
+  const floor = Math.max(FRAME_FLOOR_MS, fpsCap > 0 ? 1000 / fpsCap - 0.5 : 0);
+  return Math.max(1, Math.ceil(floor / r - 0.02)) + pace.extra;
+}
+const onRefresh = (t) => {
+  // the screen's refresh interval: the median gap between animation frames
+  if (rafT) { const g = t - rafT; if (g > 1 && g < 100) { rafGaps.push(g); if (rafGaps.length > 120) rafGaps.shift(); } }
+  rafT = t;
+  if ((rafSeq & 15) === 0 && rafGaps.length >= 20) {
+    const m = [...rafGaps].sort((x, y) => x - y)[rafGaps.length >> 1];
+    if (!pace.refreshMs || Math.abs(m - pace.refreshMs) > pace.refreshMs * 0.04) pace.refreshMs = m;
+    pace.every = paceEvery();
+  }
+  rafSeq++; rafAt = performance.now();
+  // work done from here until the browser's next task is drawn at this refresh; anything later waits for the next
+  inFrame = true;
+  yieldSoon().then(() => { inFrame = false; });
+  for (let i = 0; i < rafWaiters.length;) { if (rafWaiters[i].seq <= rafSeq) rafWaiters.splice(i, 1)[0].f(); else i++; }
+  requestAnimationFrame(onRefresh);
+};
 requestAnimationFrame(onRefresh);
 const within = (ms, arm) => new Promise((res) => { let done = false; const f = () => { if (!done) { done = true; res(); } }; arm(f); setTimeout(f, ms); });
+// the cadence follows what the game can do: its own counters say how long it was held back each frame (the time to
+// spare), and the frames that missed their refresh say when it cannot keep up. A frame that is late by more than two
+// of its own lengths is a stall (a loading screen, a cell loading in), not a game that is a little too slow: windows
+// with stalls in them change nothing, or every loading screen would end in a few seconds at half the frame rate
+// (measured: start-up took the cadence from 70 to 30 fps before this).
+let paceWin = null, paceHold = 0, paceHoldMs = 20000, paceSteppedAt = 0;
+function paceAdapt() {
+  const M = window.Module, w = M._fnv_perf() >>> 2, H = M.HEAPU32;
+  const cur = { frames: H[w] + H[w + 1] * 4294967296, wait: H[w + 4] + H[w + 5] * 4294967296, late: pace.lateTotal, stalls: pace.stallTotal, t: performance.now() };
+  const prev = paceWin;
+  paceWin = boot.ready ? cur : null;
+  if (!prev || !boot.ready || cur.frames - prev.frames < 60 || cur.t - prev.t > 8000) return;
+  const frames = cur.frames - prev.frames, spare = (cur.wait - prev.wait) / frames / 1000, late = cur.late - prev.late;
+  if (cur.stalls - prev.stalls > frames * 0.02) return;
+  const r = pace.refreshMs || 16.7;
+  const note = (m) => { pace.history.push(`${new Date().toISOString().slice(11, 19)} ${m}`); if (pace.history.length > 30) pace.history.shift(); };
+  if (late > frames * 0.1 && (paceEvery() + 1) * r <= 67) {
+    // a faster cadence that was just tried and did not hold: wait longer before trying it again
+    if (paceSteppedAt && cur.t - paceSteppedAt < 30000) { paceHoldMs = Math.min(600000, paceHoldMs * 2); paceHold = cur.t + paceHoldMs; }
+    paceSteppedAt = 0;
+    pace.extra++; pace.every = paceEvery();
+    note(`${late} of ${frames} frames late: every ${pace.every} refreshes (${(1000 / (pace.every * r)).toFixed(0)} fps)`);
+  } else if (pace.extra > 0 && late <= frames * 0.01 && spare > r * 1.3 && cur.t > paceHold) {
+    pace.extra -= Math.min(pace.extra, Math.max(1, Math.floor((spare - r * 0.3) / r))); pace.every = paceEvery(); paceSteppedAt = cur.t;
+    note(`${spare.toFixed(1)} ms to spare: every ${pace.every} refreshes (${(1000 / (pace.every * r)).toFixed(0)} fps)`);
+  }
+}
 async function paceRefresh() {
-  if (!PACE || presentSeq !== rafSeq || performance.now() - rafAt > 100) { presentSeq = rafSeq; return 0; }
+  if (!PACE || performance.now() - rafAt > 100) { presentSeq = rafSeq; return 0; }
+  if (++pace.shown % 120 === 0) paceAdapt();
+  const due = presentSeq + pace.every;
+  if (rafSeq > due || (rafSeq === due && !inFrame)) {
+    // late: its refresh has gone. Shown at the next one; the cadence carries on from there
+    if (presentSeq >= 0) { if (rafSeq - due <= 2 * pace.every) pace.lateTotal++; else pace.stallTotal++; }
+    presentSeq = inFrame ? rafSeq : rafSeq + 1;
+    return 0;
+  }
+  presentSeq = due;
+  if (rafSeq === due) return 0;                     // right on its refresh
   const t0 = performance.now();
   pumpInfo.vsyncWaits = (pumpInfo.vsyncWaits || 0) + 1;
-  await within(40, (f) => rafWaiters.push(f));
-  presentSeq = rafSeq;
+  await within(Math.max(40, (due - rafSeq + 2) * (pace.refreshMs || 16.7)), (f) => rafWaiters.push({ seq: due, f }));
+  if (rafSeq < due) presentSeq = rafSeq;            // no animation frames came (the page was hidden meanwhile)
   return performance.now() - t0;
 }
 async function paceGpu() {
@@ -557,6 +625,9 @@ async function paceGpu() {
   }
   return performance.now() - t0;
 }
+// Atomics.notify takes a signed view; the heap views the build exports are unsigned
+let wakeI32 = null;
+const wakeView = (H32) => (wakeI32 && wakeI32.buffer === H32.buffer ? wakeI32 : (wakeI32 = new Int32Array(H32.buffer)));
 async function pump() {
   pumpInfo.calls++;
   const M = window.Module;
@@ -591,6 +662,7 @@ async function pump() {
             rd += 8 + len; Atomics.store(H32, b + 3, rd);
             paced += await paceGpu();
             Atomics.add(H32, b + 5, 1);
+            Atomics.notify(wakeView(H32), b + 5);     // the game sleeps on this counter (port/recomp/pal_d3d9.cpp dv_Present)
             continue;
           }
         }
@@ -615,7 +687,7 @@ async function pump() {
     const tl = tuner && tuner.enabled && tuner.label ? ` · ${tuner.label}` : '';
     autoQState.textContent = !tuner || !tuner.enabled ? '' : tuner.pendingRes ? `lower resolution (${tuner.pendingRes}) from the next start` : tuner.label;
     if (boot.ready && !DEV) status.textContent = `${fps.toFixed(0)} fps${tl}`;
-    else if (boot.ready) status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped · ${snd}${tl}`;
+    else if (boot.ready) status.textContent = `frame ${renderer.frames} · ${fps.toFixed(0)} fps · ${renderer.stats.draws} draws · ${renderer.pipelines.size} pipelines · ${renderer.stats.skipped} skipped${renderer.pendingPipelines ? ` · ${renderer.pendingPipelines} compiling` : ''} · ${snd}${tl}`;
   }
   // the game waits on the renderer, and a hidden or embedded page may get no animation frames: whichever of the
   // next frame and a short timer comes first runs the pump
@@ -772,9 +844,28 @@ document.addEventListener('keyup', (e) => {
   if (e.code === 'Escape' && e.target !== canvas) key(e, false);
 });
 window.addEventListener('blur', () => window.Module?._fnv_key?.(1, 0));
-canvas.addEventListener('click', () => { canvas.focus(); if (document.pointerLockElement !== canvas) canvas.requestPointerLock?.(); });
-canvas.addEventListener('mousemove', (e) => {
-  if (document.pointerLockElement === canvas && window.Module._fnv_mouse) window.Module._fnv_mouse(e.movementX, e.movementY, 0, -1, 0);
+// The mouse as a game reads it: no pointer acceleration from the operating system (unadjustedMovement, where the
+// browser has it), and every movement as it happens (pointerrawupdate) instead of once per drawn frame.
+function lockPointer() {
+  if (document.pointerLockElement === canvas || !canvas.requestPointerLock) return;
+  let p = null;
+  try { p = canvas.requestPointerLock({ unadjustedMovement: true }); } catch { p = null; }
+  if (p && p.catch) p.catch((e) => {
+    if (!e || e.name !== 'NotSupportedError') return;
+    try { const q = canvas.requestPointerLock(); if (q && q.catch) q.catch(() => {}); } catch { /* no pointer lock */ }
+  });
+}
+canvas.addEventListener('click', () => { canvas.focus(); lockPointer(); });
+const mouseMoved = (e) => {
+  if (document.pointerLockElement === canvas && window.Module._fnv_mouse && (e.movementX || e.movementY)) window.Module._fnv_mouse(e.movementX, e.movementY, 0, -1, 0);
+};
+canvas.addEventListener('onpointerrawupdate' in canvas ? 'pointerrawupdate' : 'mousemove', mouseMoved);
+// In fullscreen the keys a game uses stay with the game: Escape opens its menu instead of leaving fullscreen (hold
+// Escape to leave), and Tab, the function keys and Ctrl combinations are not taken by the browser.
+document.addEventListener('fullscreenchange', () => {
+  const kb = navigator.keyboard;
+  if (!kb || !kb.lock) return;
+  if (document.fullscreenElement) kb.lock().catch(() => {}); else kb.unlock();
 });
 canvas.addEventListener('mousedown', (e) => { if (document.pointerLockElement === canvas) window.Module._fnv_mouse?.(0, 0, 0, e.button === 2 ? 1 : e.button === 1 ? 2 : 0, 1); });
 canvas.addEventListener('mouseup', (e) => { if (document.pointerLockElement === canvas) window.Module._fnv_mouse?.(0, 0, 0, e.button === 2 ? 1 : e.button === 1 ? 2 : 0, 0); });
@@ -1051,7 +1142,21 @@ const startMode = startParam === 'quick' || startParam === 'normal' ? startParam
 if (startMode === 'quick') env.FNV_START = 'quick';
 if (LOW) env.FNV_ARCHIVES = 'mobile';
 // automatic quality's start-up part: a lower resolution when earlier visits found the graphics side to be the limit
-const tunerIni = startupIni();
+// ?res=1920x1080 (or ?res=native: the screen's own size, 16:9, up to 2560x1440) sets the size the game draws at; it
+// picks its size at start-up, like the automatic quality's lower resolutions below, which a choice here overrides
+const resParam = query.get('res');
+if (resParam) {
+  let m = /^(\d{3,4})x(\d{3,4})$/.exec(resParam), w = 0, h = 0;
+  if (m) { w = +m[1]; h = +m[2]; }
+  else if (resParam === 'native') { w = Math.min(2560, Math.round(screen.width * (window.devicePixelRatio || 1))); h = Math.round(w * 9 / 16); }
+  w &= ~1; h &= ~1;
+  if (w >= 640 && h >= 360 && w <= 3840 && h <= 2160) {
+    const ini = `iSize W:Display=${w};iSize H:Display=${h}`;
+    env.FNV_INI = env.FNV_INI ? env.FNV_INI + ';' + ini : ini;
+    log(`resolution: ${w}x${h}`);
+  }
+}
+const tunerIni = resParam ? '' : startupIni();
 if (tunerIni) { env.FNV_INI = env.FNV_INI ? env.FNV_INI + ';' + tunerIni : tunerIni; log('automatic quality: ' + tunerIni); }
 log(LOW ? 'textures and sounds: the small set (phone, tablet or little memory)' : 'textures and sounds: full');
 startBoot(startMode);
