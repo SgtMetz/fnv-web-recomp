@@ -37,8 +37,8 @@
   #stage:fullscreen #fullscreen-exit { display: block; position: absolute; top: 8px; right: 8px; z-index: 10; padding: 6px 10px; background: #1e1c16; color: #d8d2c4; border: 1px solid #6a5838; border-radius: 4px; cursor: pointer; }
   #start { position: absolute; inset: 0; display: flex; background: rgba(0, 0, 0, .82); overflow: auto; }
   #start .box { margin: auto; }
-  /* a phone's game area is shorter than the panel: the panel takes the whole screen and scrolls */
-  @media (max-width: 700px), (max-height: 450px) { #start { position: fixed; z-index: 5; background: #0d0d0d; } #start .box { margin: auto 10px; } }
+  /* a phone's game area is shorter than the panel: the panel sits in the page flow and scrolls with it */
+  @media (max-width: 700px), (max-height: 450px) { #start { position: static; overflow: visible; background: none; } #start .box { margin: 10px auto; } }
   #start[hidden] { display: none; }
   #start .box { max-width: 520px; padding: 20px 24px; border: 1px solid #3a3528; background: #14130f; }
   #start h1 { margin: 0 0 4px; font-size: 17px; color: var(--accent); font-weight: 600; }
