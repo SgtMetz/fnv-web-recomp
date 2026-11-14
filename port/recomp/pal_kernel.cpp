@@ -9,6 +9,7 @@
 
 #include "pal_fs.h"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -48,10 +49,17 @@ struct Obj
     std::vector<std::string> found;            // full paths
     size_t next = 0;
     int std_id = 0;
+    std::vector<struct Waiter*> waiters;          // threads blocked on this object (wait_many), under g_mx
 };
 
 std::mutex g_mx;                                  // all handle state
-std::condition_variable g_cv;                     // any waitable changed
+std::condition_variable g_cv;                     // a thread created suspended was resumed (k_CreateThread)
+// A blocked thread waits on its own condition variable and is listed on each object it waits for, so a signal wakes
+// the threads waiting for that object and no others. With one condition variable for every handle, each SetEvent or
+// ReleaseSemaphore woke all of the game's sixty-odd threads, and the one that mattered (the main thread waiting for
+// the AI threads, every frame) queued behind them for g_mx.
+struct Waiter { std::condition_variable cv; };
+void wake(Obj* o) { for (Waiter* w : o->waiters) w->cv.notify_one(); }      // caller holds g_mx
 std::vector<Obj*> g_objs;
 std::map<std::string, uint32_t> g_named;
 
@@ -105,9 +113,10 @@ void consume(Obj* o, uint32_t tid)
 uint32_t wait_many(uint32_t n, const uint32_t* hs, bool all, uint32_t ms)
 {
     uint32_t tid = cur_tid();
+    static thread_local Waiter w;
     std::unique_lock<std::mutex> lk(g_mx);
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(ms);
-    for (;;)
+    for (bool timed_out = false;;)
     {
         if (all)
         {
@@ -134,11 +143,20 @@ uint32_t wait_many(uint32_t n, const uint32_t* hs, bool all, uint32_t ms)
                     return i;                         // WAIT_OBJECT_0 + i
                 }
             }
-        if (ms == 0) return 0x102;                    // WAIT_TIMEOUT
+        if (ms == 0 || timed_out) return 0x102;       // WAIT_TIMEOUT (checked once more after the time ran out)
+        // listed on every object while asleep; a closed handle wakes its waiters too (k_CloseHandle)
+        for (uint32_t i = 0; i < n; ++i)
+            if (Obj* o = get(hs[i])) o->waiters.push_back(&w);
         if (ms == 0xffffffffu)
-            g_cv.wait(lk);
-        else if (g_cv.wait_until(lk, deadline) == std::cv_status::timeout)
-            return 0x102;
+            w.cv.wait(lk);
+        else
+            timed_out = w.cv.wait_until(lk, deadline) == std::cv_status::timeout;
+        for (uint32_t i = 0; i < n; ++i)
+            if (Obj* o = get(hs[i]))
+            {
+                auto it = std::find(o->waiters.begin(), o->waiters.end(), &w);
+                if (it != o->waiters.end()) o->waiters.erase(it);
+            }
     }
 }
 
@@ -542,8 +560,10 @@ void signal_event(uint32_t h, int how)               // 1 set, 0 reset, 2 pulse
 {
     std::lock_guard<std::mutex> lk(g_mx);
     if (Obj* o = get(h))
+    {
         o->signaled = how != 0;
-    g_cv.notify_all();
+        if (how) wake(o);
+    }
 }
 void k_SetEvent(FnvCpu& s) { signal_event(A(0), 1); RET(1, 1); }
 void k_ResetEvent(FnvCpu& s) { signal_event(A(0), 0); RET(1, 1); }
@@ -567,7 +587,7 @@ void k_ReleaseSemaphore(FnvCpu& s)
     if (A(2)) M32(A(2)) = (uint32_t)o->count;
     if (o->count + (int32_t)A(1) > o->max) { set_err(298); RET(0, 3); }
     o->count += (int32_t)A(1);
-    g_cv.notify_all();
+    wake(o);
     RET(1, 3);
 }
 void k_CreateMutexA(FnvCpu& s)
@@ -585,8 +605,7 @@ void k_ReleaseMutex(FnvCpu& s)
     std::lock_guard<std::mutex> lk(g_mx);
     Obj* o = get(A(0));
     if (!o || o->owner != cur_tid() || !o->recursion) RET(0, 1);
-    if (--o->recursion == 0) o->owner = 0;
-    g_cv.notify_all();
+    if (--o->recursion == 0) { o->owner = 0; wake(o); }
     RET(1, 1);
 }
 void k_WaitForSingleObject(FnvCpu& s)
@@ -630,6 +649,7 @@ void k_CloseHandle(FnvCpu& s)
     for (auto it = g_named.begin(); it != g_named.end();)
         it = it->second == h ? g_named.erase(it) : std::next(it);
     g_objs[(h - kPalHandleBase) / 4] = nullptr;
+    wake(o);                                          // its waiters find the handle gone and return
     delete o;
     RET(1, 1);
 }
@@ -661,8 +681,7 @@ void k_CreateThread(FnvCpu& s)
         else
             code = t_exit_code;                     // ExitThread
         std::lock_guard<std::mutex> lk(g_mx);
-        if (Obj* o = get(h)) { o->exit_code = code; o->signaled = true; }
-        g_cv.notify_all();
+        if (Obj* o = get(h)) { o->exit_code = code; o->signaled = true; wake(o); }
     }, new Start{h, fn, arg, o->tid});
     if (ptid) M32(ptid) = o->tid;
     RET(h, 6);
@@ -715,9 +734,33 @@ void k_GetThreadPriorityReal(FnvCpu& s)
 void k_true1(FnvCpu& s) { RET(1, 1); }
 void k_SetThreadIdealProcessor(FnvCpu& s) { RET(0, 2); }
 void k_GetThreadPriority(FnvCpu& s) { RET(0, 1); }
+// Sleep on the game's main thread has to end on time: the game's frame limiter (BSTimer::Update, 0x00aa4ee0) sleeps
+// what is left of 10 ms every frame that was shorter, and a late return is a late frame. A timed wait in a browser
+// worker ends on the operating system's timer tick, which on Windows is 15.6 ms unless the browser has raised the
+// timer rate: measured, one frame in twelve took 25 ms instead of 10. So the main thread sleeps in 1 ms steps only
+// while those steps come back on time, and spins for the rest (always for the last millisecond and a half). Other
+// threads keep the plain sleep: several poll with Sleep(1), and spinning there would hold a core each.
+void sleep_on_time(uint32_t ms)
+{
+    using clock = std::chrono::steady_clock;
+    static std::atomic<bool> coarse{false};           // a step overshot: the timer is coarse, spin from now on
+    const auto end = clock::now() + std::chrono::milliseconds(ms);
+    while (!coarse.load(std::memory_order_relaxed))
+    {
+        auto left = std::chrono::duration<double, std::milli>(end - clock::now()).count();
+        if (left < 2.5) break;
+        auto t0 = clock::now();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        if (std::chrono::duration<double, std::milli>(clock::now() - t0).count() > 2.5) coarse = true;
+    }
+    while (clock::now() < end) {}
+}
 void k_Sleep(FnvCpu& s)
 {
     if (A(0) == 0) std::this_thread::yield();
+#ifdef __EMSCRIPTEN__
+    else if (A(0) <= 50 && fnv_host_is_main_thread()) sleep_on_time(A(0));
+#endif
     else std::this_thread::sleep_for(std::chrono::milliseconds(A(0)));
     RET(0, 1);
 }

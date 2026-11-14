@@ -66,9 +66,18 @@ waiting for the renderer even at the shortest distance, the next start uses a lo
 854x480). `?tuner=off` turns it off for one visit, and `?target=30` changes the target. `?FNV_INI=key:Section=value;...`
 overrides any setting the game reads at start-up (`port/recomp/pal_kernel.cpp`).
 
-**Frame pacing** (the pump in `web/recomp/index.html`): the page shows one game frame per screen refresh and keeps at
-most two frames of work queued on the GPU, and the game runs one frame ahead of the renderer. `?pace=off` turns the
-pacing off.
+**Frame pacing** (the pump in `web/recomp/index.html`): the page shows a frame every N screen refreshes, the same N
+every time, where N is the smallest that keeps a frame at least 9.9 ms long (the game's own limiter allows no less):
+every refresh at 60 and 100 Hz, every second at 120 and 144 Hz, every third at 240 Hz. A game that cannot keep that
+up gets a longer cadence, and the shorter one back when it has the time to spare (`window.fnvPace` shows it). At most
+two frames of work are queued on the GPU, and the game runs one frame ahead of the renderer. `?pace=off` turns the
+pacing off, `?fps=60` asks for a lower rate. New shader combinations met in the world compile in the background
+(`?pipelines=sync` for the old way), and `?res=1920x1080` or `?res=native` sets the size the game draws at.
+
+**Measuring** (`web/recomp/bench.js`, `tools/bench_web.mjs`): `node tools/bench_web.mjs --seconds 45` walks a scripted
+route in a visible Edge or Chrome window and reports frame-time percentiles, the worst frames with what the page did
+in them, and the cadence. It needs `npm install --prefix local/bench puppeteer-core`. A hidden tab gets no animation
+frames, so numbers from one mean nothing.
 
 Before the game loads, the page asks how to start. `?start=normal` or `?start=quick` in the address skips the
 question. There is no quality question: phones, tablets and devices with under 4 GB of memory get the smaller texture
