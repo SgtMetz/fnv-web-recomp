@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-PAGE = ['index.html', 'credits.html', 'about.html', 'how-to-play.html', 'privacy.html', 'terms.html', 'contact.html', 'renderer.js', 'audio-worklet.js', 'debug.js', 'report.js', 'precheck.js', 'chat.js', 'tuner.js', 'favicon.ico', 'icon-192.png', 'apple-touch-icon.png']
+PAGE = ['index.html', 'credits.html', 'renderer.js', 'audio-worklet.js', 'debug.js', 'report.js', 'precheck.js', 'chat.js', 'tuner.js', 'favicon.ico', 'icon-192.png', 'apple-touch-icon.png']
 BUILD = ['fnv_web.js', 'fnv_web.wasm']
 BROTLI = r"""
 const fs = require('fs'), zlib = require('zlib');
