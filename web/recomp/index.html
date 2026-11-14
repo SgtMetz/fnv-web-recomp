@@ -93,15 +93,6 @@
   #about h2 { color: var(--fg); font-size: 15px; margin: 0 0 4px; }
   #about a { color: var(--accent); }
   /* the write-up below the game: how the port was made, for a reader new to the subject */
-  #howmade { color: var(--dim); max-width: 860px; padding: 8px 0 12px; font-size: 14px; line-height: 1.6; }
-  #howmade h2 { color: var(--fg); font-size: 17px; margin: 18px 0 2px; }
-  #howmade h3 { color: var(--accent); font-size: 14.5px; font-weight: 600; margin: 18px 0 2px; }
-  #howmade b { color: var(--fg); font-weight: 600; }
-  #howmade a { color: var(--accent); }
-  #howmade code, #howmade pre { font: 12.5px ui-monospace, Consolas, monospace; color: var(--fg); }
-  #howmade pre { background: #16140f; border: 1px solid #2a271f; border-radius: 4px; padding: 10px 12px; overflow-x: auto; line-height: 1.45; }
-  #howmade ul { padding-left: 22px; }
-  #howmade .lede { color: var(--fg); }
   #sitenav { display: flex; gap: 14px; flex-wrap: wrap; padding: 12px 0 16px; margin-top: 8px; border-top: 1px solid #2a271f; font-size: 12.5px; }
   #sitenav a { color: var(--dim); }
 </style>
@@ -162,98 +153,6 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
       WebAssembly and drawn with WebGPU. It contains no game files, so you link the folder of your installed copy and the
       browser reads it from your computer. The project's README has the steps and how it works.</p>
   </section>
-  <article id="howmade" aria-labelledby="howmadeHeading">
-    <h2 id="howmadeHeading">How this was made</h2>
-    <p class="lede">Fallout: New Vegas came out in 2010 as a Windows program. This page runs that same program inside a
-      browser tab. Nobody rewrote the game: its original code was translated, function by function, into a form the
-      browser understands. Here is how, step by step.</p>
-
-    <h3>1. The problem: browsers can't run .exe files</h3>
-    <p>When you install the game you get <code>FalloutNV.exe</code>. Inside it is <b>machine code</b>: millions of tiny
-      instructions for an Intel-style (x86) processor, such as "load the number at this address", "add these two
-      numbers" or "jump to that function". The program also expects Windows to be there, asking it to open files, make
-      windows and threads, and draw pictures through Microsoft's <b>Direct3D 9</b> graphics system.</p>
-    <p>A browser offers none of that. It runs JavaScript and <b>WebAssembly</b> (a compact, fast code format that every
-      modern browser can run), and it draws graphics through <b>WebGPU</b>. To get the game into a browser you have to
-      bridge both gaps: the processor and the operating system.</p>
-
-    <h3>2. Three ways to do it, and the one chosen</h3>
-    <ul>
-      <li><b>Emulate</b> the processor: a program reads each x86 instruction while the game runs and acts it out. That
-        works, but interpreting every instruction live is far too slow for a 3D game in a browser.</li>
-      <li><b>Rewrite</b> the game by hand. That would take years, and the result would no longer be the original game.</li>
-      <li><b>Recompile</b> it ahead of time: translate the whole program once, before anyone plays, into code the
-        browser runs at near full speed. This is what this project does. Think of translating a whole book once, rather
-        than hiring an interpreter to translate it aloud every time someone reads it.</li>
-    </ul>
-
-    <h3>3. Reading the machine code</h3>
-    <p>A tool written for this project opens the exe and uses a <b>disassembler</b> (a library that turns raw bytes back
-      into readable instructions like <code>mov eax, [ecx+8]</code>). It follows every call and jump to find where each
-      function starts and ends.</p>
-    <p>A community project, <a href="https://github.com/momusdigital/fnv_decomp" target="_blank" rel="noopener">fnv_decomp</a>,
-      helped enormously. Its contributors have worked out what thousands of the game's functions do and given them real
-      names, so instead of "the function at address 0x004624B0" you can read what it is for. That made it possible to
-      understand and debug the translated game.</p>
-
-    <h3>4. Translating each function ("lifting")</h3>
-    <p>Each machine-code function is rewritten as a C++ function that does the same thing. The processor itself
-      becomes a small data structure: its eight general registers (<code>eax</code>, <code>ebx</code>,
-      <code>ecx</code>…), its status flags and its floating-point registers. Every instruction becomes a line of C++
-      that updates that structure or the game's memory. For example:</p>
-<pre>; original x86 machine code         // translated C++
-mov  eax, [ecx+8]                    s.eax = M32(s.ecx + 8);
-add  eax, 1                          s.eax = s.eax + 1;   // plus the flags
-call 0x004624B0                      f_004624b0(s);</pre>
-    <p>Two tricks keep it faithful. First, the game's memory is laid out at <b>the same addresses</b> it had on
-      Windows, so every pointer the game stores still points at the right thing. Second, when the game calls a function
-      through a pointer (as C++ objects do for "virtual" functions), a lookup table maps the original address to the
-      translated function.</p>
-
-    <h3>5. Compiling to WebAssembly</h3>
-    <p>The translated C++ is compiled with <b>Emscripten</b>, a compiler that outputs WebAssembly instead of a normal
-      program. The result is about 95 MB of WebAssembly (around 14 MB compressed for download). Because the
-      compiler optimises it, the browser runs the game's logic far faster than an emulator could.</p>
-
-    <h3>6. Pretending to be Windows</h3>
-    <p>The game still thinks it is on Windows, so the project includes a <b>platform layer</b>: stand-ins for the
-      Windows functions the game calls. When the game asks Windows to open a file, the stand-in reads it from the game
-      folder you linked. When it starts a thread, the stand-in starts a <b>web worker</b> (the browser's version of a
-      thread), and the workers share one block of memory, as the game's threads expect. Keyboard, mouse and gamepad
-      input are fed in as if they came from Windows, and the game's sound goes to the browser's audio system.</p>
-
-    <h3>7. Turning Direct3D 9 into WebGPU</h3>
-    <p>When the game draws a frame it makes Direct3D 9 calls: "use this texture", "use this shader", "draw these
-      triangles". The stand-in for Direct3D writes those requests into a queue in memory, and a renderer written in
-      JavaScript reads the queue and draws the same things with WebGPU.</p>
-    <p>The game's <b>shaders</b> (small programs that run on the graphics card and decide each pixel's colour) were
-      written for Direct3D 9 too. Each one was translated, using open-source shader compilers, into WGSL, the WebGPU
-      shader language: about 1,800 of them.</p>
-
-    <h3>8. Your game files</h3>
-    <p>The translated program is the engine: the code that runs the game. Everything you see and hear (the Mojave,
-      characters, quests, textures, music and voices) lives in the game's data files. That is why you link the folder
-      of your own copy: the browser reads those files straight from your computer, the same way the original game reads
-      them from your disk.</p>
-
-    <h3>9. The hard parts</h3>
-    <ul>
-      <li><b>Old floating-point maths.</b> The 2010-era processor instructions for decimals (x87) work differently from
-        modern ones and had to be imitated closely, or physics and animation go wrong.</li>
-      <li><b>Speed.</b> Translated code is only fast if the compiler can tidy it up. The translator keeps registers in
-        local variables and lets the compiler remove work whose result is never used.</li>
-      <li><b>Smooth frames.</b> The game, the graphics card and the screen each run on their own clock. The page paces
-        them so each screen refresh gets one finished frame, and an automatic quality setting shortens the view
-        distance when your computer falls behind.</li>
-      <li><b>Finding bugs.</b> When something breaks, it breaks inside translated code. Matching addresses back to the
-        community's named functions is how most problems were tracked down.</li>
-    </ul>
-
-    <h3>Want to see the code?</h3>
-    <p>The project's own code (the translator, the platform layer and the WebGPU renderer) is open source on
-      <a href="https://github.com/SgtMetz/fnv-web-recomp" target="_blank" rel="noopener">GitHub</a>.
-      <a href="about.html">About the project</a> and the <a href="credits.html">credits</a> have more detail.</p>
-  </article>
   <div id="log"></div>
   </div>
   <nav id="sitenav" aria-label="Site"><a href="credits.html">Credits</a><a href="https://github.com/SgtMetz/fnv-web-recomp">GitHub</a></nav>
