@@ -33,8 +33,7 @@ files. The full list is in [CREDITS.md](CREDITS.md), and the site shows it at `/
 
 
 ## Build and run the browser version
-
-The prerequisites are already installed:
+Prereqs
 - LLVM in `C:\Program Files\LLVM`.
 - Python with `capstone`.
 - emsdk 4.0.10 in `local/dl/emsdk`.
