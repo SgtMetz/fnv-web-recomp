@@ -96,6 +96,10 @@
       if (b) Object.assign(s, { phase: b.phase, stage: b.stage, kb: b.kb, fetches: b.fetches, retries: b.retries, ready: b.ready });
       if (r && r.stats) Object.assign(s, { draws: r.stats.draws, skipped: r.stats.skipped, pipelines: r.pipelines && r.pipelines.size });
       if (M && M.HEAPU8) s.heapMB = Math.round(M.HEAPU8.length / 1048576);
+      if (M && M._fnv_mem_stats) {   // KB: malloc in use, malloc arena, -, game HeapAlloc, textures, buffers, voices (+ count), sound buffers
+        const w = (M._fnv_mem_stats() >>> 0) >>> 2, u = M.HEAPU32;
+        s.mem = { used: u[w] >> 10, arena: u[w + 1] >> 10, heap: u[w + 3] >> 10, tex: u[w + 4] >> 10, buf: u[w + 5] >> 10, vorbis: u[w + 6] >> 10, voices: u[w + 7], sound: u[w + 8] >> 10 };
+      }
       if (performance.memory) s.jsMB = Math.round(performance.memory.usedJSHeapSize / 1048576);
       if (window.fnvPump) { s.pumpBusyMs = Math.round(window.fnvPump.busyMs || 0); s.packets = window.fnvPump.packets; }
       if (window.fnvAudio) { s.audio = window.fnvAudio.ctx ? window.fnvAudio.ctx.state : 'none'; s.underruns = window.fnvAudio.underruns; }
@@ -284,6 +288,7 @@
     L.push(`Status bar: ${rep.page.status}`);
     const s = rep.samples[rep.samples.length - 1];
     if (s) L.push(`Last sample: ${s.fps} fps, frame ${s.frames}, heap ${s.heapMB} MB, JS ${s.jsMB} MB`);
+    if (s && s.mem) L.push(`Memory (MB): malloc ${s.mem.used} of ${s.mem.arena}, game heap ${s.mem.heap}, textures ${s.mem.tex}, buffers ${s.mem.buf}, voices ${s.mem.vorbis} (${s.mem.voices} open), sound buffers ${s.mem.sound}`);
     if (rep.game.player && rep.game.player.cell) L.push(`Player: cell ${rep.game.player.cell}, worldspace ${rep.game.player.worldspace}, at ${rep.game.player.pos.join(', ')}`);
     if (rep.game.present && rep.game.present.presents) L.push(`Frames: ${rep.game.present.presents} presented, ${rep.game.present.avgFrameMs} ms average`);
     if (rep.build && typeof rep.build === 'object') L.push(`Build: ${rep.build.built || rep.build.version || JSON.stringify(rep.build).slice(0, 120)}`);

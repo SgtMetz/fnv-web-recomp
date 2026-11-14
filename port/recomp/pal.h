@@ -4,6 +4,12 @@
 #pragma once
 #include "fnv_recomp_host.h"
 
+// Heap use by the platform layer's own allocations, in bytes (problem reports sample them: an OOM names the pool
+// that grew). Index: PAL_MEM_*.
+enum { PAL_MEM_HEAP, PAL_MEM_TEX, PAL_MEM_BUF, PAL_MEM_VORBIS, PAL_MEM_VORBIS_N, PAL_MEM_SOUND, PAL_MEM_COUNT };
+extern int64_t g_pal_mem[PAL_MEM_COUNT];
+inline void pal_mem_add(int i, int64_t n) { __atomic_add_fetch(&g_pal_mem[i], n, __ATOMIC_RELAXED); }
+
 struct PalEntry
 {
     const char* name;   // the import's name as the exe's import table spells it

@@ -7,6 +7,7 @@
 // addresses above linear memory (0xF0000000..): they are dispatch keys, never dereferenced.
 //
 // usage (node): node fnv_web.js --exe <FalloutNV.exe> [--docs <folder>]
+#include <malloc.h>
 #include <emscripten.h>
 #include <emscripten/stack.h>
 #include <pthread.h>
@@ -512,6 +513,22 @@ void start_ring_dump(const char* path)
 // the page's hooks (web/recomp/index.html): the command ring, and input as DirectInput sees it
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_ring() { return (uint32_t)(uintptr_t)pal_d3d_ring(); }
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_boot() { return (uint32_t)(uintptr_t)&g_pal_boot; }   // PalBoot (pal.h)
+// Heap use in KB: [0] malloc in use, [1] malloc arena (sbrk), [2] largest free chunk is not tracked by dlmalloc: 0,
+// then the platform layer's pools (pal.h PAL_MEM_*; the Vorbis count is a count). web/recomp/report.js samples it.
+extern "C" EMSCRIPTEN_KEEPALIVE uint32_t* fnv_mem_stats()
+{
+    static uint32_t out[3 + PAL_MEM_COUNT];
+    struct mallinfo mi = mallinfo();
+    out[0] = (uint32_t)mi.uordblks >> 10;
+    out[1] = (uint32_t)mi.arena >> 10;
+    out[2] = 0;
+    for (int i = 0; i < PAL_MEM_COUNT; ++i)
+    {
+        int64_t v = __atomic_load_n(&g_pal_mem[i], __ATOMIC_RELAXED);
+        out[3 + i] = (uint32_t)(i == PAL_MEM_VORBIS_N ? v : v >> 10);
+    }
+    return out;
+}
 extern "C" EMSCRIPTEN_KEEPALIVE uint32_t fnv_audio() { return (uint32_t)(uintptr_t)pal_sound_ring(); }
 extern "C" EMSCRIPTEN_KEEPALIVE void fnv_key(int dik, int down) { pal_input_key(dik, down != 0); }
 // debugging: Module.ccall('fnv_console', null, ['string'], ['player.additem f 100']) runs a console line

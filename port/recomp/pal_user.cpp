@@ -561,6 +561,8 @@ void ov_open_callbacks_(FnvCpu& s)
         f->info = (uint32_t)(uintptr_t)calloc(8, 4);
         M32(f->info + 4) = f->channels;
         M32(f->info + 8) = f->rate;
+        pal_mem_add(PAL_MEM_VORBIS, (int64_t)f->frames * f->channels * 2);
+        pal_mem_add(PAL_MEM_VORBIS_N, 1);
     }
     free(req);
     {
@@ -571,7 +573,9 @@ void ov_open_callbacks_(FnvCpu& s)
     }
     if (!f) RETC(0xFFFFFF7Cu);
     std::lock_guard<std::mutex> lk(g_ov_mx);
-    g_ov[vf] = f;
+    OvFile*& slot = g_ov[vf];
+    if (slot) fnv_host_log("[vorbis] reopened without ov_clear\n");
+    slot = f;
     RETC(0);
 #else
     RETC(0xFFFFFF7Cu);
@@ -614,6 +618,8 @@ void ov_clear_(FnvCpu& s)
     {
         if (f->close_fn) { uint32_t args[1] = {f->datasource}; fnv_guest_call(s, f->close_fn, args, 1); }
         free((void*)(uintptr_t)f->pcm);
+        pal_mem_add(PAL_MEM_VORBIS, -(int64_t)f->frames * f->channels * 2);
+        pal_mem_add(PAL_MEM_VORBIS_N, -1);
         free((void*)(uintptr_t)f->info);
         delete f;
     }

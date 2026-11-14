@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <vector>
 
+int64_t g_pal_mem[PAL_MEM_COUNT];
 
 namespace {
 int strcasecmp_portable(const char* a, const char* b);
@@ -368,6 +369,7 @@ uint32_t heap_alloc(uint32_t size, bool zero)
 {
     uint8_t* p = (uint8_t*)(zero ? calloc(1, size + kHeapHeader) : malloc(size + kHeapHeader));
     if (!p) return 0;
+    pal_mem_add(PAL_MEM_HEAP, size);
     memcpy(p, &size, 4);
     memcpy(p + 4, "FNVH", 4);
     return (uint32_t)(uintptr_t)(p + kHeapHeader);
@@ -378,6 +380,7 @@ void heap_free(uint32_t p)
 {
     if (heap_ours(p))
     {
+        pal_mem_add(PAL_MEM_HEAP, -(int64_t)heap_size(p));
         memset((void*)(uintptr_t)(p - kHeapHeader + 4), 0, 4);
         free((void*)(uintptr_t)(p - kHeapHeader));
     }

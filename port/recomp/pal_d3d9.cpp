@@ -210,6 +210,7 @@ uint32_t level_mem(Tex* t, uint32_t face, uint32_t level)
         uint32_t pitch, rows;
         uint32_t bytes = pal_d3d_format_bytes(t->fmt, t->lw(level), t->lh(level), &pitch, &rows) * t->ld(level);
         L.mem = (uint32_t)(uintptr_t)calloc(1, bytes ? bytes : 4);
+        pal_mem_add(PAL_MEM_TEX, bytes);
         L.bytes = bytes; L.pitch = pitch; L.rows = rows;
     }
     return L.mem;
@@ -242,7 +243,7 @@ void destroy_tex(Tex* t)
 {
     emit(OP_DESTROY, {t->id});
     for (Level& L : t->lv)
-        if (L.mem) free((void*)(uintptr_t)L.mem);
+        if (L.mem) { free((void*)(uintptr_t)L.mem); pal_mem_add(PAL_MEM_TEX, -(int64_t)L.bytes); }
     t->lv.clear();
 }
 
@@ -409,7 +410,7 @@ void bf_Release(FnvCpu& s)
 {
     Buf* b = bufo(s);
     uint32_t r = release(A(0));
-    if (!r) { emit(OP_DESTROY, {b->id}); free((void*)(uintptr_t)b->mem); b->mem = 0; }
+    if (!r) { emit(OP_DESTROY, {b->id}); free((void*)(uintptr_t)b->mem); b->mem = 0; pal_mem_add(PAL_MEM_BUF, -(int64_t)b->size); }
     RET(r, 1);
 }
 void bf_Lock(FnvCpu& s)
@@ -650,6 +651,7 @@ uint32_t new_buffer(Device* d, uint32_t size, uint32_t kind, uint32_t usage, uin
     Buf* b = new Buf{g_next_id.fetch_add(1), size, kind, usage, pool, fvf, fmt, 0};
     b->dev = d;
     b->mem = (uint32_t)(uintptr_t)calloc(1, size ? size : 4);
+    pal_mem_add(PAL_MEM_BUF, size);
     b->obj = com_new(buffer_class(kind != 0), b);
     emit(OP_CREATE_BUFFER, {b->id, size, kind});
     return b->obj;

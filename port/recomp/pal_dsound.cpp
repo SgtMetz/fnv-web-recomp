@@ -29,6 +29,7 @@ uint64_t now_ms()
 struct Buffer
 {
     uint32_t data = 0, size = 0, flags = 0;
+    uint32_t* data_refs = nullptr; // buffers sharing `data` (DuplicateSoundBuffer); the last Release frees it
     uint32_t rate = 22050, channels = 2, bits = 16, avg = 88200, block = 4;
     int32_t volume = 0, pan = 0;
     uint32_t freq = 0;
@@ -197,10 +198,21 @@ void b_Release(FnvCpu& s)
     M32(o + 8) = r;
     if (!r)
     {
-        std::lock_guard<std::mutex> lk(g_mx);
+        std::lock_guard<std::mutex> lk(g_mx);              // the mixer reads `data` under this lock
         Buffer* b = buf(s);
         b->playing = false;
         b->dead = true;
+        // Free the samples once no duplicate shares them. Every sound the game plays is a buffer: keeping them filled
+        // the 3 GB heap in a few minutes of play (problem report 20261113-IQTFGH, Aborted(OOM)).
+        if (b->data_refs && !--*b->data_refs)
+        {
+            free((void*)(uintptr_t)b->data);
+            pal_mem_add(PAL_MEM_SOUND, -(int64_t)b->size);
+            delete b->data_refs;
+        }
+        b->data_refs = nullptr;
+        b->data = 0;
+        b->size = 0;                                       // a stray call after the release sees an empty buffer
     }
     RET(r, 1);
 }
@@ -267,6 +279,8 @@ void s_CreateSoundBuffer(FnvCpu& s)
     if (!b->block) b->block = 4;
     if (!b->avg) b->avg = b->rate * b->block;
     b->data = (uint32_t)(uintptr_t)calloc(1, b->size ? b->size : 4);
+    b->data_refs = new uint32_t(1);
+    pal_mem_add(PAL_MEM_SOUND, b->size);
     b->obj = com_new(buffer_class(), b);
     if (!b->primary) { std::lock_guard<std::mutex> lk(g_mx); g_buffers.push_back(b); }
     M32(A(2)) = b->obj;
@@ -275,11 +289,13 @@ void s_CreateSoundBuffer(FnvCpu& s)
 void s_DuplicateSoundBuffer(FnvCpu& s)
 {
     Buffer* o = (Buffer*)com_host(A(1));
+    std::lock_guard<std::mutex> lk(g_mx);
     Buffer* b = new Buffer(*o);
     b->playing = false; b->start_pos = 0; b->obj3d = b->notify = 0;
     b->dead = false; b->mixpos = 0;
+    if (b->data_refs) ++*b->data_refs;                   // shares the original's samples
     b->obj = com_new(buffer_class(), b);
-    { std::lock_guard<std::mutex> lk(g_mx); g_buffers.push_back(b); }
+    g_buffers.push_back(b);
     M32(A(2)) = b->obj;
     RET(0, 3);
 }
@@ -314,7 +330,8 @@ void mix_chunk(float* out, uint32_t n)
 {
     memset(out, 0, n * 8);
     std::lock_guard<std::mutex> lk(g_mx);
-    // released buffers leave the mix list (their memory stays: duplicates share it, guest objects are not reused)
+    // released buffers leave the mix list (their samples were freed by the last Release; the small Buffer and guest
+    // object stay, so a stray call on a released object finds an empty buffer)
     g_buffers.erase(std::remove_if(g_buffers.begin(), g_buffers.end(), [](Buffer* b) { return b->dead; }), g_buffers.end());
     for (Buffer* b : g_buffers)
     {
