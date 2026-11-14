@@ -6,10 +6,12 @@
 // {type: 'hello', history, online, you: {country}}, {type: 'you', name, owner}, {type: 'msg', id, name, country, text,
 // t}, {type: 'dm', id, name, country, to, text, t}, {type: 'online', n, names}, {type: 'error', error}; to it:
 // {type: 'join', token}, {type: 'msg', text}, {type: 'dm', to, text}. The country (an ISO code, or '') is the
-// server's, from where the connection comes from; flags come from <server>/flag/<cc>.svg.
+// server's, from where the connection comes from; flags come from <server>/flag/<cc>.svg. Messages and the online list (sites: {name: site}) also carry the page each player chats from (site), which this client does not show.
 //
 // Names come from the server, by country: "Russian #3" is the third player from Russia. A secret token kept on this
-// browser (fnv.chat.token) gets the same name back next time. Clicking a name @mentions it; the ✉ after it (or a
+// browser (fnv.chat.token) gets the same name back next time. A player can pick their own one-word name instead
+// (click "You are …": {type: 'name', name}, '' for the country name again; the server keeps it unique per token).
+// Clicking a name @mentions it; the ✉ after it (or a
 // name in the "n online" list) starts a private message, which only that player sees and the server does not keep.
 // Messages that @mention this player are highlighted, and the corner button counts them.
 //
@@ -29,8 +31,7 @@
 (() => {
   'use strict';
   const TEXT_MAX = 300;
-  const WELCOME_BOT = 'Lichtsteiner #1';
-  const WELCOME_LINK = 'https://example.com/';
+  const WELCOME_BOT = 'Server';
 
   const CSS = `
   #chat { margin: 14px 0 20px; border: 1px solid #3a3528; background: #14130f; border-radius: 6px; display: flex; flex-direction: column; }
@@ -63,6 +64,11 @@
   #chat .msg .trnote[hidden] { display: none; }
   #chat .msg .trnote button { font: inherit; color: var(--dim, #8a8478); background: none; border: 0; padding: 0; cursor: pointer; text-decoration: underline dotted; }
   #chat .msg .crown { margin-left: 3px; font-size: 13px; }
+  #chat .namebox .nick { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; flex-basis: 100%; }
+  #chat .namebox .nick input { width: 12em; }
+  #chat .namebox .nick [hidden] { display: none; }
+  #chat .namebox .err.ok { color: #8fd67a; }
+  #chat .head .me button::after { content: " ✎"; text-decoration: none; display: inline-block; opacity: .7; }
   #chat .namebox .pin { display: inline-flex; gap: 8px; align-items: center; }
   #chat .namebox .pin[hidden] { display: none; }
   #chat .namebox .pin input { width: 7em; }
@@ -91,6 +97,10 @@
   #chat .note.bad { color: #e77; }
   #chat form.send { display: flex; gap: 8px; padding: 8px 12px; border-top: 1px solid #2a271f; }
   #chat form.send input { flex: 1; min-width: 0; }
+  #chat .mentions { padding: 6px 12px; border-top: 1px solid #3a3528; display: flex; flex-wrap: wrap; gap: 6px; }
+  #chat .mentions[hidden] { display: none; }
+  #chat .mentions button[aria-selected="true"] { border-color: var(--accent, #e0a040); background: #39301e; }
+  #chat .mention-help { padding: 0 12px 6px; font-size: 11px; color: var(--dim, #8a8478); }
   #chatJump { position: fixed; right: 16px; bottom: 16px; z-index: 4; font: 600 13px system-ui, sans-serif; color: #0d0d0d;
     background: var(--accent, #e0a040); border: 0; border-radius: 18px; padding: 8px 14px; cursor: pointer; box-shadow: 0 2px 10px rgba(0,0,0,.5); }
   #chatJump[hidden] { display: none; }
@@ -100,26 +110,32 @@
     <div class="head"><h2>Chat</h2><button type="button" class="online" id="chatOnline" title="Who is online" aria-expanded="false" aria-controls="chatRoster">connecting…</button>
       <span class="tr"><label title="Show other players' messages in your language"><input type="checkbox" id="chatTr"> Translate to</label>
         <select id="chatLang" aria-label="Translate into"></select></span>
-      <span class="me">You are <button type="button" id="chatMe" title="Where your name comes from"></button></span>
+      <span class="me">You are <button type="button" id="chatMe" title="Change your name"></button></span>
       <button type="button" id="chatDashboard" hidden>Activity dashboard</button>
       <button type="button" id="chatToggle" aria-expanded="true" aria-controls="chatMsgs">Hide chat</button></div>
     <div class="roster" id="chatRoster" hidden></div>
     <div class="namebox" id="chatNameBox" hidden>
-      <span class="why">Names come from your country: the third player from Russia is Russian #3. Click a name to @mention
-        them, or ✉ to send them a private message.</span>
-      <span class="pin" id="chatPinRow"><label for="chatPin">Site owner PIN:</label>
+      <span class="why">Pick your own name, or keep the one from your country (the third player from Russia is Russian #3).
+        Click a name to @mention them, or ✉ to send them a private message.</span>
+      <span class="nick"><label for="chatNick">Your name:</label>
+        <input id="chatNick" maxlength="16" autocomplete="off" spellcheck="false" placeholder="3-16 letters or numbers" aria-label="Your name">
+        <button type="button" id="chatNickGo">Save</button>
+        <button type="button" id="chatNickReset" hidden>Use my country name</button></span>
+      <span class="pin" id="chatPinRow" hidden><label for="chatPin">Site owner PIN:</label>
         <input id="chatPin" type="password" inputmode="numeric" maxlength="12" autocomplete="off" aria-label="PIN">
         <button type="button" id="chatPinGo">Unlock</button></span>
       <span class="err" id="chatNameErr" role="status"></span>
       <button type="button" class="x" id="chatNameClose" title="Dismiss" aria-label="Dismiss">×</button>
     </div>
     <div class="msgs" id="chatMsgs" role="log" aria-live="polite"></div>
+    <div class="mentions" id="chatMentions" role="listbox" aria-label="Mention a player" hidden></div>
     <form class="send" id="chatForm">
       <span class="dmto" id="chatDmTo" hidden>✉ <b id="chatDmName"></b>
         <button type="button" id="chatDmX" title="Back to everyone" aria-label="Stop private message">×</button></span>
-      <input id="chatText" maxlength="${TEXT_MAX}" placeholder="Say something to other players…" autocomplete="off" aria-label="Message" disabled>
+      <input id="chatText" maxlength="${TEXT_MAX}" placeholder="Message players… type @ to mention" autocomplete="off" aria-label="Message" role="combobox" aria-autocomplete="list" aria-expanded="false" aria-controls="chatMentions" disabled>
       <button type="submit" id="chatSend" disabled>Send</button>
-    </form>`;
+    </form>
+    <div class="mention-help">Type @ or click a player's name to mention them. @Metz notifies the site owner by email.</div>`;
 
   function setup() {
     const anchor = document.getElementById('chat');
@@ -179,11 +195,36 @@
     });
     pinIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); $('chatPinGo').click(); } });
     $('chatNameClose').addEventListener('click', () => { nameBox.hidden = true; nameErr.textContent = ''; });
-    me.addEventListener('click', () => { nameBox.hidden = !nameBox.hidden; });
+    // your own name ({type: 'name'}): kept by the server for this browser; '' goes back to the country name
+    const nickIn = $('chatNick'), nickReset = $('chatNickReset');
+    const NICK = /^\p{L}[\p{L}\p{N}_-]{2,15}$/u;
+    const sendName = (n) => {
+      nameErr.className = 'err';
+      if (!ws || ws.readyState !== 1) { nameErr.textContent = 'Not connected to the chat yet.'; return; }
+      if (n && !NICK.test(n)) { nameErr.textContent = 'Use 3 to 16 letters, numbers, _ or -, starting with a letter, with no spaces.'; return; }
+      nameErr.textContent = 'Saving…';
+      ws.send(JSON.stringify({ type: 'name', name: n }));
+    };
+    // the owner's PIN box shows only while the name field says Metz; saving Metz asks for the PIN instead
+    const pinRow = $('chatPinRow');
+    const wantsOwner = () => nickIn.value.trim().toLowerCase() === 'metz';
+    const syncPin = () => { pinRow.hidden = !wantsOwner(); };
+    const saveName = () => {
+      if (wantsOwner()) { syncPin(); nameErr.className = 'err'; nameErr.textContent = 'Enter the site owner PIN.'; pinIn.focus(); return; }
+      sendName(nickIn.value.trim());
+    };
+    nickIn.addEventListener('input', syncPin);
+    $('chatNickGo').addEventListener('click', saveName);
+    nickIn.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); saveName(); } });
+    nickReset.addEventListener('click', () => sendName(''));
+    me.addEventListener('click', () => {
+      nameBox.hidden = !nameBox.hidden;
+      if (!nameBox.hidden) { nickIn.value = name && !name.includes(' #') && !owner ? name : ''; syncPin(); nickIn.focus(); }
+    });
 
     // ---- @mentions and private messages -------------------------------------------------------------------------------
-    // names look like "Russian #3", "South African #12", "Wanderer #1", or the owner's Metz
-    const MENTION = /@(\p{L}[\p{L}' -]{0,30}? #\d+|Metz\b)/gu;
+    // names look like "Russian #3", "South African #12", "Wanderer #1", a chosen one-word name, or the owner's Metz
+    const MENTION = /(?<![\p{L}\p{N}_@])@(\p{L}[\p{L}' -]{0,30}? #\d+|\p{L}[\p{L}\p{N}_-]{2,15})(?![\p{L}\p{N}_])/giu;
     const isMe = (n) => !!name && String(n).toLowerCase() === name.toLowerCase();
     const mentionsMe = (text) => [...String(text).matchAll(MENTION)].some((x) => isMe(x[1]));
     let dmTo = '';
@@ -191,22 +232,24 @@
     const setDm = (to) => {
       dmTo = to && !isMe(to) ? to : '';
       dmBox.hidden = !dmTo; dmName.textContent = dmTo;
-      textIn.placeholder = dmTo ? `Private message to ${dmTo}…` : 'Say something to other players…';
+      textIn.placeholder = dmTo ? `Private message to ${dmTo}…` : 'Message players… type @ to mention';
       if (!textIn.disabled) textIn.focus();
     };
     $('chatDmX').addEventListener('click', () => setDm(''));
     const mention = (n) => {
       const v = textIn.value, add = '@' + n + ' ';
       textIn.value = (v && !/\s$/.test(v) ? v + ' ' : v) + add;
+      hideMentions();
       if (!textIn.disabled) textIn.focus();
     };
     // a name you can click (@mention) with a ✉ (private message) after it
     const nameButtons = (n, ownerMark) => {
+      const out = [];
       const who = document.createElement('button');
       who.type = 'button'; who.className = 'who'; who.textContent = n; who.title = `Mention ${n}`;
       who.addEventListener('click', () => mention(n));
       if (ownerMark) { const c = document.createElement('span'); c.className = 'crown'; c.textContent = '👑'; c.title = 'Site owner'; who.append(c); }
-      const out = [who];
+      out.push(who);
       if (!isMe(n)) {
         const dm = document.createElement('button');
         dm.type = 'button'; dm.className = 'dmb'; dm.textContent = '✉'; dm.title = `Private message to ${n}`;
@@ -231,6 +274,65 @@
     };
     const roster = $('chatRoster');
     let rosterNames = [];
+    const suggestions = $('chatMentions');
+    let mentionChoices = [], mentionRange = null, mentionIndex = 0;
+    function hideMentions() {
+      suggestions.hidden = true;
+      mentionChoices = []; mentionRange = null;
+      textIn.setAttribute('aria-expanded', 'false');
+      textIn.removeAttribute('aria-activedescendant');
+    }
+    function chooseMention(n) {
+      if (!mentionRange) return;
+      const { start, end } = mentionRange;
+      const insert = '@' + n + ' ';
+      if (textIn.value.length - (end - start) + insert.length > TEXT_MAX) return;
+      textIn.value = textIn.value.slice(0, start) + insert + textIn.value.slice(end);
+      textIn.focus();
+      textIn.setSelectionRange(start + insert.length, start + insert.length);
+      hideMentions();
+    }
+    function selectMention(index) {
+      mentionIndex = (index + mentionChoices.length) % mentionChoices.length;
+      for (const [i, b] of [...suggestions.children].entries()) b.setAttribute('aria-selected', String(i === mentionIndex));
+      textIn.setAttribute('aria-activedescendant', 'chatMention' + mentionIndex);
+    }
+    function suggestMentions() {
+      const end = textIn.selectionStart;
+      const match = /(?:^|\s)@([^@\n]{0,40})$/.exec(textIn.value.slice(0, end));
+      if (!match || textIn.selectionEnd !== end) return hideMentions();
+      const query = match[1].toLowerCase();
+      const names = new Set(['Metz', ...rosterNames, ...shown.map(m => m.name)]);
+      mentionChoices = [...names].filter(n => n && n !== WELCOME_BOT && !isMe(n) && n.toLowerCase().startsWith(query)
+        && [...('@' + n).matchAll(MENTION)].some(m => m[1].toLowerCase() === n.toLowerCase())).slice(0, 8);
+      if (!mentionChoices.length) return hideMentions();
+      mentionRange = { start: end - match[1].length - 1, end };
+      suggestions.replaceChildren();
+      for (const [i, n] of mentionChoices.entries()) {
+        const b = document.createElement('button');
+        b.type = 'button'; b.id = 'chatMention' + i; b.setAttribute('role', 'option'); b.textContent = '@' + n;
+        b.addEventListener('mousedown', e => e.preventDefault());
+        b.addEventListener('click', () => chooseMention(n));
+        suggestions.appendChild(b);
+      }
+      suggestions.hidden = false;
+      textIn.setAttribute('aria-expanded', 'true');
+      selectMention(0);
+    }
+    textIn.addEventListener('input', suggestMentions);
+    textIn.addEventListener('click', suggestMentions);
+    textIn.addEventListener('keydown', e => {
+      if (suggestions.hidden || e.isComposing) return;
+      if (['ArrowDown', 'ArrowUp', 'Enter', 'Tab', 'Escape'].includes(e.key)) {
+        e.preventDefault();
+        if (e.key === 'Escape') hideMentions();
+        else if (e.key === 'ArrowDown' || e.key === 'ArrowUp') selectMention(mentionIndex + (e.key === 'ArrowDown' ? 1 : -1));
+        else chooseMention(mentionChoices[mentionIndex]);
+      }
+    });
+    anchor.addEventListener('focusout', () => setTimeout(() => {
+      if (document.activeElement !== textIn && !suggestions.contains(document.activeElement)) hideMentions();
+    }, 0));
     const showRoster = () => {
       roster.textContent = '';
       for (const n of rosterNames) { const s = document.createElement('span'); s.append(...nameButtons(n, n === 'Metz')); roster.append(s); }
@@ -267,16 +369,6 @@
     let trFailed = 0, trWarned = false;
     function render(r) {
       const m = r.m, key = m.id + '|' + lang;
-      if (m.type === 'dm' && m.name === WELCOME_BOT && m.text === WELCOME_LINK) {
-        const link = document.createElement('a');
-        link.href = WELCOME_LINK;
-        link.textContent = WELCOME_LINK;
-        link.target = '_blank';
-        link.rel = 'noopener noreferrer';
-        r.text.replaceChildren(': ', link);
-        r.note.hidden = true;
-        return;
-      }
       const want = trOn && srcOf(m) !== lang;
       let tr = want ? tcache.get(key) : null;
       if (want && tr === undefined && m.tr && typeof m.tr[lang] === 'string') tr = m.tr[lang] ? { text: m.tr[lang], from: m.lang } : null;
@@ -470,6 +562,7 @@
           // the name the server gave this browser (or the owner's, after the PIN)
           const changed = m.name !== name;
           name = m.name || ''; owner = !!m.owner;
+          nickReset.hidden = !name || name.includes(' #') || owner;
           showName();
           if (changed) redraw();
           enable(true);
@@ -496,6 +589,9 @@
             // a stale kept PIN fails quietly; a typed one says why
             if (pinIn.value) nameErr.textContent = m.error || 'Wrong PIN.';
           }
+        } else if (m.type === 'name') {
+          nameErr.className = m.ok ? 'err ok' : 'err';
+          nameErr.textContent = m.ok ? 'Saved. New messages use your new name.' : m.error || 'Could not change the name.';
         } else if (m.type === 'translation') {
           // {text, from}; text '' with a language: nothing to translate; with none: the server could not
           const f = trWait.get(m.id + '|' + m.to);
@@ -518,6 +614,7 @@
       const text = textIn.value.replace(/\s+/g, ' ').trim().slice(0, TEXT_MAX);
       if (!text || !ws || ws.readyState !== 1) return;
       textIn.value = '';
+      hideMentions();
       const msgLang = await detectLang(text);
       ws.send(JSON.stringify(dmTo ? { type: 'dm', to: dmTo, text, lang: msgLang } : { type: 'msg', text, lang: msgLang }));
     });

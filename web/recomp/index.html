@@ -92,12 +92,6 @@
   /* The touch overlay owns input. Keep the canvas from receiving touch even before the overlay is ready. */
   @media (pointer: coarse) { #screen { pointer-events: none; } }
   html.touch #screen { max-height: calc(100dvh - 56px) !important; pointer-events: none; }
-  /* tabs: the game, and the players' chat */
-  #tabs { display: flex; gap: 4px; border-bottom: 1px solid #3a3528; margin: 4px 0 8px; }
-  #tabs button { font: inherit; color: var(--dim); background: none; border: 0; border-bottom: 2px solid transparent; padding: 7px 16px; cursor: pointer; }
-  #tabs button[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); }
-  #tabs button:focus-visible { outline: 1px solid var(--accent); }
-  #chat[hidden], #gamePane[hidden] { display: none !important; }
   #about { color: var(--dim); max-width: 860px; padding: 14px 0 8px; }
   #about h2 { color: var(--fg); font-size: 15px; margin: 0 0 4px; }
   #about a { color: var(--accent); }
@@ -129,8 +123,7 @@ document.addEventListener('click', (event) => {
 if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) document.documentElement.classList.add('dev');
 </script>
 <div id="wrap">
-  <div id="tabs" role="tablist"><button type="button" role="tab" id="tabGame" aria-selected="true" aria-controls="gamePane">Game</button><button type="button" role="tab" id="tabChat" aria-selected="false" aria-controls="chat">Chat</button></div>
-  <div id="gamePane" role="tabpanel" aria-labelledby="tabGame">
+  <div id="gamePane">
   <div id="bar"><b>FalloutNV.exe (recompiled to WebAssembly)</b><span id="status">starting…</span><a href="credits.html" target="_blank" rel="noopener" style="margin-left:auto;color:var(--dim)">Credits</a></div>
   <div id="stage">
     <canvas id="screen" width="1280" height="720" tabindex="0"></canvas>
@@ -166,6 +159,7 @@ if (/*FNV_DEV*/true || new URLSearchParams(location.search).has('debug')) docume
     <span id="autoQState"></span>
     <span id="savesMsg"></span>
   </div>
+  <section id="chat" aria-label="Chat with other players"></section>
   <section id="about" aria-label="About this page">
     <h2>Fallout: New Vegas in your browser</h2>
     <p>This page runs <i>Fallout: New Vegas</i> from your own copy of the game: the game's program is recompiled to
@@ -267,23 +261,8 @@ call 0x004624B0                      f_004624b0(s);</pre>
   </article>
   <div id="log"></div>
   </div>
-  <section id="chat" role="tabpanel" aria-labelledby="tabChat" aria-label="Chat with other players" hidden></section>
   <nav id="sitenav" aria-label="Site"><a href="about.html">About</a><a href="how-to-play.html">How to play</a><a href="credits.html">Credits</a><a href="privacy.html">Privacy policy</a><a href="terms.html">Terms</a><a href="contact.html">Contact</a><a href="https://github.com/SgtMetz/fnv-web-recomp">GitHub</a></nav>
 </div>
-<script>
-// tabs: Game and Chat. The chat connects only once its tab has been opened (web/recomp/chat.js).
-(() => {
-  const tabs = { game: [document.getElementById('tabGame'), document.getElementById('gamePane')], chat: [document.getElementById('tabChat'), document.getElementById('chat')] };
-  const show = (which) => {
-    for (const k in tabs) { tabs[k][0].setAttribute('aria-selected', String(k === which)); tabs[k][1].hidden = k !== which; }
-    if (which === 'game') { const c = document.getElementById('screen'); if (c && c.offsetParent) try { c.focus({ preventScroll: true }); } catch {} }
-    try { history.replaceState(null, '', which === 'chat' ? '#chat' : location.pathname + location.search); } catch {}
-  };
-  tabs.game[0].addEventListener('click', () => show('game'));
-  tabs.chat[0].addEventListener('click', () => show('chat'));
-  if (location.hash === '#chat') show('chat');
-})();
-</script>
 <script type="module">
 import { Renderer, createDevice, OP } from './renderer.js';
 import { startTuner, startupIni, tunerEnabled } from './tuner.js';
