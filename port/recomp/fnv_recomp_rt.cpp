@@ -9,6 +9,9 @@
 
 #include <atomic>
 
+// 1: lock-releasing zero stores are release stores (fnv_recomp.h MREL); set by the host before the game's threads start
+extern "C" int fnv_weak_memory = 0;
+
 namespace {
 // open-addressing table, power-of-two size, key 0 = empty (no function lives at address 0)
 uint32_t* g_keys;

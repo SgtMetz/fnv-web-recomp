@@ -227,8 +227,28 @@ class Recompiler(ls.Lifter):
             return st + (' s.depth = 0;' if 'save' in mnem else '')
         return None
 
+    def release_store(self, mnem, ops):
+        """`mov dword ptr [m], 0|reg` and `and dword ptr [m], 0` to non-stack memory: the game's spinlocks unlock with
+        a plain store of 0, so these become MREL (port/recomp/fnv_recomp.h), a release store on weakly ordered CPUs."""
+        args = [a for a in re.split(r',(?![^\[]*\])', ops) if a.strip()] if ops else []
+        if mnem not in ('mov', 'and') or len(args) != 2 or not args[0].strip().startswith('dword ptr ['):
+            return None
+        src = args[1].strip()
+        if mnem == 'and' and src not in ('0x0', '0'):
+            return None
+        if mnem == 'mov' and src not in ('0x0', '0') and src not in ls.REG32[:4] + ls.REG32[5:]:
+            return None                         # other immediates are never an unlock (esp is never a zero)
+        k, sz, e = self.parse(args[0])
+        if k != 'mem' or sz != 32 or 's.esp' in e or 's.ebp' in e:
+            return None                         # stack slots: thread-private
+        val = '0u' if src in ('0x0', '0') else 's.' + src
+        return 'MREL(%s, %s);' % (e, val) + (' LOGICF(0u, 32);' if mnem == 'and' else '')
+
     def stmt(self, addr, n, raw, mnem, ops, labels, entry, end):
         x = self.extra(mnem, ops)
+        if x is not None:
+            return x
+        x = self.release_store(mnem, ops)
         if x is not None:
             return x
         if mnem == 'call':

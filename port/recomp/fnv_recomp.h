@@ -46,6 +46,20 @@ extern "C" void fnv_trace_enter(uint32_t addr);
 #define MD(a) (*(double*)(uintptr_t)(uint32_t)(a))
 #define X(i) (s.xmm[i])
 #define MMX(i) (s.mm[i])
+// Lock release on weakly ordered CPUs (ARM: Apple Silicon, phones). The game releases its spinlocks with a plain
+// store of 0 (`owner = 0`, inlined in dozens of functions), which on x86 orders every earlier store and load before it.
+// A wasm store on ARM64 is a plain `str`, so another core could take the lock and still see the critical section's
+// writes half done (heap pool lists, scene lists: a wild `free` in report 20261117-M5S4QA). tools/recomp.py lowers
+// every 32-bit store of zero to non-stack memory as MREL: with fnv_weak_memory set (the page sets FNV_MEMORY_ORDER=weak
+// unless the CPU is x86) a zero becomes a release store (`stlr`), elsewhere it stays a plain store.
+extern "C" int fnv_weak_memory;
+inline void fnv_store_release0(uint32_t a)
+{
+    if (a & 3u) { __atomic_thread_fence(__ATOMIC_RELEASE); M32(a) = 0u; }      // atomics need natural alignment
+    else __atomic_store_n((uint32_t*)(uintptr_t)a, 0u, __ATOMIC_RELEASE);
+}
+#define MREL(a, v) do { uint32_t a__ = (uint32_t)(a), v__ = (uint32_t)(v); \
+    if (__builtin_expect(v__ == 0u && fnv_weak_memory, 0)) fnv_store_release0(a__); else M32(a__) = v__; } while (0)
 #define PUSH(v) do { uint32_t v__ = (uint32_t)(v); s.esp -= 4; M32(s.esp) = v__; } while (0)
 #define POP() (s.esp += 4, M32(s.esp - 4))
 #define ST(i) (s.st[s.depth - 1 - (i)])

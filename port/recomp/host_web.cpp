@@ -553,6 +553,8 @@ int main(int argc, char** argv)
     g_docs = docs ? docs : "fnv_docs";
     logf("[web] %u recompiled functions; C stack %08x-%08x, static data from %p, heap from %p\n", fnv_function_count(),
          (uint32_t)emscripten_stack_get_end(), (uint32_t)emscripten_stack_get_base(), (void*)&__global_base, sbrk(0));
+    if (const char* mo = getenv("FNV_MEMORY_ORDER")) fnv_weak_memory = !strcmp(mo, "weak");   // before any game thread
+    logf("[web] memory order: %s\n", fnv_weak_memory ? "weak (release stores for lock unlocks)" : "x86 (plain stores)");
     if (!map_exe(g_exe_path.c_str())) return 1;
     g_fixed_lo = (uint32_t)(uintptr_t)aligned_alloc(16u << 20, kFixedArea);
     g_fixed_hi = g_fixed_lo + kFixedArea;

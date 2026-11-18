@@ -998,6 +998,21 @@ const startMode = startParam === 'quick' || startParam === 'normal' ? startParam
 });
 if (startMode === 'quick') env.FNV_START = 'quick';
 if (LOW) env.FNV_ARCHIVES = 'mobile';
+// weakly ordered CPUs (ARM: Apple Silicon, phones, Snapdragon laptops) need the game's lock unlocks as release stores
+// (port/recomp/fnv_recomp.h MREL), or another thread can see a critical section half written. x86 keeps plain stores.
+// Unknown counts as weak: Safari and Firefox say "Intel Mac OS X" on Apple Silicon too. ?memory=weak|x86 overrides.
+const memoryOrder = await (async () => {
+  const p = query.get('memory');
+  if (p === 'weak' || p === 'x86') return p;
+  try {
+    const ua = navigator.userAgentData && await Promise.race([
+      navigator.userAgentData.getHighEntropyValues(['architecture']), new Promise((r) => setTimeout(r, 1000))]);
+    if (ua && ua.architecture) return ua.architecture === 'x86' ? 'x86' : 'weak';
+  } catch {}
+  return /Windows NT|x86_64|x64|i686|WOW64|CrOS x86/.test(navigator.userAgent) && !/ARM|aarch64/i.test(navigator.userAgent) ? 'x86' : 'weak';
+})();
+if (memoryOrder === 'weak') env.FNV_MEMORY_ORDER = 'weak';
+log(`memory order: ${memoryOrder}`);
 // automatic quality's start-up part: a lower resolution when earlier visits found the graphics side to be the limit
 // ?res=1920x1080 (or ?res=native: the screen's own size, 16:9, up to 2560x1440) sets the size the game draws at; it
 // picks its size at start-up, like the automatic quality's lower resolutions below, which a choice here overrides
