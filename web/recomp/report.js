@@ -12,7 +12,9 @@
 //                (the last 30 minutes)
 // Gathered when the report is sent:
 //   the browser, the device, the GPU (WebGPU adapter info, features and limits; the WebGL renderer string), the
-//   connection, storage, the build (VERSION.json), the page's settings, the start-up state (window.fnvBoot), the
+//   connection, storage, the build (VERSION.json), the page's settings, the start-up state (window.fnvBoot) and the
+//   record of the last start before this page loaded (localStorage fnv.boot.last: players often reload a stuck start
+//   and then report it), how the game's files are being read (window.fnvFileSource, when the page sets it), the
 //   renderer, sound and pump state, the game's present timings, where every game thread is (fnv_dump_threads) and
 //   samples of the main thread's stack, the player's position and cell, the saves in this tab; a screenshot of the
 //   game (optional) and the newest save (optional).
@@ -23,6 +25,8 @@
 (() => {
   'use strict';
   const T0 = performance.now(), OPENED = new Date();
+  let previousBoot = null;
+  try { previousBoot = JSON.parse(localStorage.getItem('fnv.boot.last')); } catch {}
   const HEAD = 3000, TAIL = 12000, LINE_MAX = 4000;
   const head = [], tail = new Array(TAIL);
   let tailN = 0, total = 0;
@@ -246,6 +250,8 @@
       env: window.Module && window.Module.fnvEnv, args: window.Module && window.Module.arguments,
     };
     st.boot = copy(b);
+    st.previousBoot = previousBoot;
+    st.files = safe(() => (window.fnvFileSource && window.fnvFileSource.state ? window.fnvFileSource.state() : null));
     st.pump = copy(pump);
     st.tuner = copy(window.fnvTuner);       // automatic quality (tuner.js): level, last frame times, what it changed
     if (a) st.audio = safe(() => ({ state: a.ctx ? a.ctx.state : 'none', sampleRate: a.ctx && a.ctx.sampleRate, baseLatency: a.ctx && a.ctx.baseLatency,
@@ -286,6 +292,15 @@
     L.push(`Page: ${rep.page.url}  up ${rep.page.uptimeSec} s, ${rep.page.visibility}, isolated ${rep.browser.caps.crossOriginIsolated}`);
     if (rep.page.boot) L.push(`Start-up: quality ${b.quality}, mode ${b.mode}, phase ${b.phase}, stage ${b.stage}, ready ${b.ready}, failed ${b.failed}${b.failText ? ' (' + b.failText + ')' : ''}, stalled ${b.stalled}, ${b.kb} KB in ${b.fetches} fetches, ${b.retries} retries`);
     L.push(`Status bar: ${rep.page.status}`);
+    const f = rep.page.files;
+    if (f && f.summary) L.push(`Game files: ${f.summary}`);
+    const p = rep.page.previousBoot;
+    if (p && typeof p === 'object') {
+      L.push(`Start before this page load (${p.at}): ${p.ready ? 'ready' : p.failed ? 'failed: ' + p.failText : (p.stalled ? `stalled ${p.stalledSec} s at ` : 'left at ') + p.pct + '%'}, ` +
+        `${p.mode} start, phase ${p.phase}, stage ${p.stage}, ${p.kb} KB in ${p.fetches} fetches, ${p.retries} retries, ${p.elapsed} s${p.file ? ', reading ' + p.file : ''}`);
+      if (p.detail) L.push(`  It showed: ${p.text} · ${p.detail}`);
+      if (p.files && p.files.summary) L.push(`  Game files then: ${p.files.summary}`);
+    }
     const s = rep.samples[rep.samples.length - 1];
     if (s) L.push(`Last sample: ${s.fps} fps, frame ${s.frames}, heap ${s.heapMB} MB, JS ${s.jsMB} MB`);
     if (s && s.mem) L.push(`Memory (MB): malloc ${s.mem.used} of ${s.mem.arena}, game heap ${s.mem.heap}, textures ${s.mem.tex}, buffers ${s.mem.buf}, voices ${s.mem.vorbis} (${s.mem.voices} open), sound buffers ${s.mem.sound}`);

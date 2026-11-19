@@ -56,7 +56,7 @@
   #boot .track { height: 6px; background: #2a271f; border-radius: 3px; overflow: hidden; }
   #boot .fill { height: 100%; width: 0; background: var(--accent); }
   #boot .detail { margin-top: 5px; color: var(--dim); font-size: 12px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  #boot .stall { color: #e7b267; }
+  #boot .stall { color: #e7b267; white-space: pre-line; }
   #boot.failed .fill { background: #c55; }
   /* touch controls (phones and tablets, or ?touch=1): a joystick on the left, swipe to look, buttons on the right */
   #touch { position: absolute; inset: 0; touch-action: none; user-select: none; -webkit-user-select: none; }
@@ -244,6 +244,10 @@ window.Module = {
 //             and says when the main menu is up and when a quick start reaches the porch.
 // The state is window.fnvBoot and a 'fnv-progress' event on window; an embedding page gets it as a postMessage
 // {type: 'fnv-progress', ...}. Nothing changing for 20 s shows a note, and the log below has the details.
+// A variant of the page whose files come from somewhere else (the player's own folder) may set
+// window.fnvFileSource = { hint() → a line shown under the bar when reads go wrong, state() → kept with the record }.
+// The record of each start (localStorage fnv.boot.last, every 2 s and at the end) is what a report sent after a
+// reload shows (report.js keeps the one from before the page loaded).
 const boot = window.fnvBoot = {
   phase: 'download', fraction: 0, text: 'Starting', detail: '', ready: false, failed: false, stalled: false,
   download: { got: 0, total: 0, scale: 1, done: false }, runtime: false, stage: 0, kb: 0, fetches: 0, retries: 0, file: '',
@@ -261,7 +265,18 @@ const mb = (bytes) => (bytes / 1048576).toFixed(bytes < 10485760 ? 1 : 0);
 const clock = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
 const utf8 = new TextDecoder();
 let retriesSeen = 0, retriesAt = 0;
-let bootT0 = 0, lastChange = 0, lastSig = '', compileT0 = 0, bootTimer = 0;
+let bootT0 = 0, lastChange = 0, lastSig = '', compileT0 = 0, bootTimer = 0, savedAt = 0;
+const fileSource = (part) => { try { return window.fnvFileSource?.[part]?.() || null; } catch { return null; } };
+function saveBoot(now, pct) {
+  savedAt = now;
+  try {
+    localStorage.setItem('fnv.boot.last', JSON.stringify({ at: new Date().toISOString(), mode: boot.mode, quality,
+      phase: boot.phase, pct, text: boot.text, detail: boot.detail, stage: boot.stage, kb: boot.kb, fetches: boot.fetches,
+      retries: boot.retries, file: boot.file, elapsed: Math.round(boot.elapsed), ready: boot.ready, failed: boot.failed,
+      failText: boot.failText || '', stalled: boot.stalled, stalledSec: boot.stalled ? Math.round((now - lastChange) / 1000) : 0,
+      files: fileSource('state') }));
+  } catch {}
+}
 
 // count the wasm's bytes as the streaming compile reads them, as downloaded (compressed) megabytes. When the server
 // compresses the response (Content-Encoding), the body arrives decoded: the counted bytes are scaled by the
@@ -327,6 +342,7 @@ function tickBoot() {
     if (boot.retries !== retriesSeen) { retriesSeen = boot.retries; retriesAt = now; }
     if (boot.retries && now - retriesAt < 60000) detail += ` · weak connection, ${boot.retries} request${boot.retries > 1 ? 's' : ''} retried`;
   }
+  const hint = !boot.ready && !boot.failed ? fileSource('hint') : null;
   if (boot.stage >= readyStage && !boot.ready) {
     boot.ready = true;
     // from here on a new shader combination compiles in the background (renderer.js draw); ?pipelines=sync for the old way
@@ -352,8 +368,9 @@ function tickBoot() {
   bootEl.pct.textContent = boot.failed ? '' : `${pct}% · ${clock(boot.elapsed)}`;
   bootEl.fill.style.width = (boot.fraction * 100).toFixed(1) + '%';
   bootEl.root.setAttribute('aria-valuenow', String(pct));
-  bootEl.detail.textContent = boot.stalled ? `No progress for ${Math.round((now - lastChange) / 1000)} s · ${detail}` : detail;
-  bootEl.detail.classList.toggle('stall', boot.stalled);
+  bootEl.detail.textContent = (boot.stalled ? `No progress for ${Math.round((now - lastChange) / 1000)} s · ${detail}` : detail) +
+    (hint ? '\n' + hint : '');
+  bootEl.detail.classList.toggle('stall', boot.stalled || !!hint);
   bootEl.root.classList.toggle('failed', boot.failed);
   if (!boot.ready) status.textContent = `${text} · ${pct}%`;
   const info = { phase: boot.phase, fraction: boot.fraction, text, detail, ready: boot.ready, failed: boot.failed,
@@ -361,6 +378,7 @@ function tickBoot() {
     download: { ...dl } };
   window.dispatchEvent(new CustomEvent('fnv-progress', { detail: info }));
   if (window.parent !== window) window.parent.postMessage({ type: 'fnv-progress', ...info }, '*');
+  if (boot.ready || boot.failed || now - savedAt > 2000) saveBoot(now, pct);
   if (boot.ready || boot.failed) {
     clearInterval(bootTimer);
     if (boot.ready) { bootEl.root.classList.add('done'); setTimeout(() => { bootEl.root.hidden = true; }, 700); }
