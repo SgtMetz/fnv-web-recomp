@@ -112,6 +112,7 @@
         <select id="chatLang" aria-label="Translate into"></select></span>
       <span class="me">You are <button type="button" id="chatMe" title="Change your name"></button></span>
       <button type="button" id="chatDashboard" hidden>Activity dashboard</button>
+      <button type="button" id="chatLounge" hidden title="Watch the AI agents' lounge (opens a new tab)">Agent lounge</button>
       <button type="button" id="chatToggle" aria-expanded="true" aria-controls="chatMsgs">Hide chat</button></div>
     <div class="roster" id="chatRoster" hidden></div>
     <div class="namebox" id="chatNameBox" hidden>
@@ -180,11 +181,11 @@
     }
     const pinIn = $('chatPin'), nameErr = $('chatNameErr');
     let owner = false, name = '';
-    const dashboard = $('chatDashboard');
-    let dashboardTimer;
+    const dashboard = $('chatDashboard'), loungeBtn = $('chatLounge');
+    let dashboardTimer, passFor = 'dashboard';
     const showName = () => {
       me.textContent = name || '…';
-      dashboard.hidden = !owner || name !== 'Metz' || !url.startsWith('wss:');
+      dashboard.hidden = loungeBtn.hidden = !owner || name !== 'Metz' || !url.startsWith('wss:');
     };
     showName();
     const sendAuth = (pin) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: 'auth', pin })); };
@@ -530,14 +531,19 @@
     let ws = null, started = false, retry = 0;
     const resetDashboard = () => {
       clearTimeout(dashboardTimer);
-      dashboard.disabled = false;
+      dashboard.disabled = loungeBtn.disabled = false;
     };
-    dashboard.addEventListener('click', () => {
+    // both owner pages take a short-lived pass from the chat server: the activity dashboard (this tab) and the
+    // agents' lounge watch page (a new tab, so a running game is not lost)
+    const askPass = (what) => {
       if (!owner || ws?.readyState !== WebSocket.OPEN) return;
-      dashboard.disabled = true;
+      passFor = what;
+      dashboard.disabled = loungeBtn.disabled = true;
       ws.send(JSON.stringify({ type: 'dashboard' }));
       dashboardTimer = setTimeout(resetDashboard, 8000);
-    });
+    };
+    dashboard.addEventListener('click', () => askPass('dashboard'));
+    loungeBtn.addEventListener('click', () => askPass('lounge'));
     const setOnline = (n) => { online.textContent = `${n} online`; };
     const enable = (on) => { textIn.disabled = sendBtn.disabled = !on; };
     function connect() {
@@ -570,10 +576,10 @@
           resetDashboard();
           const target = new URL(url);
           target.protocol = 'https:';
-          target.pathname = '/play/dashboard';
+          target.pathname = passFor === 'lounge' ? '/lounge/watch' : '/play/dashboard';
           target.search = '';
           target.hash = new URLSearchParams({ pass: m.pass }).toString();
-          location.assign(target);
+          if (passFor !== 'lounge' || !window.open(target, '_blank')) location.assign(target);
         } else if (m.type === 'msg' || m.type === 'dm') {
           addMsg(m);
         } else if (m.type === 'online') {
